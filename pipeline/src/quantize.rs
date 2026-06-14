@@ -78,9 +78,11 @@ fn quantize_edge(edge: SplitEdge) -> QuantizedEdge {
 // ── Coordinate quantization ───────────────────────────────────────────────────
 
 /// Map a WGS84 degree value to the 1e-7 grid (round-half-to-even).
+/// Clamps to i32 range; valid WGS84 values (-180..=180 lon, -90..=90 lat) are
+/// well within range, so the clamp only fires on corrupt input.
 #[inline]
 pub fn quantize_coord(deg: f64) -> i32 {
-    (deg * 1e7).round() as i32
+    (deg * 1e7).round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
 }
 
 /// Restore a quantized coordinate to floating-point degrees.

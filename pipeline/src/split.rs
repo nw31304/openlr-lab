@@ -71,6 +71,15 @@ fn split_segment(seg: AdaptedSegment, vehicular_endpoints: &HashSet<String>) -> 
         return (vec![], vec![]);
     }
 
+    // Parse the parent GERS id once; skip the whole segment if it's malformed.
+    let parent_gers_id = match parse_gers_id(&seg.gers_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(id = %seg.gers_id, error = %e, "segment has invalid GERS id, skipped");
+            return (vec![], vec![]);
+        }
+    };
+
     // Keep endpoint connectors (at ≈ 0 or ≈ 1) always; keep interior connectors only
     // when they are endpoints of other vehicular segments (genuine road junctions).
     let filtered_connectors: Vec<_> = seg.connectors.iter()
@@ -116,8 +125,23 @@ fn split_segment(seg: AdaptedSegment, vehicular_endpoints: &HashSet<String>) -> 
             continue;
         }
 
-        let start_gers = parse_gers_id_or_warn(&c_start.connector_id, &seg.gers_id);
-        let end_gers   = parse_gers_id_or_warn(&c_end.connector_id,   &seg.gers_id);
+        // Skip edges with malformed connector IDs rather than colliding on zero.
+        let start_gers = match parse_gers_id(&c_start.connector_id) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(id = %seg.gers_id, connector = %c_start.connector_id,
+                      error = %e, "invalid start connector GERS id, edge skipped");
+                continue;
+            }
+        };
+        let end_gers = match parse_gers_id(&c_end.connector_id) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(id = %seg.gers_id, connector = %c_end.connector_id,
+                      error = %e, "invalid end connector GERS id, edge skipped");
+                continue;
+            }
+        };
 
         let sub_geom = sub_geometry(&seg.geometry, &cum, c_start.at, c_end.at);
         if sub_geom.len() < 2 {
@@ -149,7 +173,7 @@ fn split_segment(seg: AdaptedSegment, vehicular_endpoints: &HashSet<String>) -> 
             frc:             seg.frc,
             fow:             seg.fow,
             direction:       seg.direction,
-            parent_gers_id:  parse_gers_id_or_warn(&seg.gers_id, &seg.gers_id),
+            parent_gers_id,
         });
     }
 
@@ -255,15 +279,6 @@ pub fn parse_gers_id(s: &str) -> Result<[u8; 16]> {
         .map_err(|_| anyhow::anyhow!("GERS id wrong length (expected 32 hex chars): '{}'", s))
 }
 
-fn parse_gers_id_or_warn(s: &str, parent_id: &str) -> [u8; 16] {
-    match parse_gers_id(s) {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(connector_id = %s, parent = %parent_id, error = %e, "invalid GERS id, using zeros");
-            [0u8; 16]
-        }
-    }
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

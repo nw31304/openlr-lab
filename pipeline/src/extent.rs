@@ -43,6 +43,12 @@ pub fn resolve(spec: &str) -> Result<Option<Bbox>> {
             .map_err(|_| anyhow::anyhow!("non-numeric value in bbox '{spec}'"))?
             .try_into()
             .unwrap();
+        if w >= e {
+            bail!("bbox west ({w}) must be less than east ({e}) in '{spec}'");
+        }
+        if s >= n {
+            bail!("bbox south ({s}) must be less than north ({n}) in '{spec}'");
+        }
         return Ok(Some(Bbox { west: w, south: s, east: e, north: n }));
     }
 
