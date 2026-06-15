@@ -198,6 +198,7 @@ mod tests {
             frc: 3,
             fow: 3,
             direction: Direction::Both,
+            stable_id: [0u8; 16],
         });
         g
     }

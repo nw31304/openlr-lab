@@ -228,6 +228,7 @@ mod tests {
             length_m: len,
             frc: 3, fow: 3,
             direction: Direction::Both,
+            stable_id: [0u8; 16],
         }
     }
     fn cand(seg_id: u32, entry: u32, exit: u32) -> ScoredCandidate {

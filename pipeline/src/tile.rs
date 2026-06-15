@@ -133,7 +133,8 @@ fn build_tile_payload(
     let restriction_count  = intra.len() as u32;
     let xrestriction_count = cross.len() as u32;
 
-    // Build geometry pool, segment records, and segment GERS-id table (local index → GERS id).
+    // Build geometry pool, segment records, and stable-id table (local index → source ID).
+    // For OSM tiles the 16-byte id is the encoded OSM way ID (i64 LE in bytes 0-7, zeros 8-15).
     let mut geom_pool: Vec<(i32, i32)> = Vec::new();
     let mut seg_records: Vec<[u8; 32]> = Vec::with_capacity(tile_edge_indices.len());
     let mut seg_gers_ids: Vec<[u8; 16]> = Vec::with_capacity(tile_edge_indices.len());
@@ -163,10 +164,10 @@ fn build_tile_payload(
 
     let geom_vertex_count = geom_pool.len() as u32;
 
-    // 40-byte tile header.  Version 2 adds the segment GERS-id table after the segment array.
+    // 40-byte tile header.  Version 2 adds the stable-id table after the segment array.
     let mut hdr = [0u8; 40];
     hdr[0..4].copy_from_slice(&openlr_graph::tile::TILE_MAGIC);
-    hdr[4] = 2; // version: 2 adds segment GERS-id table
+    hdr[4] = 2; // version: 2 adds stable-id table
     hdr[8..12].copy_from_slice(&segment_count.to_le_bytes());
     hdr[12..16].copy_from_slice(&node_count.to_le_bytes());
     hdr[16..20].copy_from_slice(&restriction_count.to_le_bytes());
@@ -186,7 +187,7 @@ fn build_tile_payload(
     for r in &seg_records {
         payload.extend_from_slice(r);
     }
-    // Segment GERS-id table: one 16-byte entry per segment, indexed by local segment index.
+    // Stable-id table: one 16-byte entry per segment, indexed by local segment index.
     for gers in &seg_gers_ids {
         payload.extend_from_slice(gers.as_slice());
     }

@@ -4,7 +4,7 @@
 //!
 //! Header       40 bytes
 //! Segment array   segment_count × 32 bytes
-//! GERS-id table   segment_count × 16 bytes   (v2 only)
+//! Stable-id table segment_count × 16 bytes   (v2 only; OSM: way-id LE i64 + 8 zero bytes)
 //! Geometry pool   geom_vertex_count × 8 bytes
 //! Node table      node_count × 28 bytes
 //! Intra restrictions  restriction_count × 16 bytes
@@ -40,7 +40,7 @@ pub enum TileReadError {
 /// by matching their GERS IDs.
 pub struct TileLoader {
     pub graph: Graph,
-    /// GERS ID → global NodeId, for boundary nodes seen in previously loaded tiles.
+    /// Stable source ID → global NodeId, for boundary nodes seen in previously loaded tiles.
     boundary_nodes: HashMap<[u8; 16], NodeId>,
     next_node_id: u32,
     next_seg_id: u32,
@@ -99,8 +99,8 @@ fn parse_tile(
 
     // Compute section offsets.
     let seg_off   = 40;
-    let gers_off  = seg_off  + seg_count   * 32;  // GERS-id table (v2)
-    let geom_off  = gers_off + seg_count   * 16;
+    let sid_off   = seg_off  + seg_count   * 32;  // stable-id table (v2)
+    let geom_off  = sid_off  + seg_count   * 16;
     let node_off  = geom_off + geom_count  * 8;
     let restr_off = node_off + node_count  * 28;
     let xrestr_off= restr_off + restr_count * 16;
@@ -171,6 +171,10 @@ fn parse_tile(
         };
         let geometry = geom_pool[geom_idx..geom_idx + geom_len].to_vec();
 
+        let stable_id: [u8; 16] = b[sid_off + i * 16..sid_off + i * 16 + 16]
+            .try_into()
+            .unwrap();
+
         let seg_id = SegmentId(*next_seg);
         *next_seg += 1;
         local_seg.push(seg_id);
@@ -184,6 +188,7 @@ fn parse_tile(
             frc,
             fow,
             direction,
+            stable_id,
         });
     }
 

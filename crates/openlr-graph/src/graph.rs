@@ -132,6 +132,7 @@ mod tests {
             frc,
             fow: 3,
             direction: dir,
+            stable_id: [0u8; 16],
         }
     }
 

@@ -185,6 +185,7 @@ mod tests {
         NetworkSegment {
             id: SegmentId(id), start_node: NodeId(s), end_node: NodeId(e),
             geometry: geom, length_m: len, frc: 3, fow: 3, direction: Direction::Both,
+            stable_id: [0u8; 16],
         }
     }
 
