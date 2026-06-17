@@ -4,8 +4,6 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import { PMTiles } from 'pmtiles';
 import { useStore, getSegmentId, getSegGeomCache, getSegIdToTile, getTileGeomCache } from '../store.js';
 
-const PATH_FRC_NAME = ['Motorway', 'Trunk/Primary', 'Secondary', 'Tertiary', 'Unclassified', 'Residential', 'Svc/Living St', 'Other'];
-const PATH_FOW_NAME = ['Undefined', 'Motorway', 'Dual C/W', 'Single C/W', 'Roundabout', 'Traffic Sq', 'Slip Road', 'Other'];
 
 function popupStyle(anchor, w = 260, h = 200) {
   if (!anchor) return undefined;
@@ -54,6 +52,15 @@ function tilesForBounds(bounds, z) {
 function formatBearing(lb, ub) {
   if (Math.abs(ub - lb) < 0.1) return `${lb.toFixed(1)}°`;
   return `${lb.toFixed(1)}° – ${ub.toFixed(1)}°`;
+}
+
+function parseWktLinestring(wkt) {
+  const m = wkt?.match(/LINESTRING\s*\(([^)]+)\)/i);
+  if (!m) return null;
+  return m[1].trim().split(',').map(pair => {
+    const [lon, lat] = pair.trim().split(/\s+/).map(Number);
+    return [lon, lat];
+  });
 }
 
 // ── Map Component ──────────────────────────────────────────────────────────────
@@ -339,12 +346,8 @@ export default function MapView({ tilesBase, ready }) {
   }
 
   function onDecodedPathClick(e) {
-    if (!e.features?.length) return;
-    const props = e.features[0].properties;
-    setHighlightedSegment({ tile: props.tile, local_index: props.local_index });
-    setInfoProps(props);
-    setInfoAnchor({ x: e.point.x, y: e.point.y });
-    setLrpInfo(null);
+    // Path is a single WKT feature — no per-segment props. Stop propagation so
+    // the general map click handler doesn't dismiss the result panel.
     e.originalEvent.stopPropagation();
   }
 
@@ -567,37 +570,19 @@ export default function MapView({ tilesBase, ready }) {
       })),
     });
 
-    // ── Decoded path — per-segment features so each segment is clickable ─────
-    // Merge SegmentInfo (geometry, ids) with tile-cache properties (direction, length_m)
-    const segGeomCache = getSegGeomCache();
-    const pathFeatures = (decodeResult.ok && decodeResult.segments?.length)
-      ? decodeResult.segments
-          .filter(s => s.geometry?.length >= 2)
-          .map(s => {
-            const cached = segGeomCache.get(s.segment_id)?.properties ?? {};
-            return {
-              type: 'Feature',
-              geometry: { type: 'LineString', coordinates: s.geometry },
-              properties: {
-                tile:        s.tile,
-                local_index: s.local_index,
-                frc:         s.frc,
-                frc_name:    cached.frc_name ?? PATH_FRC_NAME[s.frc] ?? String(s.frc),
-                fow:         s.fow,
-                fow_name:    cached.fow_name ?? PATH_FOW_NAME[s.fow] ?? String(s.fow),
-                direction:   cached.direction ?? '—',
-                length_m:    cached.length_m ?? '—',
-                osm_way_id:  s.osm_way_id ?? cached.osm_way_id ?? null,
-                segment_id:  s.segment_id ?? null,
-              },
-            };
-          })
+    // ── Decoded path — use WKT for correctly offset-trimmed display ───────────
+    // Per-segment geometries span full segments and ignore arc-offset trim;
+    // the WKT from path_to_wkt already applies first_lrp_arc + pos_offset at
+    // the head and last_lrp_arc - neg_offset at the tail.
+    const wktCoords = parseWktLinestring(decodeResult.wkt);
+    const pathFeatures = (decodeResult.ok && wktCoords?.length >= 2)
+      ? [{ type: 'Feature', geometry: { type: 'LineString', coordinates: wktCoords }, properties: {} }]
       : [];
     pathSource?.setData({ type: 'FeatureCollection', features: pathFeatures });
 
     // ── Fit camera — prefer path coords, fall back to LRP coords ─────────────
-    const fitCoords = pathFeatures.length
-      ? pathFeatures.flatMap(f => f.geometry.coordinates)
+    const fitCoords = wktCoords?.length
+      ? wktCoords
       : lrps.map(l => [l.lon, l.lat]);
 
     if (fitCoords.length > 0) {
@@ -667,7 +652,7 @@ export default function MapView({ tilesBase, ready }) {
       {lrpInfo && (
         <div className="seg-info-panel" style={popupStyle(infoAnchor)}>
           <header className="seg-info-header">
-            <span>LRP {lrpInfo.index + 1}</span>
+            <span>LRP {lrpInfo.index}</span>
             <button className="seg-info-close" onClick={() => { setLrpInfo(null); setInfoAnchor(null); }}>✕</button>
           </header>
           <div className="seg-info-body">
