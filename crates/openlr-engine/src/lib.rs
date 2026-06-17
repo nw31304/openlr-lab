@@ -12,7 +12,7 @@ pub use params::{DecodeParams, Preset};
 pub use route_generator::RouteGenerator;
 pub use tile_prefetch::prefetch_tile_keys;
 pub use trace::{DecodeEvent, DecodeOutcome, DecodeTrace, TraceLevel};
-pub use wkt::path_to_wkt;
+pub use wkt::{path_to_wkt, path_band_wkt};
 
 use std::collections::HashMap;
 

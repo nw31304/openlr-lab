@@ -30,7 +30,8 @@ use wasm_bindgen::prelude::*;
 
 use openlr_codec::{decode_v3_base64, decode_tpeg_hex, decode_tpeg_base64};
 use openlr_codec::lrp::LocationReference;
-use openlr_engine::{decode as engine_decode, DecodeParams, Preset, prefetch_tile_keys, path_to_wkt};
+use openlr_engine::{decode as engine_decode, DecodeParams, Preset, prefetch_tile_keys, path_to_wkt, path_band_wkt};
+use openlr_graph::polyline_length_m;
 use openlr_engine::trace::TraversalDir;
 use openlr_provider::TileLoader;
 use serde::Serialize;
@@ -92,8 +93,23 @@ struct DecodeResult {
     wkt: Option<String>,
     segments: Vec<SegmentInfo>,
     lrps: Vec<LrpInfo>,
+    /// Midpoint of the positive-offset interval (meters from first LRP forward).
     pos_offset_m: f64,
+    /// Midpoint of the negative-offset interval (meters backward from last LRP).
     neg_offset_m: f64,
+    /// Raw [LB, UB] of the positive offset interval. Both 0 when no pos offset.
+    pos_offset_lb: f64,
+    pos_offset_ub: f64,
+    /// Raw [LB, UB] of the negative offset interval. Both 0 when no neg offset.
+    neg_offset_lb: f64,
+    neg_offset_ub: f64,
+    /// WKT of the v3 uncertainty band at the path head (pos offset LB→UB).
+    /// Absent when offset is zero or point-exact (TPEG).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pos_uncertainty_wkt: Option<String>,
+    /// WKT of the v3 uncertainty band at the path tail (neg offset LB→UB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neg_uncertainty_wkt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     /// Full decode trace; null when `trace_level` is `Off` or on error.
@@ -110,6 +126,12 @@ impl DecodeResult {
             lrps: vec![],
             pos_offset_m: 0.0,
             neg_offset_m: 0.0,
+            pos_offset_lb: 0.0,
+            pos_offset_ub: 0.0,
+            neg_offset_lb: 0.0,
+            neg_offset_ub: 0.0,
+            pos_uncertainty_wkt: None,
+            neg_uncertainty_wkt: None,
             error: Some(msg.into()),
             trace: None,
         }
@@ -262,6 +284,49 @@ impl Decoder {
             })
         }).collect();
 
+        // ── Offset intervals and uncertainty bands ──────────────────────────
+        // The v3 bucket turns each offset into a [lb, ub] interval; the engine
+        // uses the midpoint as the actual trim.  Expose the full interval so the
+        // UI can draw the uncertainty band between lb and ub.
+        let pos_int = loc_ref.lrps.first().and_then(|l| l.pos_offset);
+        let neg_int = loc_ref.lrps.last() .and_then(|l| l.neg_offset);
+
+        let (pos_offset_lb, pos_offset_ub) = pos_int.map(|i| (i.lb, i.ub)).unwrap_or((0.0, 0.0));
+        let (neg_offset_lb, neg_offset_ub) = neg_int.map(|i| (i.lb, i.ub)).unwrap_or((0.0, 0.0));
+
+        // Compute per-segment arc lengths once so both uncertainty bands can reuse them.
+        let actual_lens: Vec<f64> = result.path.iter()
+            .filter_map(|id| self.loader.graph.segments.get(id))
+            .map(|s| polyline_length_m(&s.geometry))
+            .collect();
+        let last_seg_len = actual_lens.last().copied().unwrap_or(0.0);
+
+        // Positive uncertainty: band from (first_lrp_arc + lb) to (first_lrp_arc + ub).
+        // Only meaningful when lb < ub (i.e., v3 encoding; TPEG has lb == ub).
+        let pos_uncertainty_wkt = pos_int
+            .filter(|i| i.ub > i.lb)
+            .and_then(|i| path_band_wkt(
+                &result.path,
+                result.first_lrp_arc_m + i.lb,
+                result.first_lrp_arc_m + i.ub,
+                result.first_seg_traversal,
+                &self.loader.graph,
+            ));
+
+        // Negative uncertainty: band at the tail.
+        // Last LRP position from path start = sum(segs[0..n-2]) + last_lrp_arc_m.
+        let last_lrp_pos_from_start: f64 = actual_lens[..actual_lens.len().saturating_sub(1)]
+            .iter().sum::<f64>() + result.last_lrp_arc_m.min(last_seg_len);
+        let neg_uncertainty_wkt = neg_int
+            .filter(|i| i.ub > i.lb)
+            .and_then(|i| path_band_wkt(
+                &result.path,
+                (last_lrp_pos_from_start - i.ub).max(0.0),
+                last_lrp_pos_from_start - i.lb,
+                result.first_seg_traversal,
+                &self.loader.graph,
+            ));
+
         let trace_value = result.trace.and_then(|t| serde_json::to_value(t).ok());
 
         serde_json::to_string(&DecodeResult {
@@ -271,6 +336,12 @@ impl Decoder {
             lrps,
             pos_offset_m: result.pos_offset_m,
             neg_offset_m: result.neg_offset_m,
+            pos_offset_lb,
+            pos_offset_ub,
+            neg_offset_lb,
+            neg_offset_ub,
+            pos_uncertainty_wkt,
+            neg_uncertainty_wkt,
             error: None,
             trace: trace_value,
         }).unwrap()

@@ -216,6 +216,17 @@ export default function MapView({ tilesBase, ready }) {
         },
       });
 
+      // ── Offset uncertainty bands (v3 [lb, ub] zone at path head/tail) ────
+      map.addSource('offset-uncertainty', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+      map.addLayer({
+        id: 'offset-uncertainty-halo', type: 'line', source: 'offset-uncertainty',
+        paint: { 'line-color': '#ffcc00', 'line-width': 12, 'line-opacity': 0.35 },
+      });
+      map.addLayer({
+        id: 'offset-uncertainty-dash', type: 'line', source: 'offset-uncertainty',
+        paint: { 'line-color': '#ffcc00', 'line-width': 4, 'line-opacity': 0.95, 'line-dasharray': [4, 3] },
+      });
+
       // ── LRP bearing cone (shown when an LRP is selected) ─────────────────
       map.addSource('lrp-bearing', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
       map.addLayer({
@@ -599,12 +610,14 @@ export default function MapView({ tilesBase, ready }) {
     const map = mapRef.current;
     if (!map) return;
 
-    const pathSource = map.getSource('decoded-path');
-    const lrpSource  = map.getSource('lrp-markers');
+    const pathSource        = map.getSource('decoded-path');
+    const lrpSource         = map.getSource('lrp-markers');
+    const uncertaintySource = map.getSource('offset-uncertainty');
 
     if (!decodeResult) {
       pathSource?.setData({ type: 'FeatureCollection', features: [] });
       lrpSource?.setData({ type: 'FeatureCollection', features: [] });
+      uncertaintySource?.setData({ type: 'FeatureCollection', features: [] });
       setInfoProps(null);
       setInfoAnchor(null);
       setLrpInfo(null);
@@ -636,6 +649,26 @@ export default function MapView({ tilesBase, ready }) {
       ? [{ type: 'Feature', geometry: { type: 'LineString', coordinates: wktCoords }, properties: {} }]
       : [];
     pathSource?.setData({ type: 'FeatureCollection', features: pathFeatures });
+
+    // ── Offset uncertainty bands ──────────────────────────────────────────────
+    // Shown only when the offset is a v3 bucket interval (lb < ub).
+    const uncertaintyFeatures = [];
+    for (const [wkt, label] of [
+      [decodeResult.pos_uncertainty_wkt, 'pos'],
+      [decodeResult.neg_uncertainty_wkt, 'neg'],
+    ]) {
+      if (wkt) {
+        const coords = parseWktLinestring(wkt);
+        if (coords?.length >= 2) {
+          uncertaintyFeatures.push({
+            type: 'Feature',
+            geometry: { type: 'LineString', coordinates: coords },
+            properties: { label },
+          });
+        }
+      }
+    }
+    uncertaintySource?.setData({ type: 'FeatureCollection', features: uncertaintyFeatures });
 
     // ── Fit camera — prefer path coords, fall back to LRP coords ─────────────
     const fitCoords = wktCoords?.length

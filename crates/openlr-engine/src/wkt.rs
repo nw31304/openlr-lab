@@ -174,6 +174,49 @@ fn segment_vertices(
     out
 }
 
+/// Extract a WKT linestring for a band of the path between two arc-length positions,
+/// both measured from the traversal entry of the first segment.
+///
+/// This is used to render offset-uncertainty bands: the caller passes the LB and UB
+/// of the offset interval (converted to absolute arc positions from path start), and
+/// gets back the geometry of that uncertainty zone.
+///
+/// Implemented by delegating to `path_to_wkt` with synthetic trim parameters:
+/// - start trim = `from_m` (treated as a pos-offset from a zero-arc-length first LRP)
+/// - end trim   = `total_path_len - to_m` (treated as a neg-offset from a full-length last LRP)
+pub fn path_band_wkt(
+    path: &[SegmentId],
+    from_m: f64,
+    to_m: f64,
+    first_seg_traversal: TraversalDir,
+    graph: &Graph,
+) -> Option<String> {
+    if from_m >= to_m { return None; }
+
+    let segs: Vec<_> = path.iter()
+        .map(|id| graph.segments.get(id))
+        .collect::<Option<Vec<_>>>()?;
+
+    let actual_lens: Vec<f64> = segs.iter()
+        .map(|s| polyline_length_m(&s.geometry))
+        .collect();
+    let total_len: f64 = actual_lens.iter().sum();
+    let last_seg_len = *actual_lens.last()?;
+
+    let neg_trim = (total_len - to_m).max(0.0);
+
+    path_to_wkt(
+        path,
+        from_m.max(0.0),
+        neg_trim,
+        0.0,           // first_lrp_arc_m = 0 (LRP at entry of first seg)
+        last_seg_len,  // last_lrp_arc_m = full length (LRP at exit of last seg)
+        first_seg_traversal,
+        TraversalDir::Forward, // _last_seg_traversal is unused by path_to_wkt
+        graph,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
