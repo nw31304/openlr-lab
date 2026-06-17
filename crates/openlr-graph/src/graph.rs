@@ -2,6 +2,24 @@ use std::collections::HashMap;
 use crate::{NetworkNode, NetworkSegment, NodeId, SegmentId, TurnRestriction, Direction};
 use crate::geometry::{haversine_m, project_onto_polyline};
 
+/// Why a candidate successor edge was filtered out by `successors_skipped()`.
+///
+/// U-turns (`seg_id == incoming_seg`) are not reported here — they are an
+/// unconditional routing rule, not a data-quality signal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum EdgeSkipReason {
+    /// Segment FRC is numerically greater than LFRCNP (less important than the
+    /// leg's lowest-FRC-to-next-point floor).
+    FrcBelowLfrcnp { seg_frc: u8, lfrcnp: u8 },
+    /// An explicit turn restriction prohibits `incoming_seg → node → this_seg`.
+    TurnRestricted,
+    /// The outgoing edge map contains this segment, but the segment's stored
+    /// direction does not permit entry from `node`.  Should be rare in practice
+    /// (indicates a graph-construction inconsistency), but surfaced here so it
+    /// is never silently swallowed.
+    DirectionBlocked,
+}
+
 /// In-memory routing graph built from loaded tile data.
 ///
 /// `outgoing[node]` lists every segment that can be *entered* from `node`:
@@ -113,6 +131,44 @@ impl Graph {
             result.push((next_node, seg_id, seg.length_m));
         }
         result
+    }
+
+    /// Returns the outgoing edges from `(node, incoming_seg)` that were **filtered out**
+    /// by `successors()`, with the reason each was skipped.
+    ///
+    /// Mirrors the filter chain in `successors()` exactly.  Only call this under
+    /// Full trace — it iterates all outgoing edges a second time.
+    pub fn successors_skipped(
+        &self,
+        node: NodeId,
+        incoming_seg: SegmentId,
+        lfrcnp: u8,
+    ) -> Vec<(SegmentId, EdgeSkipReason)> {
+        let mut skipped = Vec::new();
+        for &seg_id in self.outgoing.get(&node).into_iter().flatten() {
+            if seg_id == incoming_seg { continue; } // U-turn — expected, not a skip to report
+            let seg = match self.segments.get(&seg_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            if seg.frc > lfrcnp {
+                skipped.push((seg_id, EdgeSkipReason::FrcBelowLfrcnp { seg_frc: seg.frc, lfrcnp }));
+                continue;
+            }
+            if self.is_restricted(incoming_seg, node, seg_id) {
+                skipped.push((seg_id, EdgeSkipReason::TurnRestricted));
+                continue;
+            }
+            let ok = match seg.direction {
+                Direction::Forward | Direction::Both if seg.start_node == node => true,
+                Direction::Backward | Direction::Both if seg.end_node == node  => true,
+                _ => false,
+            };
+            if !ok {
+                skipped.push((seg_id, EdgeSkipReason::DirectionBlocked));
+            }
+        }
+        skipped
     }
 
     /// Haversine distance from node to (lon, lat). Returns None if node not loaded.

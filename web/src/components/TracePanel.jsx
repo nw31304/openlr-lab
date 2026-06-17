@@ -74,11 +74,15 @@ function fmtM(v) { return v == null ? '—' : `${v.toFixed(1)} m`; }
 function fmtScore(v) { return v == null ? '—' : v.toFixed(4); }
 
 function fmtSkipReason(reason) {
-  if (typeof reason === 'string') return reason;
-  const [type, data] = Object.entries(reason)[0];
+  // Unit variants serialise as plain strings; struct variants as {TypeName: {…}}.
+  const [type, data] = typeof reason === 'string'
+    ? [reason, {}]
+    : Object.entries(reason)[0];
   switch (type) {
-    case 'FrcBelowLfrcnp':    return `FRC below LFRCNP (seg FRC${data.seg_frc} < ${data.lfrcnp})`;
-    case 'ExceedsMaxDistance': return `Exceeds max dist (${data.distance_m.toFixed(0)}m > ${data.max_m.toFixed(0)}m)`;
+    case 'FrcBelowLfrcnp':    return `FRC ${data.seg_frc} > LFRCNP ${data.lfrcnp} (too unimportant)`;
+    case 'DirectionBlocked':  return 'One-way — wrong direction';
+    case 'TurnRestricted':    return 'Turn restriction';
+    case 'ExceedsMaxDistance': return `Exceeds max dist (${data.distance_m?.toFixed(0)}m > ${data.max_m?.toFixed(0)}m)`;
     default: return type;
   }
 }

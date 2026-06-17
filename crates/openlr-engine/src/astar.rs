@@ -2,7 +2,8 @@ use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Reverse;
 
 use openlr_codec::interval::LinearInterval;
-use openlr_graph::{Graph, NodeId, SegmentId};
+use openlr_graph::{EdgeSkipReason, Graph, NodeId, SegmentId};
+use crate::trace::TraceLevel;
 
 use crate::trace::{DecodeEvent, RoutingFailure, SkipReason, ScoredCandidate, DecodeTrace};
 use DecodeEvent as Ev;
@@ -132,6 +133,23 @@ pub fn find_route(
         // Goal check: reached to.entry_node via a segment other than the start segment.
         if node == goal_node && via_seg != from.segment_id {
             return Ok(reconstruct(entry_idx, &closed_list, from.segment_id, to.segment_id));
+        }
+
+        // Under Full trace, report edges filtered out by the graph before A* sees them.
+        if trace.params.trace_level == TraceLevel::Full {
+            for (seg_id, reason) in graph.successors_skipped(node, via_seg, lfrcnp) {
+                trace.push_full(Ev::AStarEdgeSkipped {
+                    leg,
+                    from_node: node,
+                    segment_id: seg_id,
+                    reason: match reason {
+                        EdgeSkipReason::FrcBelowLfrcnp { seg_frc, lfrcnp } =>
+                            SkipReason::FrcBelowLfrcnp { seg_frc, lfrcnp },
+                        EdgeSkipReason::TurnRestricted  => SkipReason::TurnRestricted,
+                        EdgeSkipReason::DirectionBlocked => SkipReason::DirectionBlocked,
+                    },
+                });
+            }
         }
 
         // Expand successors.
