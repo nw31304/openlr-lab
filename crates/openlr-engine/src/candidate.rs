@@ -22,18 +22,18 @@ pub fn select_candidates(
 ) -> Vec<ScoredCandidate> {
     let (lon, lat) = lrp.coord;
 
+    let nearby = graph.segments_near(lon, lat, params.candidate_search_radius_m);
+
     trace.push_summary(DecodeEvent::CandidateSearchStarted {
         lrp_idx,
         coord: lrp.coord,
         radius_m: params.candidate_search_radius_m,
     });
 
-    let nearby = graph.segments_near(lon, lat, params.candidate_search_radius_m);
-
     let mut accepted: Vec<ScoredCandidate> = Vec::new();
     let mut rejected: Vec<RejectedCandidate> = Vec::new();
 
-    for (seg_id, _coarse_dist) in nearby {
+    for &(seg_id, _coarse_dist) in &nearby {
         let seg = match graph.segments.get(&seg_id) {
             Some(s) => s,
             None => continue,
@@ -102,6 +102,7 @@ pub fn select_candidates(
         lrp_idx,
         accepted: accepted.clone(),
         rejected,
+        segments_fetched: nearby.len(),
     });
 
     accepted

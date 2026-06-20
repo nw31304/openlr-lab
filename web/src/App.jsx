@@ -5,7 +5,6 @@ import TopBar from './components/TopBar.jsx';
 import ResultPanel from './components/ResultPanel.jsx';
 import ParamsPanel from './components/ParamsPanel.jsx';
 import TracePanel from './components/TracePanel.jsx';
-import ReplayPanel from './components/ReplayPanel.jsx';
 import { setPmtiles, setDecoder, setZoom, useStore } from './store.js';
 import { initWasm } from './wasm.js';
 
@@ -17,14 +16,18 @@ export default function App() {
   useEffect(() => {
     async function setup() {
       try {
+        // ?tiles= URL param overrides the stored preference (useful for shareable
+        // links and dev overrides). Falls back to the persisted tileUrl, then the
+        // hardcoded dev default.
         const tilesParam = new URLSearchParams(window.location.search).get('tiles') ?? '';
-        const isAbsolute = tilesParam.startsWith('http://') || tilesParam.startsWith('https://');
-        // In dev, tiles are served by a dedicated HTTP server on :5176 (bypasses Vite).
-        // In production (or when an absolute URL is given), use as-is.
-        const devTileBase = `http://localhost:5176`;
-        const base = isAbsolute ? tilesParam
-                   : tilesParam  ? `${devTileBase}/${tilesParam}`
-                   : devTileBase;
+        const storedUrl  = useStore.getState().tileUrl || 'http://localhost:5176';
+        let base;
+        if (tilesParam) {
+          const isAbsolute = tilesParam.startsWith('http://') || tilesParam.startsWith('https://');
+          base = isAbsolute ? tilesParam : `http://localhost:5176/${tilesParam}`;
+        } else {
+          base = storedUrl;
+        }
         setTilesBase(base);
 
         console.log('[app] tile base:', base);
@@ -49,7 +52,6 @@ export default function App() {
     </div>
   );
 
-  const showReplay = useStore(s => s.showReplay);
   return (
     <div className="app">
       <MapView tilesBase={tilesBase} ready={ready} />
@@ -57,7 +59,6 @@ export default function App() {
       <ParamsPanel />
       <ResultPanel />
       <TracePanel />
-      {showReplay && <ReplayPanel />}
     </div>
   );
 }

@@ -1,6 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { useStore } from '../store.js';
 import { useDraggable } from '../hooks.js';
+import ReplayPanel from './ReplayPanel.jsx';
 
 const ASTAR_DISPLAY_CAP = 200;
 
@@ -530,7 +531,8 @@ function ResultSection({ decodeResult }) {
 // ── Main panel ────────────────────────────────────────────────────────────────
 
 export default function TracePanel() {
-  const { decodeResult, openlrString, showTrace, params, setParam, toggleTrace, setTraceHighlight, setTraceLrpFocus } = useStore();
+  const { decodeResult, openlrString, showTrace, params, setParam, toggleTrace,
+          setTraceHighlight, setTraceLrpFocus, replaySteps } = useStore();
   const panelRef = useRef(null);
   const { pos, onMouseDown } = useDraggable(panelRef);
 
@@ -626,6 +628,7 @@ export default function TracePanel() {
           </>
         )}
       </div>
+      {replaySteps?.length > 0 && <ReplayPanel />}
     </div>
   );
 }

@@ -4,14 +4,32 @@ import { useStore } from '../store.js';
 const TRACE_LEVELS = ['Off', 'Summary', 'Full'];
 
 export default function TopBar() {
-  const { openlrString, showParams, showTrace, showSegmentLayer, showReplay, decoding, params,
-          setOpenlrString, toggleParams, toggleTrace, toggleSegmentLayer, toggleReplay,
-          setTraceLevel, resetToDefaults, runDecode, replaySteps } = useStore();
+  const { openlrString, showParams, showTrace, showSegmentLayer, decoding, params,
+          decodeResult, tileUrl, setTileUrl,
+          setOpenlrString, toggleParams, toggleTrace, toggleSegmentLayer,
+          setTraceLevel, resetToDefaults, runDecode } = useStore();
 
   const [showGear, setShowGear] = useState(false);
   const gearRef = useRef(null);
 
   const traceLevel = params?.trace_level ?? 'Summary';
+  // Dot on gear button when trace data exists but the panel is closed
+  const hasTraceData = !!decodeResult?.trace && !showTrace;
+
+  // Tile URL input — initialise from URL param if active, else from stored value
+  const urlParam = new URLSearchParams(window.location.search).get('tiles') ?? '';
+  const effectiveUrl = urlParam
+    ? (urlParam.startsWith('http') ? urlParam : `http://localhost:5176/${urlParam}`)
+    : (tileUrl || 'http://localhost:5176');
+  const [urlDraft, setUrlDraft] = useState(effectiveUrl);
+
+  const applyTileUrl = () => {
+    const trimmed = urlDraft.trim();
+    if (!trimmed) return;
+    setTileUrl(trimmed);
+    // Navigate to clean URL (strips ?tiles= param) so the stored value takes effect
+    window.location.assign(window.location.pathname);
+  };
 
   useEffect(() => {
     if (!showGear) return;
@@ -35,9 +53,9 @@ export default function TopBar() {
       />
       <div className="gear-wrap" ref={gearRef}>
         <button
-          className={`params-btn${showGear ? ' active' : ''}`}
+          className={`params-btn${showGear ? ' active' : ''}${hasTraceData ? ' has-trace' : ''}`}
           onClick={() => setShowGear(g => !g)}
-          title="Options"
+          title={hasTraceData ? 'Options (trace data available)' : 'Options'}
         >⚙</button>
         {showGear && (
           <div className="gear-panel">
@@ -48,20 +66,9 @@ export default function TopBar() {
               </button>
             </div>
             <div className="gear-row">
-              <span>Trace panel</span>
+              <span>Decode trace</span>
               <button className={`gear-toggle${showTrace ? ' on' : ''}`} onClick={toggleTrace}>
                 {showTrace ? 'On' : 'Off'}
-              </button>
-            </div>
-            <div className="gear-row">
-              <span>Replay</span>
-              <button
-                className={`gear-toggle${showReplay ? ' on' : ''}${!replaySteps?.length ? ' disabled' : ''}`}
-                onClick={toggleReplay}
-                disabled={!replaySteps?.length}
-                title={!replaySteps?.length ? 'Decode first to enable replay' : undefined}
-              >
-                {showReplay ? 'On' : 'Off'}
               </button>
             </div>
             <div className="gear-row">
@@ -77,6 +84,31 @@ export default function TopBar() {
               </div>
             </div>
             <div className="gear-divider" />
+            <div className="gear-section-hdr">Tile source</div>
+            {urlParam && (
+              <div className="gear-url-note">
+                URL param active — apply to persist
+              </div>
+            )}
+            <div className="gear-url-row">
+              <input
+                className="gear-url-input"
+                type="url"
+                value={urlDraft}
+                onChange={e => setUrlDraft(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && applyTileUrl()}
+                spellCheck={false}
+                placeholder="http://localhost:5176"
+              />
+            </div>
+            <button
+              className="gear-url-apply"
+              onClick={applyTileUrl}
+              disabled={!urlDraft.trim()}
+            >
+              Apply &amp; reload
+            </button>
+            <div className="gear-divider" />
             <button className="gear-action" onClick={() => { toggleParams(); setShowGear(false); }}>
               Parameters…
             </button>
@@ -86,13 +118,6 @@ export default function TopBar() {
           </div>
         )}
       </div>
-      {replaySteps?.length > 0 && (
-        <button
-          className={`replay-btn${showReplay ? ' active' : ''}`}
-          onClick={toggleReplay}
-          title="Toggle decode replay"
-        >▶ Replay</button>
-      )}
       <button className="decode-btn" onClick={runDecode} disabled={decoding}>
         {decoding ? '…' : 'Decode'}
       </button>

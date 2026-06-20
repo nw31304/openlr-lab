@@ -95,6 +95,17 @@ pub struct RejectedCandidate {
 
 // ── Gate verdicts / skip reasons ─────────────────────────────────────────────
 
+/// Why A* stopped without reaching the goal (carried in `AStarTerminated`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum AStarTerminationReason {
+    /// The open set was fully drained — the graph is genuinely disconnected in
+    /// this region with the current FRC/direction/turn-restriction settings.
+    OpenSetExhausted,
+    /// The per-leg expansion cap was hit.  Raise `max_astar_expansions` or loosen
+    /// `lfrcnp_tolerance` to let A* search further.
+    ExpansionLimitHit { limit: usize },
+}
+
 /// Why a candidate failed a hard gate.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum GateVerdict {
@@ -154,6 +165,9 @@ pub enum DecodeEvent {
         lrp_idx: usize,
         accepted: Vec<ScoredCandidate>,
         rejected: Vec<RejectedCandidate>,
+        /// How many raw segments were returned by the spatial query before directional
+        /// expansion. Zero means there are no road segments in the search area (coverage gap).
+        segments_fetched: usize,
     },
 
     // ── Routing ──────────────────────────────────────────────────────────────
@@ -179,6 +193,22 @@ pub enum DecodeEvent {
         from_node: NodeId,
         segment_id: SegmentId,
         reason: SkipReason,
+    },
+    /// Emitted at Summary level when A* fails to reach the goal.
+    /// Carries aggregate skip-reason counts so the cause is diagnosable without Full trace.
+    AStarTerminated {
+        leg: usize,
+        reason: AStarTerminationReason,
+        /// Nodes popped from the open set (includes duplicates skipped by the closed set).
+        nodes_expanded: usize,
+        /// Edges blocked because segment FRC exceeds effective LFRCNP.
+        edges_skipped_frc: u32,
+        /// Edges blocked by one-way / direction constraint.
+        edges_skipped_direction: u32,
+        /// Edges blocked by an explicit turn restriction.
+        edges_skipped_turn: u32,
+        /// Edges skipped because accumulated path distance would exceed the A* cap.
+        edges_skipped_distance: u32,
     },
     /// The engine needs a tile that isn't loaded; caller must inject it.
     TileNeeded {

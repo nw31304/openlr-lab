@@ -114,11 +114,11 @@ export const PRESETS = {
 export const useStore = create(persist(
  (set, get) => ({
   openlrString: '',
+  tileUrl: 'http://localhost:5176',
   params: { ...PRESETS.Default },
   showParams: false,
   showTrace: false,
   showSegmentLayer: false,
-  showReplay: false,
   decoding: false,
   decodeResult: null,
   highlightedSegment: null,
@@ -130,6 +130,7 @@ export const useStore = create(persist(
   replayStep: 0,          // current display step index
 
   setOpenlrString: (s) => set({ openlrString: s }),
+  setTileUrl: (url) => set({ tileUrl: url }),
 
   resetToDefaults: () => set({ params: { ...PRESETS.Default } }),
 
@@ -150,12 +151,21 @@ export const useStore = create(persist(
   toggleParams:        () => set(state => ({ showParams:        !state.showParams })),
   toggleTrace:         () => set(state => ({ showTrace:         !state.showTrace })),
   toggleSegmentLayer:  () => set(state => ({ showSegmentLayer:  !state.showSegmentLayer })),
-  toggleReplay:        () => set(state => ({ showReplay:        !state.showReplay })),
 
   setReplayStep:  (n)  => set(state => ({ replayStep: Math.max(0, Math.min(n, state.replaySteps.length - 1)) })),
   stepReplay: (delta) => set(state => ({
     replayStep: Math.max(0, Math.min(state.replayStep + delta, state.replaySteps.length - 1)),
   })),
+
+  // Re-decode at an elevated trace level and open the trace panel.
+  // Off → Summary on first call; Summary or Full → Full on subsequent calls.
+  debugDecode: async () => {
+    const { params } = get();
+    const current = params.trace_level ?? 'Summary';
+    const elevated = current === 'Off' ? 'Summary' : 'Full';
+    set(state => ({ params: { ...state.params, trace_level: elevated }, showTrace: true }));
+    await get().runDecode();
+  },
 
   clearResult: () => set({ decodeResult: null, highlightedSegment: null, traceHighlightSegIds: null, traceLrpFocus: null }),
   setHighlightedSegment: (seg) => set({ highlightedSegment: seg }),
@@ -253,6 +263,7 @@ export const useStore = create(persist(
    name: 'openlrlens-settings',
    partialize: (state) => ({
      openlrString: state.openlrString,
+     tileUrl: state.tileUrl,
      params: state.params,
    }),
    // Deep-merge params so new fields added to PRESETS.Default survive across

@@ -136,8 +136,8 @@ impl Graph {
     /// Returns the outgoing edges from `(node, incoming_seg)` that were **filtered out**
     /// by `successors()`, with the reason each was skipped.
     ///
-    /// Mirrors the filter chain in `successors()` exactly.  Only call this under
-    /// Full trace — it iterates all outgoing edges a second time.
+    /// Mirrors the filter chain in `successors()` exactly.  Called at Summary+ trace
+    /// level for aggregate skip counting and at Full level for per-edge events.
     pub fn successors_skipped(
         &self,
         node: NodeId,

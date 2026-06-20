@@ -5,7 +5,7 @@ use openlr_codec::interval::LinearInterval;
 use openlr_graph::{EdgeSkipReason, Graph, NodeId, SegmentId};
 use crate::trace::TraceLevel;
 
-use crate::trace::{DecodeEvent, RoutingFailure, SkipReason, ScoredCandidate, DecodeTrace};
+use crate::trace::{AStarTerminationReason, DecodeEvent, RoutingFailure, SkipReason, ScoredCandidate, DecodeTrace};
 use DecodeEvent as Ev;
 
 /// Sentinel: used as `incoming_seg` at the very start of A* (no prior edge).
@@ -103,15 +103,21 @@ pub fn find_route(
     open.push((Reverse(F64Key(h0)), F64Key(0.0), start_node, from.segment_id, None));
 
     let mut expansions: usize = 0;
+    let mut expansion_limit_hit = false;
+    // Aggregate skip counts — tracked at Summary+ level for AStarTerminated.
+    let mut skip_frc:  u32 = 0;
+    let mut skip_dir:  u32 = 0;
+    let mut skip_turn: u32 = 0;
+    let mut skip_dist: u32 = 0;
+
     while let Some((_, g_key, node, via_seg, parent_idx)) = open.pop() {
         let g = g_key.0;
         let state = (node, via_seg);
 
-        if max_astar_expansions > 0 {
-            expansions += 1;
-            if expansions > max_astar_expansions {
-                break;
-            }
+        expansions += 1;
+        if max_astar_expansions > 0 && expansions > max_astar_expansions {
+            expansion_limit_hit = true;
+            break;
         }
 
         // Skip if we've seen a cheaper path to this (node, seg) state.
@@ -142,20 +148,28 @@ pub fn find_route(
             return Ok(reconstruct(entry_idx, &closed_list, from.segment_id, to.segment_id));
         }
 
-        // Under Full trace, report edges filtered out by the graph before A* sees them.
-        if trace.params.trace_level == TraceLevel::Full {
+        // Count (and at Full level: report) edges filtered out before A* sees them.
+        // Called at Summary+ so AStarTerminated can carry aggregate counts without Full trace.
+        if trace.params.trace_level != TraceLevel::Off {
             for (seg_id, reason) in graph.successors_skipped(node, via_seg, lfrcnp) {
-                trace.push_full(Ev::AStarEdgeSkipped {
-                    leg,
-                    from_node: node,
-                    segment_id: seg_id,
-                    reason: match reason {
-                        EdgeSkipReason::FrcBelowLfrcnp { seg_frc, lfrcnp } =>
-                            SkipReason::FrcBelowLfrcnp { seg_frc, lfrcnp },
-                        EdgeSkipReason::TurnRestricted  => SkipReason::TurnRestricted,
-                        EdgeSkipReason::DirectionBlocked => SkipReason::DirectionBlocked,
-                    },
-                });
+                match &reason {
+                    EdgeSkipReason::FrcBelowLfrcnp { .. } => skip_frc  += 1,
+                    EdgeSkipReason::TurnRestricted        => skip_turn += 1,
+                    EdgeSkipReason::DirectionBlocked      => skip_dir  += 1,
+                }
+                if trace.params.trace_level == TraceLevel::Full {
+                    trace.push_full(Ev::AStarEdgeSkipped {
+                        leg,
+                        from_node: node,
+                        segment_id: seg_id,
+                        reason: match reason {
+                            EdgeSkipReason::FrcBelowLfrcnp { seg_frc, lfrcnp } =>
+                                SkipReason::FrcBelowLfrcnp { seg_frc, lfrcnp },
+                            EdgeSkipReason::TurnRestricted   => SkipReason::TurnRestricted,
+                            EdgeSkipReason::DirectionBlocked => SkipReason::DirectionBlocked,
+                        },
+                    });
+                }
             }
         }
 
@@ -164,15 +178,18 @@ pub fn find_route(
             let new_g = g + seg_len;
 
             if new_g > max_dist_m {
-                trace.push_full(Ev::AStarEdgeSkipped {
-                    leg,
-                    from_node: node,
-                    segment_id: next_seg,
-                    reason: SkipReason::ExceedsMaxDistance {
-                        distance_m: new_g,
-                        max_m: max_dist_m,
-                    },
-                });
+                if trace.params.trace_level != TraceLevel::Off { skip_dist += 1; }
+                if trace.params.trace_level == TraceLevel::Full {
+                    trace.push_full(Ev::AStarEdgeSkipped {
+                        leg,
+                        from_node: node,
+                        segment_id: next_seg,
+                        reason: SkipReason::ExceedsMaxDistance {
+                            distance_m: new_g,
+                            max_m: max_dist_m,
+                        },
+                    });
+                }
                 continue;
             }
 
@@ -187,6 +204,22 @@ pub fn find_route(
             open.push((Reverse(F64Key(new_g + h)), F64Key(new_g), next_node, next_seg, Some(entry_idx)));
         }
     }
+
+    // Emit termination summary before returning failure so callers can diagnose
+    // the reason without requiring Full trace.
+    trace.push_summary(Ev::AStarTerminated {
+        leg,
+        reason: if expansion_limit_hit {
+            AStarTerminationReason::ExpansionLimitHit { limit: max_astar_expansions }
+        } else {
+            AStarTerminationReason::OpenSetExhausted
+        },
+        nodes_expanded: expansions,
+        edges_skipped_frc:       skip_frc,
+        edges_skipped_direction: skip_dir,
+        edges_skipped_turn:      skip_turn,
+        edges_skipped_distance:  skip_dist,
+    });
 
     Err(RoutingFailure::NoPathFound)
 }

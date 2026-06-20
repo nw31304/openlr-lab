@@ -223,7 +223,7 @@ export default function MapView({ tilesBase, ready }) {
   const replayStep  = useStore(s => s.replayStep);
   const replaySteps = useStore(s => s.replaySteps);
   const replayStats = useStore(s => s.replayStats);
-  const showReplay  = useStore(s => s.showReplay);
+  const showTrace   = useStore(s => s.showTrace);
 
   // Reset drag position when a new popup target is clicked
   useEffect(() => { lrpResetPos(); }, [lrpInfo]);   // eslint-disable-line react-hooks/exhaustive-deps
@@ -933,10 +933,10 @@ export default function MapView({ tilesBase, ready }) {
 
     const emptyFC = { type: 'FeatureCollection', features: [] };
     const replaySources = ['replay-radius', 'replay-route', 'replay-candidates', 'replay-cloud', 'replay-frontier', 'replay-leg', 'replay-flash'];
-    const vis = showReplay && replaySteps.length > 0 ? 'visible' : 'none';
+    const vis = showTrace && replaySteps.length > 0 ? 'visible' : 'none';
     replayLayerIds.forEach(id => { if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis); });
 
-    if (!showReplay || !replaySteps.length) {
+    if (!showTrace || !replaySteps.length) {
       replaySources.forEach(s => { map.getSource(s)?.setData(emptyFC); });
       replayVisualRef.current = null;
       replayStepRef.current   = -1;
@@ -1098,7 +1098,7 @@ export default function MapView({ tilesBase, ready }) {
         flashAnimRef.current = requestAnimationFrame(animFlash);
       }
     }
-  }, [showReplay, replayStep, replaySteps, replayStats]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [showTrace, replayStep, replaySteps, replayStats]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Segment layer visibility toggle ──────────────────────────────────────────
 

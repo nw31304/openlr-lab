@@ -77,7 +77,13 @@ export function buildReplaySteps(events) {
         break;
 
       case 'CandidatesRanked':
-        steps.push({ type: 'candidates_ranked', lrp_idx: d.lrp_idx, accepted: d.accepted, rejected: d.rejected ?? [] });
+        steps.push({
+          type: 'candidates_ranked',
+          lrp_idx: d.lrp_idx,
+          accepted: d.accepted,
+          rejected: d.rejected ?? [],
+          segments_fetched: d.segments_fetched ?? 0,
+        });
         i++;
         break;
 
@@ -109,6 +115,20 @@ export function buildReplaySteps(events) {
       }
 
       case 'AStarEdgeSkipped':
+        i++;
+        break;
+
+      case 'AStarTerminated':
+        steps.push({
+          type: 'astar_terminated',
+          leg:               d.leg,
+          reason:            d.reason,
+          nodes_expanded:    d.nodes_expanded,
+          edges_skipped_frc:       d.edges_skipped_frc       ?? 0,
+          edges_skipped_direction: d.edges_skipped_direction ?? 0,
+          edges_skipped_turn:      d.edges_skipped_turn      ?? 0,
+          edges_skipped_distance:  d.edges_skipped_distance  ?? 0,
+        });
         i++;
         break;
 
@@ -150,17 +170,18 @@ export function buildReplaySteps(events) {
 
 function emptyState() {
   return {
-    searchRadius:  null,    // { lon, lat, radiusM, lrpIdx }
-    candidates:    [],      // { lon, lat, ctype, score, lrpIdx, segmentId, winner }
-    astarNodes:    [],      // { lon, lat, gM, hM, color }
-    frontier:      [],      // last FRONTIER_SIZE nodes
-    currentLeg:    null,    // { leg, fromPt, toPt, fromSegId, toSegId }
-    routeSegIds:   [],      // segment IDs of current best route
-    maxG:          0,
-    statusText:    'Ready to replay',
-    phase:         'idle',
-    stepType:      '',
-    stepIdx:       -1,
+    searchRadius:    null,    // { lon, lat, radiusM, lrpIdx }
+    candidates:      [],      // { lon, lat, ctype, score, lrpIdx, segmentId, winner }
+    astarNodes:      [],      // { lon, lat, gM, hM, color }
+    frontier:        [],      // last FRONTIER_SIZE nodes
+    currentLeg:      null,    // { leg, fromPt, toPt, fromSegId, toSegId }
+    routeSegIds:     [],      // segment IDs of current best route
+    lastTermination: null,    // last AStarTerminated step, for failure display
+    maxG:            0,
+    statusText:      'Ready to replay',
+    phase:           'idle',
+    stepType:        '',
+    stepIdx:         -1,
   };
 }
 
@@ -235,9 +256,10 @@ function applyStep(s, step, maxGTotal) {
         fromSegId: step.from.segment_id,
         toSegId:   step.to.segment_id,
       };
-      s.astarNodes = [];
-      s.frontier   = [];
-      s.maxG       = 0;
+      s.astarNodes       = [];
+      s.frontier         = [];
+      s.maxG             = 0;
+      s.lastTermination  = null;  // clear termination from previous attempt
       s.statusText = `Leg ${step.leg} — A* search started`;
       // Mark the chosen from/to candidates as winners so they render distinctly.
       const winIds = new Set([step.from.segment_id, step.to.segment_id]);
@@ -263,6 +285,12 @@ function applyStep(s, step, maxGTotal) {
       s.routeSegIds = step.path;
       s.frontier    = [];
       s.statusText  = `Leg ${step.leg} — route found · ${step.length_m.toFixed(0)} m · ${step.path.length} seg${step.path.length !== 1 ? 's' : ''}`;
+      break;
+
+    case 'astar_terminated':
+      s.frontier        = [];
+      s.lastTermination = step;
+      s.statusText      = `Leg ${step.leg} — A* terminated`;
       break;
 
     case 'route_failed':
