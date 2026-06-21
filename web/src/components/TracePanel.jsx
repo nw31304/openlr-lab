@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { useStore } from '../store.js';
+import { useStore, getSegGeomCache } from '../store.js';
 import { useDraggable } from '../hooks.js';
 import ReplayPanel from './ReplayPanel.jsx';
 
@@ -120,16 +120,18 @@ function Section({ title, badge, badgeOk, defaultOpen = true, children }) {
 // ── Segment highlight button ──────────────────────────────────────────────────
 
 function SegBtn({ segId, setTraceHighlight }) {
+  const sourceKey = getSegGeomCache().get(segId)?.properties?.source_id ?? null;
+  const label = sourceKey != null ? sourceKey : segId;
   return (
     <button
       className="tp-seg-btn"
-      title={`Highlight segment ${segId}`}
+      title={`Segment Key ${sourceKey ?? '?'} · Internal ID ${segId}`}
       onClick={(e) => {
         e.stopPropagation();
         setTraceHighlight([segId]);
       }}
     >
-      {segId}
+      {label}
     </button>
   );
 }
@@ -180,7 +182,7 @@ function buildRefSummary(openlrString, lrps, decodeResult) {
   return lines.join('\n');
 }
 
-function ReferenceSummarySection({ openlrString, lrps, decodeResult, setTraceLrpFocus }) {
+function ReferenceSummarySection({ openlrString, lrps, decodeResult, setTraceLrpFocus, lfrcnpTolerance = 0 }) {
   const summary = buildRefSummary(openlrString, lrps, decodeResult);
   return (
     <Section title="Reference" defaultOpen={true}>
@@ -206,7 +208,11 @@ function ReferenceSummarySection({ openlrString, lrps, decodeResult, setTraceLrp
                 <td>{l.lat.toFixed(5)}</td>
                 <td>{l.frc}</td>
                 <td>{l.fow}</td>
-                <td>{l.lfrcnp ?? '—'}</td>
+                <td>{l.lfrcnp != null
+                  ? (lfrcnpTolerance > 0
+                    ? `${l.lfrcnp} → ${Math.min(l.lfrcnp + lfrcnpTolerance, 7)}`
+                    : l.lfrcnp)
+                  : '—'}</td>
                 <td className="tp-monospace">
                   {Math.abs(l.bearing_ub - l.bearing_lb) < 0.1
                     ? `${l.bearing_lb.toFixed(1)}°`
@@ -258,7 +264,7 @@ function RejectedTable({ rejected, setTraceHighlight }) {
         <table className="tp-table tp-rej-table">
           <thead>
             <tr>
-              <th>Seg</th>
+              <th>Seg Key</th>
               <th>Dir</th>
               <th>Dist m</th>
               <th>Bear °</th>
@@ -309,7 +315,7 @@ function CandidatesSection({ lrpIdx, phase, lrpInfo, setTraceHighlight }) {
           <thead>
             <tr>
               <th>#</th>
-              <th>Seg</th>
+              <th>Seg Key</th>
               <th>Dir</th>
               <th>Dist m</th>
               <th>Bear °</th>
@@ -465,7 +471,7 @@ function RoutingSection({ leg, phase, fromCandidate, toCandidate, setTraceHighli
                 <details className="tp-skipped">
                   <summary className="tp-dim">{skipped.length} edges skipped</summary>
                   <table className="tp-table">
-                    <thead><tr><th>From Node</th><th>Seg</th><th>Reason</th></tr></thead>
+                    <thead><tr><th>From Node</th><th>Seg Key</th><th>Reason</th></tr></thead>
                     <tbody>
                       {skipped.slice(0, 100).map((e, i) => (
                         <tr key={i}>
@@ -591,6 +597,7 @@ export default function TracePanel() {
             lrps={lrps}
             decodeResult={decodeResult}
             setTraceLrpFocus={setTraceLrpFocus}
+            lfrcnpTolerance={params.lfrcnp_tolerance ?? 0}
           />
         )}
         {decodeResult && !trace && (

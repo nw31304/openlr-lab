@@ -214,14 +214,17 @@ export default function MapView({ tilesBase, ready }) {
   const { pos: segPos,  onMouseDown: segMouseDown,  resetPos: segResetPos  } = useDraggable(segPanelRef);
   const { pos: candPos, onMouseDown: candMouseDown, resetPos: candResetPos } = useDraggable(candPanelRef);
 
-  const decodeResult          = useStore(s => s.decodeResult);
-  const highlightedSegment    = useStore(s => s.highlightedSegment);
-  const setHighlightedSegment = useStore(s => s.setHighlightedSegment);
+  const decodeResult               = useStore(s => s.decodeResult);
+  const highlightedSegment         = useStore(s => s.highlightedSegment);
+  const setHighlightedSegment      = useStore(s => s.setHighlightedSegment);
+  const requestedInfoSegment       = useStore(s => s.requestedInfoSegment);
+  const clearRequestedInfoSegment  = useStore(s => s.clearRequestedInfoSegment);
   const traceHighlightSegIds  = useStore(s => s.traceHighlightSegIds);
   const traceLrpFocus         = useStore(s => s.traceLrpFocus);
   const setTraceLrpFocus      = useStore(s => s.setTraceLrpFocus);
   const showSegmentLayer      = useStore(s => s.showSegmentLayer);
   const searchRadiusM         = useStore(s => s.params.candidate_search_radius_m);
+  const lfrcnpTolerance       = useStore(s => s.params.lfrcnp_tolerance ?? 0);
   const replayStep  = useStore(s => s.replayStep);
   const replaySteps = useStore(s => s.replaySteps);
   const replayStats = useStore(s => s.replayStats);
@@ -230,6 +233,37 @@ export default function MapView({ tilesBase, ready }) {
   // Reset drag position when a new popup target is clicked
   useEffect(() => { lrpResetPos(); }, [lrpInfo]);   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { segResetPos(); }, [infoProps]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Open the segment info popup when ResultPanel (or decoded-path click) requests it.
+  useEffect(() => {
+    if (!requestedInfoSegment) return;
+    const { tile, local_index } = requestedInfoSegment;
+    clearRequestedInfoSegment();
+    const [z, x, y] = tile.split('/').map(Number);
+    const segId = getSegmentId(z, x, y, local_index);
+    const feat = segId >= 0 ? getSegGeomCache().get(segId) : null;
+    if (!feat) return;
+
+    // Project the segment's geographic midpoint to screen coordinates.
+    // Clamp x so the popup (260px wide + margins) doesn't overlap the result
+    // panel, which occupies the rightmost ~336px (width 320 + right: 16px).
+    let anchor = null;
+    const map = mapRef.current;
+    if (map) {
+      const coords = feat.geometry.coordinates;
+      const mid = coords[Math.floor(coords.length / 2)];
+      const pt = map.project(mid);
+      const POPUP_W = 260 + 12 * 2;
+      const RESULT_PANEL_W = 320 + 16 + 12; // width + right margin + gap
+      const maxSafeX = window.innerWidth - RESULT_PANEL_W - POPUP_W;
+      anchor = { x: Math.min(pt.x, maxSafeX), y: pt.y };
+    }
+
+    setLrpInfo(null);
+    setInfoAnchor(anchor);
+    setInfoProps({ ...feat.properties, segment_id: segId >= 0 ? segId : null });
+    setSegDiagnosis(null);
+  }, [requestedInfoSegment]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Always-current ref so the highlight effect can read decodeResult without
   // adding it to the dependency array (which would cause both effects to race).
@@ -475,7 +509,8 @@ export default function MapView({ tilesBase, ready }) {
       // Found route — pulsing line, updated each time a route_found step fires
       map.addLayer({
         id: 'replay-route-line', type: 'line', source: 'replay-route',
-        paint: { 'line-color': '#ffe066', 'line-width': 4, 'line-opacity': 0.85, 'line-cap': 'round', 'line-join': 'round' },
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': '#ffe066', 'line-width': 4, 'line-opacity': 0.85 },
       });
 
       // Candidate snap points — colour by verdict type
@@ -706,9 +741,37 @@ export default function MapView({ tilesBase, ready }) {
   }
 
   function onDecodedPathClick(e) {
-    // Path is a single WKT feature — no per-segment props. Stop propagation so
-    // the general map click handler doesn't dismiss the result panel.
     e.originalEvent.stopPropagation();
+    const segments = decodeResultRef.current?.segments;
+    if (!segments?.length) return;
+
+    const { lng, lat } = e.lngLat;
+    const cache = getSegGeomCache();
+    let best = null, bestDist = Infinity;
+
+    for (const s of segments) {
+      const [z, x, y] = s.tile.split('/').map(Number);
+      const segId = getSegmentId(z, x, y, s.local_index);
+      const feat = segId >= 0 ? cache.get(segId) : null;
+      if (!feat) continue;
+      const coords = feat.geometry.coordinates;
+      // Use midpoint of the segment for distance comparison.
+      const mid = coords[Math.floor(coords.length / 2)];
+      const dx = mid[0] - lng, dy = mid[1] - lat;
+      const d = dx * dx + dy * dy;
+      if (d < bestDist) { bestDist = d; best = { feat, segId }; }
+    }
+
+    if (best) {
+      setLrpInfo(null);
+      setInfoAnchor({ x: e.point.x, y: e.point.y });
+      setInfoProps({ ...best.feat.properties, segment_id: best.segId });
+      setSegDiagnosis(null);
+      setHighlightedSegment({
+        tile:        best.feat.properties.tile,
+        local_index: best.feat.properties.local_index,
+      });
+    }
   }
 
   function onLrpClick(e) {
@@ -857,12 +920,18 @@ export default function MapView({ tilesBase, ready }) {
 
     // Show segment info popup for single-segment trace clicks
     if (features.length === 1) {
-      setInfoProps({ ...features[0].properties });
-      const coords = features[0].geometry?.coordinates;
+      const feat = features[0];
+      // segId is the WASM runtime segment_id — include it so the popup
+      // doesn't show "— (decode first)" for Internal ID.
+      setInfoProps({ ...feat.properties, segment_id: traceHighlightSegIds[0] });
+      const coords = feat.geometry?.coordinates;
       if (coords?.length) {
         const mid = coords[Math.floor(coords.length / 2)];
         const pixel = map.project(mid);
-        setInfoAnchor({ x: pixel.x, y: pixel.y });
+        const POPUP_W = 260 + 12 * 2;
+        const RESULT_PANEL_W = 320 + 16 + 12;
+        const maxSafeX = window.innerWidth - RESULT_PANEL_W - POPUP_W;
+        setInfoAnchor({ x: Math.min(pixel.x, maxSafeX), y: pixel.y });
       }
     }
   }, [traceHighlightSegIds]);
@@ -1242,10 +1311,7 @@ export default function MapView({ tilesBase, ready }) {
           style={segPos ? { position: 'absolute', left: segPos.left, top: segPos.top, right: 'auto', bottom: 'auto' } : popupStyle(infoAnchor)}>
           <header className="seg-info-header" onMouseDown={segMouseDown}>
             <span>
-              Segment{' '}
-              {infoProps.osm_way_id != null
-                ? <a href={`https://www.openstreetmap.org/way/${infoProps.osm_way_id}`} target="_blank" rel="noreferrer">{infoProps.osm_way_id}</a>
-                : null}
+              Segment{infoProps.source_id != null ? ` ${infoProps.source_id}` : ''}
             </span>
             <button
               className="seg-info-close"
@@ -1266,9 +1332,10 @@ export default function MapView({ tilesBase, ready }) {
                   ['FOW',       `${infoProps.fow} — ${infoProps.fow_name}`],
                   ['Direction', infoProps.direction],
                   ['Length',    `${infoProps.length_m} m`],
-                  ['Tile',      infoProps.tile],
-                  ['Index',     infoProps.local_index],
-                  ['Seg ID',    infoProps.segment_id != null ? infoProps.segment_id : '— (decode first)'],
+                  ['Tile',         infoProps.tile],
+                  ['Tile Index',   infoProps.local_index],
+                  ['Segment Key',  infoProps.source_id   ?? '—'],
+                  ['Internal ID',  infoProps.segment_id  != null ? infoProps.segment_id : '— (decode first)'],
                 ].map(([k, v]) => (
                   <tr key={k}>
                     <td className="seg-info-key">{k}</td>
@@ -1285,6 +1352,7 @@ export default function MapView({ tilesBase, ready }) {
                 infoProps.segment_id ?? null,
                 infoProps,
                 decodeResult,
+                decodeResult?.trace?.params?.lfrcnp_tolerance ?? lfrcnpTolerance,
               ))}
             >
               Why didn't the location cover this segment?
@@ -1330,7 +1398,11 @@ export default function MapView({ tilesBase, ready }) {
                   ['Lon',     lrpInfo.lon.toFixed(6)],
                   ['FRC',     lrpInfo.frc],
                   ['FOW',     lrpInfo.fow],
-                  ['LFRCNP',  lrpInfo.lfrcnp !== null ? lrpInfo.lfrcnp : '— (last LRP)'],
+                  ['LFRCNP',  lrpInfo.lfrcnp !== null
+                    ? (lfrcnpTolerance > 0
+                      ? `${lrpInfo.lfrcnp} → ${Math.min(lrpInfo.lfrcnp + lfrcnpTolerance, 7)}`
+                      : lrpInfo.lfrcnp)
+                    : '— (last LRP)'],
                   ['Bearing', formatBearing(lrpInfo.bearing_lb, lrpInfo.bearing_ub)],
                 ].map(([k, v]) => (
                   <tr key={k}><td className="seg-info-key">{k}</td><td><b>{v}</b></td></tr>

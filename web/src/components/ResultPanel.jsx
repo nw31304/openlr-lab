@@ -7,12 +7,12 @@ const FOW_NAMES = ['Undef', 'Motorway', 'Dual C/W', 'Single C/W', 'Roundabout', 
 const FRC_NAMES = ['FRC0', 'FRC1', 'FRC2', 'FRC3', 'FRC4', 'FRC5', 'FRC6', 'FRC7'];
 
 export default function ResultPanel() {
-  const { decodeResult, clearResult, highlightedSegment, setHighlightedSegment,
-          showTrace, toggleTrace, debugDecode, params } = useStore();
+  const { decodeResult, showResult, hideResult, highlightedSegment, setHighlightedSegment,
+          requestInfoSegment, showTrace, toggleTrace, debugDecode, params } = useStore();
   const panelRef = useRef(null);
   const { pos, onMouseDown } = useDraggable(panelRef);
 
-  if (!decodeResult) return null;
+  if (!decodeResult || !showResult) return null;
 
   const diagnosis = decodeResult.ok ? null : diagnoseFailure(decodeResult);
 
@@ -36,7 +36,7 @@ export default function ResultPanel() {
         onMouseDown={onMouseDown}
       >
         <span>{decodeResult.ok ? '✓ Decoded' : '✗ Failed'}</span>
-        <button className="seg-info-close" onClick={clearResult}>✕</button>
+        <button className="seg-info-close" onClick={hideResult}>✕</button>
       </div>
       <div className="result-body">
         {decodeResult.ok ? (
@@ -55,10 +55,9 @@ export default function ResultPanel() {
               <table className="seg-table">
                 <thead>
                   <tr>
-                    <th>Seg ID</th>
+                    <th>Segment Key</th>
                     <th>FRC</th>
                     <th>FOW</th>
-                    <th>OSM Way</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -70,19 +69,16 @@ export default function ResultPanel() {
                         <td>
                           <button
                             className="seg-row-btn"
-                            title={`Tile ${s.tile} · local index ${s.local_index}`}
-                            onClick={() => setHighlightedSegment(
-                              isActive ? null : { tile: s.tile, local_index: s.local_index }
-                            )}
-                          >{s.segment_id ?? i + 1}</button>
+                            title={`Tile ${s.tile} · tile index ${s.local_index} · internal ID ${s.segment_id}`}
+                            onClick={() => {
+                              const nowActive = !isActive;
+                              setHighlightedSegment(nowActive ? { tile: s.tile, local_index: s.local_index } : null);
+                              if (nowActive) requestInfoSegment(s.tile, s.local_index);
+                            }}
+                          >{s.source_id ?? s.segment_id ?? i + 1}</button>
                         </td>
                         <td>{FRC_NAMES[s.frc] ?? s.frc}</td>
                         <td>{FOW_NAMES[s.fow] ?? s.fow}</td>
-                        <td>
-                          {s.osm_way_id != null
-                            ? <a href={`https://www.openstreetmap.org/way/${s.osm_way_id}`} target="_blank" rel="noreferrer">{s.osm_way_id}</a>
-                            : '—'}
-                        </td>
                       </tr>
                     );
                   })}

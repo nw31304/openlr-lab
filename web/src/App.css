@@ -116,6 +116,28 @@ html, body, #root, .app {
   opacity: 0.5;
   cursor: default;
 }
+.result-toggle-btn {
+  flex-shrink: 0;
+  height: 36px;
+  min-width: 36px;
+  padding: 0 10px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.result-toggle-btn:hover {
+  background: rgba(255, 255, 255, 0.13);
+  color: #fff;
+}
+.result-toggle-btn.active {
+  background: rgba(255, 255, 255, 0.07);
+  color: #6ee98f;
+  border-color: rgba(110, 233, 143, 0.35);
+}
 
 /* ── Result panel ───────────────────────────────────────────────────────────── */
 
@@ -308,8 +330,9 @@ html, body, #root, .app {
 
 .seg-info-panel {
   position: absolute;
+  /* Fallback position when no anchor: lower-left, away from the result panel */
   bottom: 28px;
-  right: 10px;
+  left: 10px;
   width: 260px;
   background: rgba(20, 20, 36, 0.95);
   border: 1px solid rgba(255, 255, 255, 0.15);
@@ -317,13 +340,7 @@ html, body, #root, .app {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
   font-size: 13px;
   color: #e8e8f0;
-  z-index: 8;
-}
-
-/* Push info panel left when result panel is open — result panel is 320px + 16px gap */
-.result-panel ~ .seg-info-panel,
-.seg-info-panel:has(~ .result-panel) {
-  right: 348px;
+  z-index: 20;
 }
 
 .seg-info-header {
@@ -728,14 +745,51 @@ html, body, #root, .app {
   transform: translateX(-50%);
   width: calc(100% - 32px);
   max-width: 680px;
+  max-height: calc(100vh - 88px);
+  display: flex;
+  flex-direction: column;
   background: rgba(10, 10, 20, 0.92);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 10px;
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
-  z-index: 9;
-  padding: 12px 14px;
+  z-index: 11;
+  padding: 0;
+}
+.params-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
+}
+.params-panel-body {
+  overflow-y: auto;
+  padding: 10px 14px 12px;
+  flex: 1;
+}
+.params-panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.5);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.params-panel-close {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 4px;
+  line-height: 1;
+  border-radius: 4px;
+}
+.params-panel-close:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .params-grid {

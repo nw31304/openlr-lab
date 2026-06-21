@@ -118,6 +118,7 @@ export const useStore = create(persist(
   params: { ...PRESETS.Default },
   showParams: false,
   showTrace: false,
+  showResult: false,
   showSegmentLayer: false,
   decoding: false,
   decodeResult: null,
@@ -167,8 +168,15 @@ export const useStore = create(persist(
     await get().runDecode();
   },
 
-  clearResult: () => set({ decodeResult: null, highlightedSegment: null, traceHighlightSegIds: null, traceLrpFocus: null }),
+  hideResult:    () => set({ showResult: false }),
+  toggleResult:  () => set(state => ({ showResult: !state.showResult })),
+  clearResult: () => set({ decodeResult: null, showResult: false, highlightedSegment: null, traceHighlightSegIds: null, traceLrpFocus: null }),
   setHighlightedSegment: (seg) => set({ highlightedSegment: seg }),
+  // Request the segment info popup to open for a given tile+local_index.
+  // Map.jsx watches this and opens the popup; call clearRequestedInfoSegment() after handling.
+  requestedInfoSegment: null,
+  requestInfoSegment:      (tile, local_index) => set({ requestedInfoSegment: { tile, local_index } }),
+  clearRequestedInfoSegment: () => set({ requestedInfoSegment: null }),
   setTraceHighlight: (ids) => set({ traceHighlightSegIds: ids?.length ? ids : null }),
   setTraceLrpFocus: (lrp) => set({ traceLrpFocus: lrp ? { ...lrp, _tick: Date.now() } : null }),
 
@@ -181,24 +189,34 @@ export const useStore = create(persist(
     _segIdToTile   = new Map();
     _segGeomCache  = new Map();
     try {
+      const t0 = performance.now();
       _decoder.reset_tiles();
       const paramsJson = JSON.stringify(params);
       console.log('[params] fow_weight:', params.fow_weight, 'frc_weight:', params.frc_weight,
-        'fow[3][7]:', params.fow_penalty_table[3][7], 'fow[7][3]:', params.fow_penalty_table[7][3]);
+        'fow[3][7]:', params.fow_penalty_table[3][7], 'fow[7][3]:', params.fow_penalty_table[7][3],
+        'lfrcnp_tolerance:', params.lfrcnp_tolerance);
       const startResult = JSON.parse(_decoder.start(openlrString.trim(), paramsJson, _zoom));
+      console.log(`[timing] start(): ${(performance.now()-t0).toFixed(1)} ms`);
 
       console.log('[decode] requested tiles:', startResult.tiles.map(([z,x,y]) => `${z}/${x}/${y}`));
       let loadedTiles = 0;
+      let wasmLoadMs = 0;
+      let jsDecodeMs = 0;
+      const tFetch0 = performance.now();
       await Promise.all(startResult.tiles.map(async ([z, x, y]) => {
         try {
           const res = await _pmtiles.getZxy(z, x, y);
           if (res?.data) {
+            const tWasm0 = performance.now();
             _decoder.load_tile(z, x, y, new Uint8Array(res.data));
+            wasmLoadMs += performance.now() - tWasm0;
             loadedTiles++;
             const tileKey = `${z}/${x}/${y}`;
             const wasmCount = _decoder.tile_segment_count(z, x, y);
+            const tJs0 = performance.now();
             // Cache tile geometry so the trace panel can pan/highlight decoded segments
             _tileGeomCache.set(tileKey, decodeTile(res.data, z, x, y).features);
+            jsDecodeMs += performance.now() - tJs0;
             console.log(`[tile] loaded ${tileKey} (${res.data.byteLength} bytes, ${wasmCount} segs in WASM)`);
           } else {
             console.warn(`[tile] no data for ${z}/${x}/${y} (tile not in archive)`);
@@ -207,26 +225,53 @@ export const useStore = create(persist(
           console.warn(`[tile] ${z}/${x}/${y} load failed:`, e?.message ?? e);
         }
       }));
+      console.log(`[timing] tile fetch+load total: ${(performance.now()-tFetch0).toFixed(1)} ms  (WASM load_tile: ${wasmLoadMs.toFixed(1)} ms, JS decodeTile: ${jsDecodeMs.toFixed(1)} ms)`);
 
       const segs = _decoder.loaded_segment_count();
       console.log(`[decode] tiles requested=${startResult.tiles.length} loaded=${loadedTiles} segments=${segs}`);
 
       // Build segment_id → tile + segment_id → feature maps.
-      // all_segment_tile_mappings() does one O(n) WASM pass instead of O(n²) per-index scans.
+      // Pre-index each tile's features by local_index so the per-segment lookup is O(1)
+      // rather than O(tile_size) — avoiding an O(N²) scan over 200k+ segments.
+      const tIdx0 = performance.now();
+      const tileFeatureIndex = new Map();
+      for (const [tileKey, features] of _tileGeomCache) {
+        const idx = new Map();
+        for (const feat of features) idx.set(feat.properties.local_index, feat);
+        tileFeatureIndex.set(tileKey, idx);
+      }
+      console.log(`[timing] tile feature index build: ${(performance.now()-tIdx0).toFixed(1)} ms`);
+
+      const tMap0 = performance.now();
       const rawMappings = JSON.parse(_decoder.all_segment_tile_mappings());
+      console.log(`[timing] all_segment_tile_mappings serialize+parse: ${(performance.now()-tMap0).toFixed(1)} ms`);
+
+      const tCache0 = performance.now();
       for (const [segId, z, x, y, li] of rawMappings) {
         const tileKey = `${z}/${x}/${y}`;
         _segIdToTile.set(segId, { tile_key: tileKey, local_index: li });
-        // Direct segId → feature lookup used by the trace highlight effect
-        const feat = _tileGeomCache.get(tileKey)?.find(f => f.properties.local_index === li);
+        // O(1) lookup via pre-built index — was O(tile_size) with .find()
+        const feat = tileFeatureIndex.get(tileKey)?.get(li);
         if (feat) _segGeomCache.set(segId, feat);
       }
+      console.log(`[timing] segGeomCache build (${rawMappings.length} segs): ${(performance.now()-tCache0).toFixed(1)} ms`);
       console.log(`[segGeomCache] ${_segGeomCache.size}/${rawMappings.length} segments have geometry`);
 
+      const tDecode0 = performance.now();
       const result = JSON.parse(_decoder.decode());
-      // Temporary diagnostic — remove after debugging
-      console.log('[PATH] segments:', result.segments?.map(s => s.osm_way_id));
-      console.log('[LRPs]', result.lrps?.map((l, i) => `LRP${i}: lon=${l.lon.toFixed(5)} lat=${l.lat.toFixed(5)} bear=[${l.bearing_lb.toFixed(2)},${l.bearing_ub.toFixed(2)}]`));
+      console.log(`[timing] decode() WASM: ${(performance.now()-tDecode0).toFixed(1)} ms`);
+      // Enrich decoded segments with source_id from the tile geometry cache.
+      for (const seg of result.segments ?? []) {
+        const feat = _segGeomCache.get(seg.segment_id);
+        if (feat) seg.source_id = feat.properties.source_id ?? null;
+      }
+      console.log('[PATH] segments:', result.segments?.map(s => s.source_id));
+      console.log('[LRPs]', result.lrps?.map((l, i) =>
+        `LRP${i}: lon=${l.lon.toFixed(5)} lat=${l.lat.toFixed(5)}` +
+        ` bear=[${l.bearing_lb.toFixed(2)},${l.bearing_ub.toFixed(2)}]` +
+        ` frc=${l.frc} fow=${l.fow}` +
+        (l.lfrcnp != null ? ` lfrcnp=${l.lfrcnp} (effective floor=${Math.min(l.lfrcnp + (params.lfrcnp_tolerance ?? 0), 7)})` : ' [last LRP]')
+      ));
       if (result.trace?.events) {
         result.trace.events.filter(e => e.CandidatesRanked).forEach(e => {
           const r = e.CandidatesRanked;
@@ -242,6 +287,15 @@ export const useStore = create(persist(
         });
         const routes = result.trace.events.filter(e => e.RouteSearchStarted || e.DnpChecked);
         console.log('[TRACE] Routing events:', JSON.stringify(routes, null, 2));
+        // Show A* termination stats — these confirm whether LFRCNP is biting
+        result.trace.events.filter(e => e.AStarTerminated).forEach(e => {
+          const t = e.AStarTerminated;
+          console.log(
+            `[TRACE] A* leg ${t.leg}: ${t.nodes_expanded} expansions, reason=${JSON.stringify(t.reason)}` +
+            ` skipped: frc=${t.edges_skipped_frc} dir=${t.edges_skipped_direction}` +
+            ` turn=${t.edges_skipped_turn} dist=${t.edges_skipped_distance}`
+          );
+        });
       }
       // Build replay steps from trace events (if any)
       const replayData = result.trace?.events?.length
@@ -250,6 +304,7 @@ export const useStore = create(persist(
       set({
         decoding: false,
         decodeResult: result,
+        showResult: true,
         replaySteps: replayData.steps,
         replayStats:  replayData.stats,
         replayStep:   0,

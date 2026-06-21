@@ -133,6 +133,127 @@ pub async fn run_osm(
     Ok(())
 }
 
+// ── Generic GeoJSONL build path ───────────────────────────────────────────────
+
+/// Build a PMTiles archive from a GeoJSONL(.gz) road network file or directory.
+///
+/// Bypasses adapt and split (data arrives pre-attributed and pre-split); goes
+/// straight from extract → quantize → tile.
+pub async fn run_generic(
+    roads_path:        &Path,
+    restrictions_path: Option<&Path>,
+    label:             &str,
+    extent_spec:       &str,
+    output:            &Path,
+    tile_zoom:         u8,
+) -> Result<()> {
+    std::fs::create_dir_all(output)?;
+    let t0 = Instant::now();
+
+    let extent_slug = crate::extent::extent_slug(extent_spec);
+
+    info!(
+        roads       = %roads_path.display(),
+        extent      = %extent_slug,
+        output      = %output.display(),
+        label,
+        "generic build started"
+    );
+
+    // Step 1: extract ─────────────────────────────────────────────────────────
+    let (edges, nodes, seg_to_to_int) = {
+        let _s = info_span!("generic_extract").entered();
+        let roads_path = roads_path.to_path_buf();
+        let (edges, nodes, seg_to_to_int) = tokio::task::spawn_blocking(move || {
+            crate::generic_extract::extract(&roads_path)
+        })
+        .await
+        .context("generic_extract panicked")??;
+        info!(
+            edges     = edges.len(),
+            nodes     = nodes.len(),
+            elapsed_s = t0.elapsed().as_secs_f32(),
+            "generic extract complete"
+        );
+        (edges, nodes, seg_to_to_int)
+    };
+
+    // Step 2: restrictions (optional) ─────────────────────────────────────────
+    let restrictions = if let Some(csv_path) = restrictions_path {
+        let _s = info_span!("restrictions").entered();
+        let csv_path = csv_path.to_path_buf();
+        let r = tokio::task::spawn_blocking(move || {
+            crate::generic_extract::read_restrictions_csv(&csv_path, &seg_to_to_int)
+        })
+        .await
+        .context("restrictions panicked")??;
+        info!(count = r.len(), elapsed_s = t0.elapsed().as_secs_f32(), "restrictions complete");
+        r
+    } else {
+        vec![]
+    };
+
+    // Step 3: quantize ────────────────────────────────────────────────────────
+    let (q_edges, q_nodes) = {
+        let _s = info_span!("quantize").entered();
+        let (qe, qn) = tokio::task::spawn_blocking(move || {
+            crate::quantize::quantize(edges, nodes)
+        })
+        .await
+        .context("quantize panicked")?;
+        info!(
+            edges     = qe.len(),
+            nodes     = qn.len(),
+            elapsed_s = t0.elapsed().as_secs_f32(),
+            "quantize complete"
+        );
+        (qe, qn)
+    };
+
+    // Step 4: tile and write PMTiles ──────────────────────────────────────────
+    {
+        let _s = info_span!("tile").entered();
+        info!(tile_zoom, edges = q_edges.len(), restrictions = restrictions.len(), "tiling");
+        let output_dir   = output.to_path_buf();
+        let extent_slug2 = extent_slug.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::tile::write_tiles(
+                q_edges, q_nodes, restrictions,
+                tile_zoom, &output_dir, "generic", &extent_slug2,
+            )
+        })
+        .await
+        .context("tile panicked")??;
+    }
+
+    // Patch label into manifest if provided.
+    if !label.is_empty() {
+        let manifest_path = output.join("manifest.json");
+        if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(mut map) =
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
+            {
+                map.insert(
+                    "external_id_label".to_string(),
+                    serde_json::Value::String(label.to_string()),
+                );
+                if let Ok(updated) =
+                    serde_json::to_string_pretty(&serde_json::Value::Object(map))
+                {
+                    let _ = std::fs::write(&manifest_path, updated);
+                }
+            }
+        }
+    }
+
+    info!(
+        elapsed_s = t0.elapsed().as_secs_f32(),
+        output    = %output.display(),
+        "generic build complete"
+    );
+    Ok(())
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub async fn run(

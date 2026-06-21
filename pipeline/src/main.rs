@@ -3,6 +3,7 @@ mod build;
 mod cli;
 mod extent;
 mod extract;
+mod generic_extract;
 mod http;
 mod merge;
 mod osm_adapt;
@@ -59,70 +60,87 @@ async fn main() -> Result<()> {
                 info!(threads = n, "rayon thread pool configured");
             }
 
-            let bbox = extent::resolve(&args.extent)?;
+            if let Some(roads_path) = args.roads {
+                // ── Generic GeoJSONL path ─────────────────────────────────────
+                // extent_slug is derived directly from the --extent label; no
+                // spatial filtering is needed — the data is already the right region.
+                build::run_generic(
+                    &roads_path,
+                    args.restrictions.as_deref(),
+                    &args.label,
+                    &args.extent,
+                    &args.output,
+                    args.tile_zoom,
+                )
+                .await?;
+            } else {
+                // OSM and Overture paths both need extent resolved to a bbox.
+                let bbox = extent::resolve(&args.extent)?;
 
-            match args.pbf {
-                // ── OSM PBF path ──────────────────────────────────────────────
-                Some(pbf_str) => {
-                    // Accept a local path or an https:// URL; download if URL.
-                    let pbf_path: PathBuf = if pbf_str.starts_with("http://")
-                        || pbf_str.starts_with("https://")
-                    {
-                        let filename = pbf_str
-                            .rsplit('/')
-                            .next()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or("download.osm.pbf");
-                        let dest = PathBuf::from(filename);
-                        info!(url = %pbf_str, dest = %dest.display(), "fetching PBF from URL");
-                        http::Client::new(retry).download_to_file(&pbf_str, &dest).await?;
-                        dest
-                    } else {
-                        PathBuf::from(&pbf_str)
-                    };
+                match args.pbf {
+                    // ── OSM PBF path ──────────────────────────────────────────
+                    Some(pbf_str) => {
+                        let pbf_path: PathBuf = if pbf_str.starts_with("http://")
+                            || pbf_str.starts_with("https://")
+                        {
+                            let filename = pbf_str
+                                .rsplit('/')
+                                .next()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or("download.osm.pbf");
+                            let dest = PathBuf::from(filename);
+                            info!(url = %pbf_str, dest = %dest.display(), "fetching PBF from URL");
+                            http::Client::new(retry).download_to_file(&pbf_str, &dest).await?;
+                            dest
+                        } else {
+                            PathBuf::from(&pbf_str)
+                        };
 
-                    let osm_schema = osm_schema::load(&args.osm_schema)?;
-                    build::run_osm(
-                        &pbf_path,
-                        &args.extent,
-                        bbox,
-                        &osm_schema,
-                        &args.output,
-                        args.tile_zoom,
-                    )
-                    .await?;
-                }
-
-                // ── Overture path ─────────────────────────────────────────────
-                None => {
-                    let release = args.release.ok_or_else(|| {
-                        anyhow::anyhow!("either --pbf or --release must be provided")
-                    })?;
-                    let client    = http::Client::new(retry);
-                    let available = releases::fetch(&client).await?;
-                    if !available.contains(&release) {
-                        anyhow::bail!(
-                            "release '{}' not found. Run `list-releases` to see available releases.",
-                            release
-                        );
+                        let osm_schema = osm_schema::load(&args.osm_schema)?;
+                        build::run_osm(
+                            &pbf_path,
+                            &args.extent,
+                            bbox,
+                            &osm_schema,
+                            &args.output,
+                            args.tile_zoom,
+                        )
+                        .await?;
                     }
-                    info!(release = %release, extent = %args.extent, "release validated");
 
-                    let schema = schema::load(&args.schema)?;
+                    // ── Overture path ─────────────────────────────────────────
+                    None => {
+                        let release = args.release.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "one of --roads, --pbf, or --release must be provided"
+                            )
+                        })?;
+                        let client    = http::Client::new(retry);
+                        let available = releases::fetch(&client).await?;
+                        if !available.contains(&release) {
+                            anyhow::bail!(
+                                "release '{}' not found. Run `list-releases` to see available releases.",
+                                release
+                            );
+                        }
+                        info!(release = %release, extent = %args.extent, "release validated");
 
-                    build::run(
-                        &release,
-                        &args.extent,
-                        bbox,
-                        &schema,
-                        &args.output,
-                        &client,
-                        args.fetch_concurrency,
-                        args.tile_zoom,
-                        args.ram_gb,
-                        args.bytes_per_segment,
-                    )
-                    .await?;
+                        let schema = schema::load(&args.schema)?;
+
+                        build::run(
+                            &release,
+                            &args.extent,
+                            bbox,
+                            &schema,
+                            &args.output,
+                            &client,
+                            args.fetch_concurrency,
+                            args.tile_zoom,
+                            args.ram_gb,
+                            args.bytes_per_segment,
+                        )
+                        .await?;
+                    }
                 }
             }
         }

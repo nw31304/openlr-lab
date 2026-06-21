@@ -128,45 +128,51 @@ function PenaltyTable({ tableKey, rowLabels, colLabels }) {
 }
 
 export default function ParamsPanel() {
-  const { params, showParams, setParam } = useStore();
+  const { params, showParams, setParam, toggleParams } = useStore();
   const [showAdvanced, setShowAdvanced] = useState(false);
   if (!showParams) return null;
 
   return (
     <div className="params-panel">
-      <div className="params-grid">
-        {SCALAR_FIELDS.map(({ key, label, unit, step, min, max, int: isInt }) => (
-          <label key={key} className="param-row">
-            <span className="param-label">{label}{unit ? <em> {unit}</em> : ''}</span>
-            <SpinInput
-              value={params[key] ?? 0}
-              step={step}
-              min={min}
-              max={max}
-              isInt={isInt}
-              onChange={v => setParam(key, v)}
-            />
-          </label>
-        ))}
+      <div className="params-panel-header">
+        <span className="params-panel-title">Decode Parameters</span>
+        <button className="params-panel-close" onClick={toggleParams} title="Close">✕</button>
       </div>
+      <div className="params-panel-body">
+        <div className="params-grid">
+          {SCALAR_FIELDS.map(({ key, label, unit, step, min, max, int: isInt }) => (
+            <label key={key} className="param-row">
+              <span className="param-label">{label}{unit ? <em> {unit}</em> : ''}</span>
+              <SpinInput
+                value={params[key] ?? 0}
+                step={step}
+                min={min}
+                max={max}
+                isInt={isInt}
+                onChange={v => setParam(key, v)}
+              />
+            </label>
+          ))}
+        </div>
 
-      <button className="advanced-toggle" onClick={() => setShowAdvanced(s => !s)}>
-        {showAdvanced ? '▾' : '▸'} Advanced penalty tables
-      </button>
+        <button className="advanced-toggle" onClick={() => setShowAdvanced(s => !s)}>
+          {showAdvanced ? '▾' : '▸'} Advanced penalty tables
+        </button>
 
-      {showAdvanced && (
-        <>
-          <div className="table-section">
-            <div className="table-section-title">FRC penalty table</div>
-            <PenaltyTable tableKey="frc_penalty_table" rowLabels={FRC_LABELS} colLabels={FRC_LABELS} />
-          </div>
+        {showAdvanced && (
+          <>
+            <div className="table-section">
+              <div className="table-section-title">FRC penalty table</div>
+              <PenaltyTable tableKey="frc_penalty_table" rowLabels={FRC_LABELS} colLabels={FRC_LABELS} />
+            </div>
 
-          <div className="table-section">
-            <div className="table-section-title">FOW penalty table</div>
-            <PenaltyTable tableKey="fow_penalty_table" rowLabels={FOW_LABELS} colLabels={FOW_LABELS} />
-          </div>
-        </>
-      )}
+            <div className="table-section">
+              <div className="table-section-title">FOW penalty table</div>
+              <PenaltyTable tableKey="fow_penalty_table" rowLabels={FOW_LABELS} colLabels={FOW_LABELS} />
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }

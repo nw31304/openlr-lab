@@ -4,9 +4,9 @@ import { useStore } from '../store.js';
 const TRACE_LEVELS = ['Off', 'Summary', 'Full'];
 
 export default function TopBar() {
-  const { openlrString, showParams, showTrace, showSegmentLayer, decoding, params,
+  const { openlrString, showParams, showTrace, showResult, showSegmentLayer, decoding, params,
           decodeResult, tileUrl, setTileUrl,
-          setOpenlrString, toggleParams, toggleTrace, toggleSegmentLayer,
+          setOpenlrString, toggleParams, toggleTrace, toggleResult, toggleSegmentLayer,
           setTraceLevel, resetToDefaults, runDecode } = useStore();
 
   const [showGear, setShowGear] = useState(false);
@@ -118,6 +118,13 @@ export default function TopBar() {
           </div>
         )}
       </div>
+      {decodeResult && (
+        <button
+          className={`result-toggle-btn${showResult ? ' active' : ''}`}
+          onClick={toggleResult}
+          title={showResult ? 'Hide result panel' : 'Show result panel'}
+        >{decodeResult.ok ? '✓' : '✗'}</button>
+      )}
       <button className="decode-btn" onClick={runDecode} disabled={decoding}>
         {decoding ? '…' : 'Decode'}
       </button>

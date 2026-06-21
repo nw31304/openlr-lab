@@ -40,6 +40,24 @@ pub enum Command {
 
 #[derive(clap::Args)]
 pub struct BuildArgs {
+    /// Generic GeoJSONL(.gz) road network input (alternative to --pbf / --release).
+    /// Accepts a single .geojsonl or .geojsonl.gz file, or a directory of such files.
+    /// Properties required per feature: id (integer), frc (0-7), fow (0-7),
+    /// flowdir (1=both, 2=backward, 3=forward), from_int, to_int (node integers).
+    #[arg(long, conflicts_with_all = ["release", "schema", "pbf", "osm_schema"])]
+    pub roads: Option<PathBuf>,
+
+    /// Optional turn-restriction CSV for generic input (requires --roads).
+    /// Columns: from_segment_id, [via_node_id,] to_segment_id
+    /// If via_node_id is omitted, it is derived from the from-segment's to_int.
+    #[arg(long, requires = "roads")]
+    pub restrictions: Option<PathBuf>,
+
+    /// Human-readable label for the data source, written to manifest.json as
+    /// 'external_id_label'. Used by the WebApp when displaying segment source links.
+    #[arg(long, default_value = "")]
+    pub label: String,
+
     /// OSM PBF file or URL to build from (e.g. a Geofabrik regional extract).
     /// If a https:// URL is given, the file is downloaded to the current directory first.
     /// Use this instead of --release to build from OSM instead of Overture.
@@ -56,7 +74,8 @@ pub struct BuildArgs {
     pub release: Option<String>,
 
     /// Extent: ISO 3166-1 alpha-2 country code (NZ), continent name (oceania),
-    /// 'world', or explicit bbox 'west,south,east,north'.
+    /// 'world', explicit bbox 'west,south,east,north', or any label string (generic
+    /// input only — used purely as an archive filename slug, no spatial filtering).
     #[arg(long)]
     pub extent: String,
 

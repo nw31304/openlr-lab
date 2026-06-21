@@ -61,16 +61,17 @@ export function decodeTile(buffer, z, x, y) {
     const fow       = (packed >> 3) & 0x07;
     const dirIdx    = (packed >> 6) & 0x03;
 
-    // OSM way ID from stable-ID table (bytes 0-7 = way id LE i64, bytes 8-15 = 0)
-    let osm_way_id = null;
+    // Source integer ID from stable-ID table (bytes 0-7 = source integer LE i64,
+    // bytes 8-15 = 0 for simple integer IDs; full GERS UUIDs have non-zero high bytes).
+    let source_id = null;
     const sidBase = offSegGers + i * 16;
-    let isOsm = true;
+    let isIntId = true;
     for (let b = 8; b < 16; b++) {
-      if (view.getUint8(sidBase + b) !== 0) { isOsm = false; break; }
+      if (view.getUint8(sidBase + b) !== 0) { isIntId = false; break; }
     }
-    if (isOsm) {
-      const wayIdBig = view.getBigInt64(sidBase, true);
-      if (wayIdBig !== 0n) osm_way_id = Number(wayIdBig);
+    if (isIntId) {
+      const idBig = view.getBigInt64(sidBase, true);
+      if (idBig !== 0n) source_id = Number(idBig);
     }
 
     // Read geometry
@@ -96,7 +97,7 @@ export function decodeTile(buffer, z, x, y) {
         length_m:  (lengthCm / 100).toFixed(1),
         tile:      tileKey,
         local_index: i,
-        osm_way_id,
+        source_id,
       },
     });
   }

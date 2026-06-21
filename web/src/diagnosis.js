@@ -182,7 +182,7 @@ function diagnoseNoRoute(failedLeg, ranked, terminated, routeFailed) {
  *
  * Returns { headline, bullets: string[], suggestions: string[] }.
  */
-export function diagnoseSegment(segId, segProps, decodeResult) {
+export function diagnoseSegment(segId, segProps, decodeResult, lfrcnpTolerance = 0) {
   const lrps     = decodeResult?.lrps ?? [];
   const segments = decodeResult?.segments ?? [];
   const events   = decodeResult?.trace?.events ?? [];
@@ -263,18 +263,22 @@ export function diagnoseSegment(segId, segProps, decodeResult) {
   }
 
   // ── Static FRC routing constraint ──────────────────────────────────────────
+  // Effective LFRCNP floor = min(encoded_lfrcnp + lfrcnp_tolerance, 7), matching the engine.
   const segFrc = segProps.frc != null ? parseInt(segProps.frc, 10) : null;
   if (segFrc != null) {
     const frcBlocked = [];
     for (let i = 0; i < lrps.length - 1; i++) {
-      const lfrcnp = lrps[i].lfrcnp;
-      if (lfrcnp != null && segFrc > lfrcnp) {
-        frcBlocked.push(`leg ${i} (LFRCNP ${lfrcnp})`);
+      const encoded = lrps[i].lfrcnp;
+      if (encoded == null) continue;
+      const effective = Math.min(encoded + lfrcnpTolerance, 7);
+      if (segFrc > effective) {
+        const tolNote = lfrcnpTolerance > 0 ? ` encoded ${encoded} + tolerance ${lfrcnpTolerance}` : '';
+        frcBlocked.push(`leg ${i} (floor ${effective}${tolNote})`);
       }
     }
     if (frcBlocked.length > 0) {
-      bullets.push(`FRC ${segFrc} exceeds the LFRCNP routing floor for ${frcBlocked.join(', ')} — A* cannot route through this segment on those legs.`);
-      suggestions.push('The encoded LFRCNP may be too restrictive for this road class.');
+      bullets.push(`FRC ${segFrc} exceeds the effective LFRCNP routing floor for ${frcBlocked.join(', ')} — A* cannot route through this segment on those legs.`);
+      suggestions.push('Increase the LFRCNP tolerance parameter, or the encoded LFRCNP may be too restrictive for this road class.');
     }
   }
 
