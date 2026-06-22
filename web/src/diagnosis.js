@@ -1,3 +1,73 @@
+// ── Haversine ─────────────────────────────────────────────────────────────────
+
+function haversineM(lat1, lon1, lat2, lon2) {
+  const R  = 6_371_000;
+  const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
+  const Δφ = (lat2 - lat1) * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+  const a  = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// ── Success warnings ──────────────────────────────────────────────────────────
+
+/**
+ * Detect degenerate successful decodes — cases where the engine reported
+ * success but the result is almost certainly meaningless.
+ *
+ * Returns { headline, bullets: string[], suggestions: string[] } or null.
+ */
+export function diagnoseSuccess(result) {
+  const lrps   = result?.lrps ?? [];
+  const events = result?.trace?.events ?? [];
+  const ofType = (key) => events.filter(e => e[key] !== undefined).map(e => e[key]);
+  const dnpChecked = ofType('DnpChecked');
+
+  const bullets     = [];
+  const suggestions = [];
+
+  // Signal 1: route length near zero on any leg (both LRP anchors snapped to
+  // the same node; the engine found a trivial zero-length path).
+  for (const d of dnpChecked) {
+    if (d.actual_m != null && d.actual_m < 10) {
+      bullets.push(
+        `Leg ${d.leg}: routed path is only ${d.actual_m.toFixed(1)} m — ` +
+        `both LRP anchors appear to have snapped to the same map location.`
+      );
+    }
+  }
+
+  // Signal 2: adjacent LRP encoded coordinates are very close.
+  for (let i = 0; i < lrps.length - 1; i++) {
+    const a = lrps[i], b = lrps[i + 1];
+    if (!a || !b) continue;
+    const dist = haversineM(a.lat, a.lon, b.lat, b.lon);
+    if (dist < 25) {
+      bullets.push(
+        `LRP ${i} and LRP ${i + 1} are only ${dist.toFixed(1)} m apart in the ` +
+        `encoded reference — likely snapped to the same map node.`
+      );
+    }
+  }
+
+  if (bullets.length === 0) return null;
+
+  suggestions.push(
+    'Check whether the encoding map has a short connector segment at this location that is absent from the decoding map.'
+  );
+  suggestions.push(
+    'When both LRP anchors snap to the same point the decoded location covers no meaningful path, even though the decode reports success.'
+  );
+
+  return {
+    headline: 'Decode succeeded but result may be degenerate',
+    bullets,
+    suggestions,
+  };
+}
+
+// ── Failure diagnosis ─────────────────────────────────────────────────────────
+
 /**
  * Synthesise a human-readable failure diagnosis from decode trace events.
  *

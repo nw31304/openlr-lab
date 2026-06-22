@@ -5,9 +5,9 @@ const TRACE_LEVELS = ['Off', 'Summary', 'Full'];
 
 export default function TopBar() {
   const { openlrString, showParams, showTrace, showResult, showSegmentLayer, decoding, params,
-          decodeResult, tileUrl, setTileUrl,
+          decodeResult, tileUrl, setTileUrl, llmConfig,
           setOpenlrString, toggleParams, toggleTrace, toggleResult, toggleSegmentLayer,
-          setTraceLevel, resetToDefaults, runDecode } = useStore();
+          setTraceLevel, resetToDefaults, runDecode, toggleLlmSettings } = useStore();
 
   const [showGear, setShowGear] = useState(false);
   const gearRef = useRef(null);
@@ -110,7 +110,10 @@ export default function TopBar() {
             </button>
             <div className="gear-divider" />
             <button className="gear-action" onClick={() => { toggleParams(); setShowGear(false); }}>
-              Parameters…
+              Decoding Parameters…
+            </button>
+            <button className="gear-action" onClick={() => { toggleLlmSettings(); setShowGear(false); }}>
+              AI settings…{llmConfig ? ' ●' : ''}
             </button>
             <button className="gear-action gear-reset" onClick={() => { resetToDefaults(); setShowGear(false); }}>
               Reset to defaults

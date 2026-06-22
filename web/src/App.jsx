@@ -5,6 +5,8 @@ import TopBar from './components/TopBar.jsx';
 import ResultPanel from './components/ResultPanel.jsx';
 import ParamsPanel from './components/ParamsPanel.jsx';
 import TracePanel from './components/TracePanel.jsx';
+import LlmSettingsPanel from './components/LlmSettingsPanel.jsx';
+import LlmChatPanel from './components/LlmChatPanel.jsx';
 import { setPmtiles, setDecoder, setZoom, useStore } from './store.js';
 import { initWasm } from './wasm.js';
 
@@ -57,6 +59,8 @@ export default function App() {
       <MapView tilesBase={tilesBase} ready={ready} />
       <TopBar />
       <ParamsPanel />
+      <LlmSettingsPanel />
+      <LlmChatPanel />
       <ResultPanel />
       <TracePanel />
     </div>

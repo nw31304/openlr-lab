@@ -1,20 +1,23 @@
 import React, { useRef } from 'react';
 import { useStore } from '../store.js';
 import { useDraggable } from '../hooks.js';
-import { diagnoseFailure } from '../diagnosis.js';
+import { diagnoseFailure, diagnoseSuccess } from '../diagnosis.js';
+import { renderLlmText } from '../renderLlmText.jsx';
 
 const FOW_NAMES = ['Undef', 'Motorway', 'Dual C/W', 'Single C/W', 'Roundabout', 'Traffic Sq', 'Slip Rd', 'Other'];
 const FRC_NAMES = ['FRC0', 'FRC1', 'FRC2', 'FRC3', 'FRC4', 'FRC5', 'FRC6', 'FRC7'];
 
 export default function ResultPanel() {
   const { decodeResult, showResult, hideResult, highlightedSegment, setHighlightedSegment,
-          requestInfoSegment, showTrace, toggleTrace, debugDecode, params } = useStore();
+          requestInfoSegment, showTrace, toggleTrace, debugDecode, params,
+          llmConfig, llmChatOpen, toggleLlmChat, toggleLlmSettings } = useStore();
   const panelRef = useRef(null);
   const { pos, onMouseDown } = useDraggable(panelRef);
 
   if (!decodeResult || !showResult) return null;
 
-  const diagnosis = decodeResult.ok ? null : diagnoseFailure(decodeResult);
+  const diagnosis        = decodeResult.ok ? null : diagnoseFailure(decodeResult);
+  const successWarning   = decodeResult.ok ? diagnoseSuccess(decodeResult) : null;
 
   // What the debug button should do depends on how much trace data we already have.
   const hasTrace = !!decodeResult.trace;
@@ -85,6 +88,29 @@ export default function ResultPanel() {
                 </tbody>
               </table>
             </div>
+            {successWarning && (
+              <div className="diag-body diag-body-warn">
+                <div className="diag-headline diag-headline-warn">⚠ {successWarning.headline}</div>
+                <ul className="diag-bullets">
+                  {successWarning.bullets.map((b, i) => <li key={i}>{b}</li>)}
+                </ul>
+                {successWarning.suggestions.length > 0 && (
+                  <div className="diag-suggestions">
+                    <span className="diag-try-label">Note:</span>
+                    <ul className="diag-bullets">
+                      {successWarning.suggestions.map((s, i) => <li key={i}>{s}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+            <button
+              className="diag-debug-btn llm-ask-btn"
+              onClick={llmConfig ? toggleLlmChat : toggleLlmSettings}
+              title={llmConfig ? undefined : 'Configure an AI model to use this feature'}
+            >
+              {llmConfig ? (llmChatOpen ? '✦ Close AI Chat' : '✦ AI Chat') : '✦ AI Chat — configure…'}
+            </button>
           </>
         ) : (
           <div className="result-failure">
@@ -112,8 +138,16 @@ export default function ResultPanel() {
                 {debugLabel}
               </button>
             )}
+            <button
+              className="diag-debug-btn llm-ask-btn"
+              onClick={llmConfig ? toggleLlmChat : toggleLlmSettings}
+              title={llmConfig ? undefined : 'Configure an AI model to use this feature'}
+            >
+              {llmConfig ? (llmChatOpen ? '✦ Close AI Chat' : '✦ AI Chat') : '✦ AI Chat — configure…'}
+            </button>
           </div>
         )}
+
       </div>
     </div>
   );

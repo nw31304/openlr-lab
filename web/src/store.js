@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { decodeTile } from './tileDecoder.js';
 import { buildReplaySteps } from './replayEngine.js';
+import { loadLlmConfig, saveLlmConfig, clearLlmConfig as clearLlmStorage, chatComplete } from './llmClient.js';
+import { buildSystemContext } from './llmDiagnosis.js';
 
 let _pmtiles = null;
 let _decoder = null;
@@ -117,8 +119,13 @@ export const useStore = create(persist(
   tileUrl: 'http://localhost:5176',
   params: { ...PRESETS.Default },
   showParams: false,
+  showLlmSettings: false,
   showTrace: false,
   showResult: false,
+  llmConfig: loadLlmConfig(),
+  llmChatOpen: false,
+  llmMessages: [],   // { role: 'user'|'assistant', content: string, error?: bool }
+  llmLoading: false,
   showSegmentLayer: false,
   decoding: false,
   decodeResult: null,
@@ -150,6 +157,33 @@ export const useStore = create(persist(
   }),
 
   toggleParams:        () => set(state => ({ showParams:        !state.showParams })),
+  toggleLlmSettings:   () => set(state => ({ showLlmSettings:   !state.showLlmSettings })),
+
+  setLlmConfig: (config) => { saveLlmConfig(config); set({ llmConfig: config }); },
+  clearLlmConfig: () => { clearLlmStorage(); set({ llmConfig: null }); },
+
+  toggleLlmChat: () => set(s => ({ llmChatOpen: !s.llmChatOpen })),
+  clearLlmChat:  () => set({ llmMessages: [], llmLoading: false }),
+
+  // content = text sent to the API (may include appended format hints)
+  // display = text shown in the chat bubble (the user's original words)
+  sendLlmMessage: async (content, display) => {
+    const { llmMessages, decodeResult, params, llmConfig } = get();
+    if (!llmConfig || !decodeResult) return;
+    const userMsg = { role: 'user', content, display: display ?? content };
+    set({ llmMessages: [...llmMessages, userMsg], llmLoading: true });
+    const systemContext = buildSystemContext(decodeResult, params);
+    const history = [
+      { role: 'system', content: systemContext },
+      ...llmMessages.map(m => ({ role: m.role, content: m.content })),
+      { role: 'user', content },
+    ];
+    const result = await chatComplete(llmConfig, history);
+    const assistantMsg = result.ok
+      ? { role: 'assistant', content: result.content ?? '' }
+      : { role: 'assistant', content: result.error ?? 'Unknown error', error: true };
+    set(s => ({ llmMessages: [...s.llmMessages, assistantMsg], llmLoading: false }));
+  },
   toggleTrace:         () => set(state => ({ showTrace:         !state.showTrace })),
   toggleSegmentLayer:  () => set(state => ({ showSegmentLayer:  !state.showSegmentLayer })),
 
@@ -184,7 +218,7 @@ export const useStore = create(persist(
     const { openlrString, params } = get();
     if (!openlrString.trim() || !_pmtiles || !_decoder) return;
 
-    set({ decoding: true, decodeResult: null, highlightedSegment: null, traceHighlightSegIds: null });
+    set({ decoding: true, decodeResult: null, highlightedSegment: null, traceHighlightSegIds: null, llmMessages: [], llmLoading: false });
     _tileGeomCache = new Map();
     _segIdToTile   = new Map();
     _segGeomCache  = new Map();
