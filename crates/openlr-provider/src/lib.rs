@@ -238,8 +238,7 @@ mod integration {
         let bearing_1 = bearing_at_offset(&seg_b.geometry, seg_b.length_m, false);
         let dnp_crow = haversine_m(coord_0.0, coord_0.1, coord_1.0, coord_1.1);
 
-        let loc_ref = LocationReference {
-            lrps: vec![
+        let loc_ref = LocationReference::line(vec![
                 Lrp {
                     coord: coord_0,
                     bearing: CircularInterval {
@@ -269,8 +268,7 @@ mod integration {
                     pos_offset: None,
                     neg_offset: None,
                 },
-            ],
-        };
+            ]);
 
         // Exercise the full pipeline: prefetch tiles for this reference, then decode.
         let params = DecodeParams::preset(Preset::Permissive);
@@ -433,7 +431,7 @@ mod integration {
         // Try each consecutive pair as an isolated 2-LRP decode.
         eprintln!("\n--- Testing each leg in isolation (max_cands={}) ---", params.max_candidates_per_lrp);
         for leg in 0..full_ref.lrps.len() - 1 {
-            let loc2 = LocationReference { lrps: vec![full_ref.lrps[leg].clone(), full_ref.lrps[leg + 1].clone()] };
+            let loc2 = LocationReference::line(vec![full_ref.lrps[leg].clone(), full_ref.lrps[leg + 1].clone()]);
             let r = decode(&loc2, provider.graph(), &params);
             eprintln!(
                 "  Leg {leg}: {} → {}  [lfrcnp={}, dnp=[{:.0},{:.0}]m]  → {}",
@@ -455,7 +453,7 @@ mod integration {
             p2.max_candidates_per_lrp = 0; // unlimited
             eprintln!("\n--- lfrcnp_tolerance={tol}, unlimited candidates ---");
             for leg in 0..full_ref.lrps.len() - 1 {
-                let loc2 = LocationReference { lrps: vec![full_ref.lrps[leg].clone(), full_ref.lrps[leg + 1].clone()] };
+                let loc2 = LocationReference::line(vec![full_ref.lrps[leg].clone(), full_ref.lrps[leg + 1].clone()]);
                 let r = decode(&loc2, provider.graph(), &p2);
                 eprintln!(
                     "  Leg {leg}: {}",
@@ -491,7 +489,7 @@ mod integration {
 
         let lrp4 = full_ref.lrps[4].clone();
         let lrp5 = full_ref.lrps[5].clone();
-        let loc_ref = LocationReference { lrps: vec![lrp4.clone(), lrp5.clone()] };
+        let loc_ref = LocationReference::line(vec![lrp4.clone(), lrp5.clone()]);
 
         eprintln!(
             "LRP[4→0]: ({:.6}, {:.6})  frc={} fow={} lfrcnp={}  dnp=[{:.0},{:.0}]m  bearing=[{:.2},{:.2}]°",

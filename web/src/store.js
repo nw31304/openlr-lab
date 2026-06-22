@@ -78,7 +78,7 @@ export const PRESETS = {
     frc_weight:                     0.10,
     fow_weight:                     0.20,
     interior_weight:                0.10,
-    wrong_endpoint_weight:          0.20,
+    wrong_endpoint_weight:          5.00,
     frc_penalty_table: defaultFrcTable(),
     fow_penalty_table: DEFAULT_FOW_TABLE,
     max_bearing_deviation_deg:     45.0,
@@ -132,6 +132,7 @@ export const useStore = create(persist(
   highlightedSegment: null,
   traceHighlightSegIds: null,
   traceLrpFocus: null,
+  candidatePopup: null,
   // ── Replay state ─────────────────────────────────────────────────────────
   replaySteps: [],        // pre-built display steps from buildReplaySteps()
   replayStats: null,      // { maxG, totalNodes, phases }
@@ -204,7 +205,7 @@ export const useStore = create(persist(
 
   hideResult:    () => set({ showResult: false }),
   toggleResult:  () => set(state => ({ showResult: !state.showResult })),
-  clearResult: () => set({ decodeResult: null, showResult: false, highlightedSegment: null, traceHighlightSegIds: null, traceLrpFocus: null }),
+  clearResult: () => set({ decodeResult: null, showResult: false, highlightedSegment: null, traceHighlightSegIds: null, traceLrpFocus: null, candidatePopup: null }),
   setHighlightedSegment: (seg) => set({ highlightedSegment: seg }),
   // Request the segment info popup to open for a given tile+local_index.
   // Map.jsx watches this and opens the popup; call clearRequestedInfoSegment() after handling.
@@ -212,13 +213,15 @@ export const useStore = create(persist(
   requestInfoSegment:      (tile, local_index) => set({ requestedInfoSegment: { tile, local_index } }),
   clearRequestedInfoSegment: () => set({ requestedInfoSegment: null }),
   setTraceHighlight: (ids) => set({ traceHighlightSegIds: ids?.length ? ids : null }),
+  setCandidatePopup: (data) => set({ candidatePopup: data }),
+  clearCandidatePopup: () => set({ candidatePopup: null }),
   setTraceLrpFocus: (lrp) => set({ traceLrpFocus: lrp ? { ...lrp, _tick: Date.now() } : null }),
 
   runDecode: async () => {
     const { openlrString, params } = get();
     if (!openlrString.trim() || !_pmtiles || !_decoder) return;
 
-    set({ decoding: true, decodeResult: null, highlightedSegment: null, traceHighlightSegIds: null, llmMessages: [], llmLoading: false });
+    set({ decoding: true, decodeResult: null, highlightedSegment: null, traceHighlightSegIds: null, candidatePopup: null, llmMessages: [], llmLoading: false });
     _tileGeomCache = new Map();
     _segIdToTile   = new Map();
     _segGeomCache  = new Map();

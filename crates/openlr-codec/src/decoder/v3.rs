@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
 use crate::{CircularInterval, LinearInterval};
-use crate::lrp::{LocationReference, Lrp};
+use crate::lrp::{LocationReference, Orientation, SideOfRoad, Lrp};
 use super::DecodeError;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -17,12 +17,27 @@ pub fn decode_v3(bytes: &[u8]) -> Result<LocationReference, DecodeError> {
         return Err(DecodeError::TooShort { min: 16, got: bytes.len() });
     }
 
-    // Byte 0: status.  Bits 2-0 must be 3 (v3); bits 6-3 encode location type.
+    // Byte 0: status.  Bits 2-0 must be 3 (v3).
+    // Bit 5 = point_flag, bits 6+4 = area_flag, bit 3 = attr_flag.
     let status = bytes[0];
     if status & 0x07 != 3 {
         return Err(DecodeError::InvalidHeader(status));
     }
 
+    let is_point  = status & 0x20 != 0;
+    let area_flag = ((status & 0x40) >> 5) | ((status & 0x10) >> 4);
+    let has_attrs = status & 0x08 != 0;
+
+    // PointAlongLine: point_flag=1, area_flag=0, attr_flag=1, len=16 or 17.
+    if is_point && area_flag == 0 && has_attrs {
+        return decode_pal(bytes);
+    }
+
+    decode_line(bytes)
+}
+
+/// Decode a v3 Line location reference.
+fn decode_line(bytes: &[u8]) -> Result<LocationReference, DecodeError> {
     // Remainder must be: 9 + 7*(n-2) + 6 + [0,1,2] extra bytes.
     // n = bytes.len() / 7  (integer division);  offsets = (bytes.len()-16) % 7.
     let n_lrps = bytes.len() / 7;
@@ -122,7 +137,82 @@ pub fn decode_v3(bytes: &[u8]) -> Result<LocationReference, DecodeError> {
         });
     }
 
-    Ok(LocationReference { lrps })
+    Ok(LocationReference::line(lrps))
+}
+
+/// Decode a v3 PointAlongLine (PAL) location reference.
+///
+/// Binary layout (16 or 17 bytes):
+///   byte 0:     header (already validated)
+///   bytes 1-3:  lon (24-bit absolute)
+///   bytes 4-6:  lat (24-bit absolute)
+///   byte 7:     bits[7:6]=orientation  bits[5:3]=FRC  bits[2:0]=FOW
+///   byte 8:     bits[7:5]=LFRCNP  bits[4:0]=bearing sector
+///   byte 9:     DNP
+///   bytes 10-11: relative lon
+///   bytes 12-13: relative lat
+///   byte 14:    bits[7:6]=side-of-road  bits[5:3]=FRC  bits[2:0]=FOW
+///   byte 15:    bits[4:0]=bearing sector  (no offset flags)
+///   byte 16:    positive offset raw (optional, present when len==17)
+fn decode_pal(bytes: &[u8]) -> Result<LocationReference, DecodeError> {
+    if bytes.len() != 16 && bytes.len() != 17 {
+        return Err(DecodeError::TooShort { min: 16, got: bytes.len() });
+    }
+
+    // ── First LRP (absolute coords) ──────────────────────────────────────────
+    let lon0 = decode_abs_coord(bytes[1], bytes[2], bytes[3]);
+    let lat0 = decode_abs_coord(bytes[4], bytes[5], bytes[6]);
+
+    let attr1_first  = bytes[7];
+    let orientation  = Orientation::from_u8(attr1_first >> 6);
+    let (frc0, fow0) = decode_attr1(attr1_first);
+    let (lfrcnp0, bearing0) = decode_attr2(bytes[8]);
+    let dnp0 = decode_dnp(bytes[9]);
+
+    // ── Last LRP (relative coords) ────────────────────────────────────────────
+    let lon1 = decode_rel_coord(bytes[10], bytes[11], lon0);
+    let lat1 = decode_rel_coord(bytes[12], bytes[13], lat0);
+
+    let attr1_last   = bytes[14];
+    let side_of_road = SideOfRoad::from_u8(attr1_last >> 6);
+    let (frc1, fow1) = decode_attr1(attr1_last);
+
+    // PAL last LRP attr4: bits[4:0] = bearing sector only (no pos/neg offset flags).
+    let bearing1 = bearing_sector_to_interval(bytes[15] & 0x1F);
+
+    // ── Optional positive offset (byte 16) ───────────────────────────────────
+    let pos_offset = if bytes.len() == 17 {
+        let raw = bytes[16] as f64;
+        Some(LinearInterval {
+            lb: raw / 256.0 * dnp0.lb,
+            ub: (raw + 1.0) / 256.0 * dnp0.ub,
+        })
+    } else {
+        None
+    };
+
+    let lrp0 = Lrp {
+        coord:      (lon0, lat0),
+        bearing:    bearing0,
+        frc:        frc0,
+        fow:        fow0,
+        lfrcnp:     Some(lfrcnp0),
+        dnp:        Some(dnp0),
+        pos_offset,
+        neg_offset: None,
+    };
+    let lrp1 = Lrp {
+        coord:      (lon1, lat1),
+        bearing:    bearing1,
+        frc:        frc1,
+        fow:        fow1,
+        lfrcnp:     None,
+        dnp:        None,
+        pos_offset: None,
+        neg_offset: None,
+    };
+
+    Ok(LocationReference::point_along_line(vec![lrp0, lrp1], orientation, side_of_road))
 }
 
 pub fn decode_v3_base64(s: &str) -> Result<LocationReference, DecodeError> {
@@ -148,6 +238,8 @@ pub fn decode_rel_coord(hi: u8, lo: u8, prev: f64) -> f64 {
 }
 
 /// Attr1 byte: bits[5:3] = FRC, bits[2:0] = FOW.
+/// Note: for PAL, bits[7:6] carry Orientation or SideOfRoad — those are extracted
+/// by the caller before this function.
 fn decode_attr1(b: u8) -> (u8, u8) {
     ((b >> 3) & 0x07, b & 0x07)
 }
@@ -159,7 +251,7 @@ fn decode_attr2(b: u8) -> (u8, CircularInterval) {
     (lfrcnp, bearing_sector_to_interval(sector))
 }
 
-/// Attr4 byte (last LRP): bit6 = pos-offset flag, bit5 = neg-offset flag,
+/// Attr4 byte (last LRP of line location): bit6 = pos-offset flag, bit5 = neg-offset flag,
 /// bits[4:0] = bearing sector.
 fn decode_attr4(b: u8) -> (bool, bool, CircularInterval) {
     let has_pos = b & 0x40 != 0;
@@ -202,6 +294,7 @@ mod tests {
         assert!(loc.lrps[1].dnp.is_none());
         assert!(loc.lrps[0].lfrcnp.is_some());
         assert!(loc.lrps[1].lfrcnp.is_none());
+        assert_eq!(loc.location_type, crate::lrp::LocationType::Line);
     }
 
     // rustlr test_decode4: "C/7VOCaEbSu/BP+5AMUrbJEQ"
@@ -300,5 +393,51 @@ mod tests {
         let mut b = vec![0x0B_u8; 16];
         b[0] = 0x0C; // version = 4
         assert!(matches!(decode_v3(&b), Err(DecodeError::InvalidHeader(_))));
+    }
+
+    /// Verify PAL detection from header byte.
+    /// PAL header byte: version=3 (0x03), attr_flag=1 (0x08), point_flag=1 (0x20) → 0x2B.
+    #[test]
+    fn pal_header_detection() {
+        // Build a minimal 16-byte PAL blob with header 0x2B.
+        // Coordinates and attributes can be zero for this detection test.
+        let mut b = [0u8; 16];
+        b[0] = 0x2B; // version=3 | attr_flag | point_flag
+        let loc = decode_v3(&b).unwrap();
+        assert_eq!(loc.location_type, crate::lrp::LocationType::PointAlongLine);
+        assert!(loc.is_point());
+        assert_eq!(loc.lrps.len(), 2);
+    }
+
+    /// PAL with offset byte (17 bytes): verify pos_offset is parsed and orientation/side_of_road extracted.
+    #[test]
+    fn pal_with_offset() {
+        let mut b = [0u8; 17];
+        b[0] = 0x2B;
+        // First LRP attr1: orientation=1 (FirstTowardSecond), FRC=2, FOW=3
+        // bits[7:6]=01  bits[5:3]=010  bits[2:0]=011 → 0b0101_0011 = 0x53
+        b[7] = 0x53;
+        // First LRP attr2: LFRCNP=2, bearing=5 → bits[7:5]=010 bits[4:0]=00101 → 0b0100_0101 = 0x45
+        b[8] = 0x45;
+        // DNP = 4 → 4 * 58.6 ≈ 234.4 m
+        b[9] = 4;
+        // Last LRP attr1: side_of_road=1 (Right), FRC=2, FOW=3
+        // bits[7:6]=01  bits[5:3]=010  bits[2:0]=011 → 0x53
+        b[14] = 0x53;
+        // Last LRP bearing sector = 15
+        b[15] = 15;
+        // Positive offset raw = 128 → 128/256 * 4*58.6 ≈ 117.2 m
+        b[16] = 128;
+
+        let loc = decode_v3(&b).unwrap();
+        assert_eq!(loc.location_type, crate::lrp::LocationType::PointAlongLine);
+        assert_eq!(loc.orientation, Some(crate::lrp::Orientation::FirstTowardSecond));
+        assert_eq!(loc.side_of_road, Some(crate::lrp::SideOfRoad::Right));
+        assert_eq!(loc.lrps[0].frc, 2);
+        assert_eq!(loc.lrps[0].fow, 3);
+        assert!(loc.lrps[0].pos_offset.is_some());
+        let off = loc.lrps[0].pos_offset.unwrap();
+        // lb = 128/256 * dnp.lb = 0.5 * (4 * 58.59375) ≈ 117.1875
+        assert!((off.lb - 128.0 / 256.0 * 4.0 * 15_000.0 / 256.0).abs() < 1e-6);
     }
 }

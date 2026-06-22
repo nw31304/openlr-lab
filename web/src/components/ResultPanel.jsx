@@ -38,14 +38,18 @@ export default function ResultPanel() {
         className={`result-header ${decodeResult.ok ? 'ok' : 'err'} draggable-header`}
         onMouseDown={onMouseDown}
       >
-        <span>{decodeResult.ok ? '✓ Decoded' : '✗ Failed'}</span>
+        <span>{decodeResult.ok
+          ? (decodeResult.location_type === 'PointAlongLine' ? '✓ Decoded (Point)' : '✓ Decoded')
+          : '✗ Failed'}</span>
         <button className="seg-info-close" onClick={hideResult}>✕</button>
       </div>
       <div className="result-body">
         {decodeResult.ok ? (
           <>
             <div className="result-meta">
-              {decodeResult.segments.length} segment{decodeResult.segments.length !== 1 ? 's' : ''}
+              {decodeResult.location_type === 'PointAlongLine'
+                ? 'PointAlongLine'
+                : `${decodeResult.segments.length} segment${decodeResult.segments.length !== 1 ? 's' : ''}`}
               {decodeResult.pos_offset_m > 0 && ` · +${decodeResult.pos_offset_m.toFixed(1)} m`}
               {decodeResult.neg_offset_m > 0 && ` · −${decodeResult.neg_offset_m.toFixed(1)} m`}
               {decodeResult.trace && !showTrace && (
@@ -88,6 +92,26 @@ export default function ResultPanel() {
                 </tbody>
               </table>
             </div>
+            {decodeResult.location_type === 'PointAlongLine' && decodeResult.point_lon != null && (
+              <div className="pal-point-info">
+                <div className="pal-point-row">
+                  <span className="pal-label">Point</span>
+                  <span className="pal-value">{decodeResult.point_lat?.toFixed(6)}, {decodeResult.point_lon?.toFixed(6)}</span>
+                </div>
+                {decodeResult.orientation && decodeResult.orientation !== 'NoOrientation' && (
+                  <div className="pal-point-row">
+                    <span className="pal-label">Orientation</span>
+                    <span className="pal-value">{decodeResult.orientation.replace(/([A-Z])/g, ' $1').trim()}</span>
+                  </div>
+                )}
+                {decodeResult.side_of_road && decodeResult.side_of_road !== 'DirectlyOnOrNA' && (
+                  <div className="pal-point-row">
+                    <span className="pal-label">Side of road</span>
+                    <span className="pal-value">{decodeResult.side_of_road}</span>
+                  </div>
+                )}
+              </div>
+            )}
             {successWarning && (
               <div className="diag-body diag-body-warn">
                 <div className="diag-headline diag-headline-warn">⚠ {successWarning.headline}</div>

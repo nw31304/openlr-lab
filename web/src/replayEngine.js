@@ -28,7 +28,7 @@ function nodeColorAt(t) {
 }
 
 /** Verdict type string from a serde-tagged GateVerdict. */
-function verdictType(verdict) {
+export function verdictType(verdict) {
   if (!verdict || verdict === 'Pass') return 'pass';
   if (typeof verdict === 'string') return verdict.toLowerCase();
   const key = Object.keys(verdict)[0];
@@ -236,10 +236,10 @@ function applyStep(s, step, maxGTotal) {
             lrpIdx: step.lrp_idx,
             segmentId: r.segment_id ?? null,
             winner: false,
-            // Rejection details
+            traversal:     r.traversal     ?? null,
             verdict_json:  JSON.stringify(r.verdict ?? null),
-            bearing_deg:   r.bearing_deg ?? null,
-            distance_m:    r.distance_m  ?? null,
+            bearing_deg:   r.bearing_deg   ?? null,
+            distance_m:    r.distance_m    ?? null,
           });
         }
       }
@@ -355,8 +355,9 @@ function circlePolygon(lon, lat, radiusM, steps = 64) {
   return { type: 'Polygon', coordinates: [coords] };
 }
 
-/** Convert a visual state to a set of GeoJSON FeatureCollections for all replay sources. */
-export function stateToGeoJSON(state) {
+/** Convert a visual state to a set of GeoJSON FeatureCollections for all replay sources.
+ *  geomLookup(segmentId) → GeoJSON Feature (from tile cache) or undefined. */
+export function stateToGeoJSON(state, geomLookup) {
   const empty = { type: 'FeatureCollection', features: [] };
 
   // Search radius
@@ -371,31 +372,51 @@ export function stateToGeoJSON(state) {
       }
     : empty;
 
-  // Candidates — all detail fields flattened so the click popup can read them
+  // Candidates — rendered as coloured LineStrings (green=accepted, red=rejected).
+  // Coordinates are reversed for Backward traversal so direction arrows always
+  // point in the direction of travel.
   const candFC = {
     type: 'FeatureCollection',
-    features: state.candidates.map(c => ({
-      type: 'Feature',
-      geometry: { type: 'Point', coordinates: [c.lon, c.lat] },
-      properties: {
-        ctype:         c.ctype,
-        lrp_idx:       c.lrpIdx,
-        winner:        c.winner ?? false,
-        segment_id:    c.segmentId ?? null,
-        traversal:     c.traversal ?? null,
-        distance_m:    c.distance_m  ?? null,
-        arc_offset_m:  c.arc_offset_m ?? null,
-        bearing_deg:   c.bearing_deg  ?? null,
-        score_total:       c.score_total    ?? null,
-        score_distance:    c.score_distance ?? null,
-        score_bearing:     c.score_bearing  ?? null,
-        score_frc:         c.score_frc      ?? null,
-        score_fow:         c.score_fow      ?? null,
-        score_wrong_ep:    c.score_wrong_ep ?? null,
-        score_interior:    c.score_interior ?? null,
-        verdict_json:      c.verdict_json   ?? null,
-      },
-    })),
+    features: state.candidates.flatMap(c => {
+      if (c.segmentId == null) return [];
+      const feat = geomLookup?.(c.segmentId);
+      if (!feat?.geometry?.coordinates) return [];
+      const coords = c.traversal === 'Backward'
+        ? [...feat.geometry.coordinates].reverse()
+        : feat.geometry.coordinates;
+      return [{
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: coords },
+        properties: {
+          ctype:         c.ctype,
+          lrp_idx:       c.lrpIdx,
+          winner:        c.winner ?? false,
+          segment_id:    c.segmentId,
+          traversal:     c.traversal ?? null,
+          snap_lon:      c.lon,
+          snap_lat:      c.lat,
+          distance_m:    c.distance_m  ?? null,
+          arc_offset_m:  c.arc_offset_m ?? null,
+          bearing_deg:   c.bearing_deg  ?? null,
+          score_total:       c.score_total    ?? null,
+          score_distance:    c.score_distance ?? null,
+          score_bearing:     c.score_bearing  ?? null,
+          score_frc:         c.score_frc      ?? null,
+          score_fow:         c.score_fow      ?? null,
+          score_wrong_ep:    c.score_wrong_ep ?? null,
+          score_interior:    c.score_interior ?? null,
+          verdict_json:      c.verdict_json   ?? null,
+          // Segment attributes from tile cache
+          frc:       feat.properties.frc      ?? null,
+          fow:       feat.properties.fow      ?? null,
+          frc_name:  feat.properties.frc_name ?? null,
+          fow_name:  feat.properties.fow_name ?? null,
+          direction: feat.properties.direction ?? null,
+          length_m:  feat.properties.length_m  ?? null,
+          source_id: feat.properties.source_id ?? null,
+        },
+      }];
+    }),
   };
 
   // A* node cloud (older, faded)

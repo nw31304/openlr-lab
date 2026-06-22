@@ -99,7 +99,7 @@ const SCALAR_FIELDS = [
   { key: 'frc_weight',                   label: 'FRC weight',              unit: '',      step: 0.05,  min: 0,     max: 2      },
   { key: 'fow_weight',                   label: 'FOW weight',              unit: '',      step: 0.05,  min: 0,     max: 2      },
   { key: 'interior_weight',              label: 'Interior snap weight',    unit: '',      step: 0.05,  min: 0,     max: 2      },
-  { key: 'wrong_endpoint_weight',        label: 'Wrong endpoint weight',   unit: '',      step: 0.05,  min: 0,     max: 2      },
+  { key: 'wrong_endpoint_weight',        label: 'Wrong endpoint weight',   unit: '',      step: 0.5,   min: 0                  },
   { key: 'max_candidate_score',          label: 'Max candidate score',     unit: '',      step: 0.05,  min: 0,     max: 5      },
   { key: 'max_candidates_per_lrp',       label: 'Max candidates',          unit: '/LRP',  step: 1,     min: 1,     max: 50,    int: true },
   { key: 'dnp_tolerance_pct',            label: 'DNP tolerance',           unit: '',      step: 0.05,  min: 0,     max: 1      },
@@ -137,9 +137,8 @@ function SpinInput({ value, onChange, step, min, max, isInt, className, style })
   }, [value]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const commit = (raw) => {
-    const out = isInt
-      ? Math.round(Math.min(max, Math.max(min, raw)))
-      : parseFloat(Math.min(max, Math.max(min, raw)).toFixed(dec));
+    const clamped = max != null ? Math.min(max, Math.max(min, raw)) : Math.max(min, raw);
+    const out = isInt ? Math.round(clamped) : parseFloat(clamped.toFixed(dec));
     const s = fmt(out, dec, isInt);
     textRef.current = s;
     setText(s);

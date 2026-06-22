@@ -29,7 +29,7 @@
 use wasm_bindgen::prelude::*;
 
 use openlr_codec::{decode_v3_base64, decode_tpeg_hex, decode_tpeg_base64};
-use openlr_codec::lrp::LocationReference;
+use openlr_codec::lrp::{LocationReference, LocationType, Orientation, SideOfRoad};
 use openlr_engine::{decode as engine_decode, DecodeParams, Preset, prefetch_tile_keys, path_to_wkt, path_band_wkt};
 use openlr_graph::polyline_length_m;
 use openlr_engine::trace::TraversalDir;
@@ -158,6 +158,20 @@ struct DecodeResult {
     /// Full decode trace; null when `trace_level` is `Off` or on error.
     #[serde(skip_serializing_if = "Option::is_none")]
     trace: Option<serde_json::Value>,
+    // ── PointAlongLine ─────────────────────────────────────────────────────────
+    /// "Line" or "PointAlongLine".
+    location_type: String,
+    /// Decoded point coordinate for PointAlongLine. Absent for line locations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_lon: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_lat: Option<f64>,
+    /// PAL orientation: "NoOrientation" | "FirstTowardSecond" | "SecondTowardFirst" | "BothDirections"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orientation: Option<String>,
+    /// PAL side of road: "DirectlyOnOrNA" | "Right" | "Left" | "Both"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side_of_road: Option<String>,
 }
 
 impl DecodeResult {
@@ -179,6 +193,11 @@ impl DecodeResult {
             neg_uncertainty_wkt: None,
             error: Some(msg.into()),
             trace: None,
+            location_type: "Line".to_string(),
+            point_lon: None,
+            point_lat: None,
+            orientation: None,
+            side_of_road: None,
         }
     }
 }
@@ -397,6 +416,27 @@ impl Decoder {
 
         let trace_value = result.trace.and_then(|t| serde_json::to_value(t).ok());
 
+        let location_type = if loc_ref.location_type == LocationType::PointAlongLine {
+            "PointAlongLine".to_string()
+        } else {
+            "Line".to_string()
+        };
+        let (point_lon, point_lat) = result.point_coord
+            .map(|(lon, lat)| (Some(lon), Some(lat)))
+            .unwrap_or((None, None));
+        let orientation = result.orientation.map(|o| match o {
+            Orientation::NoOrientation       => "NoOrientation",
+            Orientation::FirstTowardSecond   => "FirstTowardSecond",
+            Orientation::SecondTowardFirst   => "SecondTowardFirst",
+            Orientation::BothDirections      => "BothDirections",
+        }.to_string());
+        let side_of_road = result.side_of_road.map(|s| match s {
+            SideOfRoad::DirectlyOnOrNA => "DirectlyOnOrNA",
+            SideOfRoad::Right          => "Right",
+            SideOfRoad::Left           => "Left",
+            SideOfRoad::Both           => "Both",
+        }.to_string());
+
         serde_json::to_string(&DecodeResult {
             ok: true,
             format: self.openlr_format.to_string(),
@@ -414,6 +454,11 @@ impl Decoder {
             neg_uncertainty_wkt,
             error: None,
             trace: trace_value,
+            location_type,
+            point_lon,
+            point_lat,
+            orientation,
+            side_of_road,
         }).unwrap()
     }
 

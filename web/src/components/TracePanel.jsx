@@ -1,6 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { useStore, getSegGeomCache } from '../store.js';
 import { useDraggable } from '../hooks.js';
+import { verdictType } from '../replayEngine.js';
 import ReplayPanel from './ReplayPanel.jsx';
 
 const ASTAR_DISPLAY_CAP = 200;
@@ -119,7 +120,7 @@ function Section({ title, badge, badgeOk, defaultOpen = true, children }) {
 
 // ── Segment highlight button ──────────────────────────────────────────────────
 
-function SegBtn({ segId, setTraceHighlight }) {
+function SegBtn({ segId, setTraceHighlight, onSelect }) {
   const sourceKey = getSegGeomCache().get(segId)?.properties?.source_id ?? null;
   const label = sourceKey != null ? sourceKey : segId;
   return (
@@ -129,11 +130,43 @@ function SegBtn({ segId, setTraceHighlight }) {
       onClick={(e) => {
         e.stopPropagation();
         setTraceHighlight([segId]);
+        onSelect?.();
       }}
     >
       {label}
     </button>
   );
+}
+
+function buildCandPopup(segId, lrpIdx, traversal, ctype, winner, snapPt, projection, score, verdict) {
+  const feat = getSegGeomCache().get(segId);
+  return {
+    lrp_idx:      lrpIdx,
+    segment_id:   segId,
+    source_id:    feat?.properties?.source_id ?? null,
+    traversal,
+    ctype,
+    winner:       winner ?? false,
+    snap_lon:     snapPt?.[0] ?? null,
+    snap_lat:     snapPt?.[1] ?? null,
+    distance_m:   projection?.distance_m ?? null,
+    arc_offset_m: projection?.arc_offset_m ?? null,
+    bearing_deg:  projection?.bearing_deg ?? null,
+    score_total:      score?.total ?? null,
+    score_distance:   score?.distance_score ?? null,
+    score_bearing:    score?.bearing_score ?? null,
+    score_frc:        score?.frc_score ?? null,
+    score_fow:        score?.fow_score ?? null,
+    score_wrong_ep:   score?.wrong_endpoint_score ?? null,
+    score_interior:   score?.interior_score ?? null,
+    verdict_json:     verdict ? JSON.stringify(verdict) : null,
+    frc:       feat?.properties?.frc ?? null,
+    fow:       feat?.properties?.fow ?? null,
+    frc_name:  feat?.properties?.frc_name ?? null,
+    fow_name:  feat?.properties?.fow_name ?? null,
+    direction: feat?.properties?.direction ?? null,
+    length_m:  feat?.properties?.length_m ?? null,
+  };
 }
 
 // ── Reference summary ─────────────────────────────────────────────────────────
@@ -251,7 +284,7 @@ function fmtVerdict(verdict) {
 
 // ── Candidates section ────────────────────────────────────────────────────────
 
-function RejectedTable({ rejected, setTraceHighlight }) {
+function RejectedTable({ rejected, lrpIdx, setTraceHighlight, setCandidatePopup }) {
   const [open, setOpen] = useState(false);
   if (!rejected?.length) return null;
   return (
@@ -276,7 +309,11 @@ function RejectedTable({ rejected, setTraceHighlight }) {
               const { label, cls } = fmtVerdict(r.verdict);
               return (
                 <tr key={i}>
-                  <td><SegBtn segId={r.segment_id} setTraceHighlight={setTraceHighlight} /></td>
+                  <td><SegBtn segId={r.segment_id} setTraceHighlight={setTraceHighlight}
+                    onSelect={() => setCandidatePopup(buildCandPopup(
+                      r.segment_id, lrpIdx, r.traversal, verdictType(r.verdict), false,
+                      r.point, { distance_m: r.distance_m, bearing_deg: r.bearing_deg }, null, r.verdict
+                    ))} /></td>
                   <td className="tp-dim">{r.traversal === 'Forward' ? 'Fwd' : 'Bwd'}</td>
                   <td>{r.distance_m != null ? r.distance_m.toFixed(1) : '—'}</td>
                   <td>{r.bearing_deg != null ? r.bearing_deg.toFixed(1) : '—'}</td>
@@ -291,7 +328,7 @@ function RejectedTable({ rejected, setTraceHighlight }) {
   );
 }
 
-function CandidatesSection({ lrpIdx, phase, lrpInfo, setTraceHighlight }) {
+function CandidatesSection({ lrpIdx, phase, lrpInfo, setTraceHighlight, setCandidatePopup }) {
   const ranked = phase?.ranked;
   if (!ranked) return null;
 
@@ -333,7 +370,11 @@ function CandidatesSection({ lrpIdx, phase, lrpInfo, setTraceHighlight }) {
               <tr key={i} className={i === 0 ? 'tp-best-row' : ''}>
                 <td className="tp-dim">{i}</td>
                 <td>
-                  <SegBtn segId={c.segment_id} setTraceHighlight={setTraceHighlight} />
+                  <SegBtn segId={c.segment_id} setTraceHighlight={setTraceHighlight}
+                    onSelect={() => setCandidatePopup(buildCandPopup(
+                      c.segment_id, lrpIdx, c.traversal, 'accepted', i === 0,
+                      c.projection.point, c.projection, c.score, null
+                    ))} />
                 </td>
                 <td className="tp-dim">{c.traversal === 'Forward' ? 'Fwd' : 'Bwd'}</td>
                 <td>{c.projection.distance_m.toFixed(1)}</td>
@@ -350,7 +391,8 @@ function CandidatesSection({ lrpIdx, phase, lrpInfo, setTraceHighlight }) {
           </tbody>
         </table>
       )}
-      <RejectedTable rejected={rejected} setTraceHighlight={setTraceHighlight} />
+      <RejectedTable rejected={rejected} lrpIdx={lrpIdx}
+        setTraceHighlight={setTraceHighlight} setCandidatePopup={setCandidatePopup} />
     </Section>
   );
 }
@@ -538,7 +580,7 @@ function ResultSection({ decodeResult }) {
 
 export default function TracePanel() {
   const { decodeResult, openlrString, showTrace, params, setParam, toggleTrace,
-          setTraceHighlight, setTraceLrpFocus, replaySteps } = useStore();
+          setTraceHighlight, setTraceLrpFocus, replaySteps, setCandidatePopup } = useStore();
   const panelRef = useRef(null);
   const { pos, onMouseDown } = useDraggable(panelRef);
 
@@ -615,6 +657,7 @@ export default function TracePanel() {
                 phase={candidates[i]}
                 lrpInfo={lrps}
                 setTraceHighlight={setTraceHighlight}
+                setCandidatePopup={setCandidatePopup}
               />
             ))}
 

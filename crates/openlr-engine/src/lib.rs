@@ -16,7 +16,7 @@ pub use wkt::{path_to_wkt, path_band_wkt};
 
 use std::collections::HashMap;
 
-use openlr_codec::lrp::{LocationReference, Lrp};
+use openlr_codec::lrp::{LocationReference, LocationType, Orientation, SideOfRoad, Lrp};
 use openlr_graph::{Graph, NodeId, SegmentId};
 
 use astar::find_route;
@@ -30,7 +30,7 @@ type RouteCache = HashMap<(NodeId, NodeId, u8), Option<(Vec<SegmentId>, f64)>>;
 
 // ── Public result types ───────────────────────────────────────────────────────
 
-/// The decoded line location.
+/// The decoded location (line or point).
 #[derive(Debug, Clone)]
 pub struct DecodedLocation {
     /// Ordered segment IDs making up the matched path (includes partial first/last segments).
@@ -58,6 +58,13 @@ pub struct DecodedLocation {
     /// Trace of every decision made during this decode.
     /// `None` when `params.trace_level == TraceLevel::Off`.
     pub trace: Option<DecodeTrace>,
+    // ── PointAlongLine-specific fields ────────────────────────────────────────
+    /// The decoded point coordinate (lon, lat). Set for PAL; None for line locations.
+    pub point_coord: Option<(f64, f64)>,
+    /// PAL orientation attribute.
+    pub orientation: Option<Orientation>,
+    /// PAL side-of-road attribute.
+    pub side_of_road: Option<SideOfRoad>,
 }
 
 /// Decode failure.
@@ -96,7 +103,8 @@ pub fn decode(
     graph: &Graph,
     params: &DecodeParams,
 ) -> Result<DecodedLocation, DecodeFailure> {
-    let lrps = &loc_ref.lrps;
+    let lrps = loc_ref.lrps.as_slice();
+    let is_pal = loc_ref.location_type == LocationType::PointAlongLine;
     let mut trace = if params.trace_level != TraceLevel::Off {
         Some(Trace::new(params.clone()))
     } else {
@@ -246,7 +254,16 @@ pub fn decode(
         .map(|i| all_candidates[i][winning_indices[i]].projection.distance_m)
         .collect();
 
-    // ── 5. Emit completion ──────────────────────────────────────────────────
+    // ── 5. PAL: compute point coordinate ───────────────────────────────────
+    let (point_coord, orientation, side_of_road) = if is_pal {
+        let dist = first_lrp_arc_m + pos_offset_m;
+        let pt = wkt::point_at_path_distance(&path, dist, first_seg_traversal, graph);
+        (pt, loc_ref.orientation, loc_ref.side_of_road)
+    } else {
+        (None, None, None)
+    };
+
+    // ── 6. Emit completion ──────────────────────────────────────────────────
     let outcome = DecodeOutcome::Success {
         path: path.clone(),
         pos_offset_m: if pos_offset_m > 0.0 { Some(pos_offset_m) } else { None },
@@ -262,6 +279,7 @@ pub fn decode(
         first_seg_traversal, last_seg_traversal,
         lrp_snap_points, lrp_snap_is_endpoint, lrp_snap_distances_m,
         trace,
+        point_coord, orientation, side_of_road,
     })
 }
 
@@ -410,7 +428,7 @@ fn try_route_combination(
 mod tests {
     use super::*;
     use openlr_codec::{CircularInterval, LinearInterval};
-    use openlr_codec::lrp::{LocationReference, Lrp};
+    use openlr_codec::lrp::{LocationReference, LocationType, Orientation, SideOfRoad, Lrp};
     use openlr_graph::{Direction, Graph, NetworkNode, NetworkSegment, NodeId, SegmentId};
 
     fn node(id: u32, lon: f64, lat: f64) -> NetworkNode {
@@ -456,8 +474,7 @@ mod tests {
         //
         // Each LRP position unambiguously matches exactly one segment because
         // the other segments are too far or face the wrong direction.
-        let loc_ref = LocationReference {
-            lrps: vec![
+        let loc_ref = LocationReference::line(vec![
                 Lrp {
                     coord: (0.0005, 0.000),
                     bearing: CircularInterval { lb_deg: 75.0,  ub_deg: 105.0  }, // east
@@ -481,8 +498,7 @@ mod tests {
                     lfrcnp: None, dnp: None,
                     pos_offset: None, neg_offset: None,
                 },
-            ],
-        };
+            ]);
 
         let mut params = DecodeParams::preset(Preset::Permissive);
         params.trace_level = TraceLevel::Off;

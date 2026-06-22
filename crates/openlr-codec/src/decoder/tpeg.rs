@@ -148,7 +148,7 @@ pub fn decode_tpeg(bytes: &[u8]) -> Result<LocationReference, DecodeError> {
         neg_offset,
     });
 
-    Ok(LocationReference { lrps })
+    Ok(LocationReference::line(lrps))
 }
 
 pub fn decode_tpeg_hex(s: &str) -> Result<LocationReference, DecodeError> {

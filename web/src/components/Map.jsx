@@ -195,6 +195,23 @@ function addMapImages(map) {
   ac.fill(); ac.stroke();
   map.addImage('displacement-arrow', ac.getImageData(0, 0, aw, ah));
 
+  // Direction triangle — solid filled, points right (→), rotated by MapLibre to follow
+  // the line direction. Registered as SDF so icon-color can tint it per layer.
+  const tw = 14, th = 14;
+  const triCanvas = document.createElement('canvas');
+  triCanvas.width = tw; triCanvas.height = th;
+  const tc = triCanvas.getContext('2d');
+  tc.clearRect(0, 0, tw, th);
+  // Solid white fill (SDF tinting overrides colour at render time)
+  tc.beginPath();
+  tc.moveTo(2, 1); tc.lineTo(tw - 1, th / 2); tc.lineTo(2, th - 1);
+  tc.closePath();
+  tc.fillStyle = 'white';
+  tc.fill();
+  map.addImage('direction-triangle', tc.getImageData(0, 0, tw, th), { sdf: true });
+  // Keep legacy name so any surviving refs still resolve
+  map.addImage('candidate-chevron',  tc.getImageData(0, 0, tw, th), { sdf: true });
+
 }
 
 // ── Map Component ──────────────────────────────────────────────────────────────
@@ -215,13 +232,13 @@ export default function MapView({ tilesBase, ready }) {
   const replayStepsKey  = useRef(null);   // identity check for replaySteps array
   const flashAnimRef    = useRef(null);   // rAF handle for sonar-ping fade animation
   const routePulseRef   = useRef(null);   // rAF handle for route-found pulse animation
-  const candPanelRef    = useRef(null);
+  const candPanelRef        = useRef(null);
+  const candidatePopupRef   = useRef(null);
 
   const [status, setStatus] = useState(null);
   const [infoProps, setInfoProps] = useState(null);
   const [infoAnchor, setInfoAnchor] = useState(null);
   const [lrpInfo, setLrpInfo] = useState(null);
-  const [candInfo, setCandInfo] = useState(null);
   const [candAnchor, setCandAnchor] = useState(null);
   const [basemap, setBasemap] = useState('liberty');
   const [segDiagnosis, setSegDiagnosis] = useState(null);
@@ -250,11 +267,58 @@ export default function MapView({ tilesBase, ready }) {
   const replayStep  = useStore(s => s.replayStep);
   const replaySteps = useStore(s => s.replaySteps);
   const replayStats = useStore(s => s.replayStats);
-  const showTrace   = useStore(s => s.showTrace);
+  const showTrace          = useStore(s => s.showTrace);
+  const candidatePopup     = useStore(s => s.candidatePopup);
+  const clearCandidatePopup = useStore(s => s.clearCandidatePopup);
 
   // Reset drag position when a new popup target is clicked
   useEffect(() => { lrpResetPos(); }, [lrpInfo]);   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { segResetPos(); }, [infoProps]);  // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {                                  // eslint-disable-line react-hooks/exhaustive-deps
+    candidatePopupRef.current = candidatePopup;
+    candResetPos();
+    const map = mapRef.current;
+
+    // Update trace-segment-line color and trace-segment-arrow visibility based on accept/reject
+    const isAccepted = candidatePopup?.winner || candidatePopup?.ctype === 'accepted';
+    if (map?.getLayer('trace-segment-line')) {
+      map.setPaintProperty('trace-segment-line', 'line-color',
+        candidatePopup ? (isAccepted ? '#22cc66' : '#ee4444') : '#ff8c00');
+      map.setPaintProperty('trace-segment-line', 'line-width', candidatePopup ? 5 : 4);
+    }
+    if (map?.getLayer('trace-segment-arrow')) {
+      map.setLayoutProperty('trace-segment-arrow', 'visibility',
+        candidatePopup ? 'visible' : 'none');
+      if (candidatePopup) {
+        const arrowColor = isAccepted ? '#22cc66' : '#ee4444';
+        map.setPaintProperty('trace-segment-arrow', 'icon-color',       arrowColor);
+        map.setPaintProperty('trace-segment-arrow', 'icon-halo-color',  'white');
+        map.setPaintProperty('trace-segment-arrow', 'icon-halo-width',  4);
+        map.setPaintProperty('trace-segment-arrow', 'icon-halo-blur',   0);
+        map.setPaintProperty('trace-segment-arrow', 'icon-opacity',     1);
+      }
+    }
+
+    if (!candidatePopup?.snap_lon) {
+      setCandAnchor(null);
+      // Remove per-candidate filter on replay arrow layer when popup closes
+      if (map?.getLayer('replay-candidates-arrow')) {
+        map.setFilter('replay-candidates-arrow', null);
+      }
+      return;
+    }
+    if (!map) return;
+    const pt = map.project([candidatePopup.snap_lon, candidatePopup.snap_lat]);
+    setCandAnchor({ x: pt.x, y: pt.y });
+    // Filter replay-layer arrows to only the selected traversal direction, preventing
+    // overlapping opposite-direction chevrons when both traversals of the same segment exist
+    if (map.getLayer('replay-candidates-arrow') && candidatePopup.segment_id != null) {
+      map.setFilter('replay-candidates-arrow', ['all',
+        ['==', ['get', 'segment_id'], candidatePopup.segment_id],
+        ['==', ['get', 'traversal'],  candidatePopup.traversal ?? ''],
+      ]);
+    }
+  }, [candidatePopup]);
 
   // Open the segment info popup when ResultPanel (or decoded-path click) requests it.
   useEffect(() => {
@@ -365,6 +429,27 @@ export default function MapView({ tilesBase, ready }) {
           'line-color':   '#00d4ff',
           'line-width':   5,
           'line-opacity': 0.9,
+        },
+      });
+      // Direction triangles along the decoded path showing location traversal direction
+      map.addLayer({
+        id:     'decoded-path-arrow',
+        type:   'symbol',
+        source: 'decoded-path',
+        layout: {
+          'symbol-placement':    'line',
+          'symbol-spacing':      18,
+          'icon-image':          'direction-triangle',
+          'icon-size':           1.0,
+          'icon-allow-overlap':  true,
+          'icon-ignore-placement': true,
+        },
+        paint: {
+          'icon-color':        '#004466',
+          'icon-halo-color':   'white',
+          'icon-halo-width':   2,
+          'icon-halo-blur':    0,
+          'icon-opacity':      0.9,
         },
       });
 
@@ -507,6 +592,28 @@ export default function MapView({ tilesBase, ready }) {
           'line-opacity': 1,
         },
       });
+      // Direction triangles on the selected candidate segment (shown when candidatePopup is open)
+      map.addLayer({
+        id:     'trace-segment-arrow',
+        type:   'symbol',
+        source: 'trace-segment',
+        layout: {
+          'symbol-placement':    'line',
+          'symbol-spacing':      18,
+          'icon-image':          'direction-triangle',
+          'icon-size':           1.4,
+          'icon-allow-overlap':  true,
+          'icon-ignore-placement': true,
+          'visibility':          'none',
+        },
+        paint: {
+          'icon-color':        'white',
+          'icon-halo-color':   'white',
+          'icon-halo-width':   4,
+          'icon-halo-blur':    0,
+          'icon-opacity':      1.0,
+        },
+      });
 
       // ── Replay sources & layers ──────────────────────────────────────────
       const emptyFC = { type: 'FeatureCollection', features: [] };
@@ -535,34 +642,42 @@ export default function MapView({ tilesBase, ready }) {
         paint: { 'line-color': '#ffe066', 'line-width': 4, 'line-opacity': 0.85 },
       });
 
-      // Candidate snap points — colour by verdict type
+      // Candidate segments — coloured lines (green = accepted, red = rejected)
       map.addLayer({
-        id: 'replay-candidates-circle', type: 'circle', source: 'replay-candidates',
+        id: 'replay-candidates-line', type: 'line', source: 'replay-candidates',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
         paint: {
-          // Winners (chosen leg endpoints) are larger with a white ring.
-          'circle-radius': ['case',
-            ['boolean', ['get', 'winner'], false], 10,
-            ['==', ['get', 'ctype'], 'accepted'],   7,
-            5,
+          'line-color': ['case',
+            ['boolean', ['get', 'winner'], false], '#00ff88',
+            ['==', ['get', 'ctype'], 'accepted'],  '#22cc66',
+            '#dd3333',
           ],
-          'circle-opacity': 0.95,
-          'circle-stroke-width': ['case',
-            ['boolean', ['get', 'winner'], false], 3,
-            ['==', ['get', 'ctype'], 'accepted'],   2,
-            1,
+          'line-width': ['case',
+            ['boolean', ['get', 'winner'], false], 4,
+            ['==', ['get', 'ctype'], 'accepted'],  2.5,
+            1.5,
           ],
-          'circle-stroke-color': ['case',
-            ['boolean', ['get', 'winner'], false], '#ffffff',
-            'rgba(0,0,0,0.5)',
+          'line-opacity': ['case',
+            ['boolean', ['get', 'winner'], false], 1.0,
+            ['==', ['get', 'ctype'], 'accepted'],  0.85,
+            0.6,
           ],
-          'circle-color': ['match', ['get', 'ctype'],
-            'accepted',  '#00ff88',
-            'bearing',   '#ff8c00',
-            'radius',    '#ffdd00',
-            'score',     '#cc44ff',
-            'direction', '#556677',
-            /* default */ '#aaaaaa',
-          ],
+        },
+      });
+      // Direction triangles along each candidate segment
+      map.addLayer({
+        id: 'replay-candidates-arrow', type: 'symbol', source: 'replay-candidates',
+        layout: {
+          'symbol-placement':  'line',
+          'symbol-spacing':    18,
+          'icon-image':        'direction-triangle',
+          'icon-size':         1.0,
+          'icon-allow-overlap': true,
+          'icon-ignore-placement': true,
+        },
+        paint: {
+          'icon-color':   'white',
+          'icon-opacity': 0.9,
         },
       });
 
@@ -640,6 +755,19 @@ export default function MapView({ tilesBase, ready }) {
         },
       });
 
+      // ── PointAlongLine result marker ──────────────────────────────────────
+      map.addSource('pal-point', { type: 'geojson', data: emptyFC2 });
+      map.addLayer({
+        id: 'pal-point-layer', type: 'circle', source: 'pal-point',
+        paint: {
+          'circle-radius':       9,
+          'circle-color':        '#ff6b35',
+          'circle-stroke-color': '#ffffff',
+          'circle-stroke-width': 2.5,
+          'circle-opacity':      0.9,
+        },
+      });
+
       // ── Click handlers ────────────────────────────────────────────────────
       const pointerOn  = () => { if (!measuringRef.current) map.getCanvas().style.cursor = 'pointer'; };
       const pointerOff = () => { if (!measuringRef.current) map.getCanvas().style.cursor = ''; };
@@ -654,15 +782,8 @@ export default function MapView({ tilesBase, ready }) {
       map.on('mouseenter', 'lrp-markers-circle', pointerOn);
       map.on('mouseleave', 'lrp-markers-circle', pointerOff);
 
-      map.on('click', 'replay-candidates-circle', (e) => {
-        const props = e.features?.[0]?.properties;
-        if (!props) return;
-        setCandInfo(props);
-        setCandAnchor({ x: e.point.x, y: e.point.y });
-        e.stopPropagation?.();
-      });
-      map.on('mouseenter', 'replay-candidates-circle', pointerOn);
-      map.on('mouseleave', 'replay-candidates-circle', pointerOff);
+      map.on('mouseenter', 'replay-candidates-line',  pointerOn);
+      map.on('mouseleave', 'replay-candidates-line',  pointerOff);
 
       map.on('click', 'decoded-path-line', onDecodedPathClick);
       map.on('mouseenter', 'decoded-path-line', pointerOn);
@@ -853,6 +974,7 @@ export default function MapView({ tilesBase, ready }) {
     setInfoAnchor({ x: e.point.x, y: e.point.y });
     setInfoProps(null);
     setHighlightedSegment(null);
+    e.stopPropagation();           // stop lower-Z layers (segments) from also firing
     e.originalEvent.stopPropagation();
   }
 
@@ -986,6 +1108,22 @@ export default function MapView({ tilesBase, ready }) {
       if (feat.geometry?.coordinates) allCoords.push(...feat.geometry.coordinates);
     }
 
+    // When a candidate popup is active for a Backward traversal, reverse the
+    // coordinate order so trace-segment-arrow chevrons point the correct way.
+    const cp = candidatePopupRef.current;
+    if (
+      cp?.traversal === 'Backward' &&
+      features.length === 1 &&
+      traceHighlightSegIds?.length === 1 &&
+      traceHighlightSegIds[0] === cp.segment_id
+    ) {
+      const f = features[0];
+      features[0] = {
+        ...f,
+        geometry: { type: 'LineString', coordinates: [...f.geometry.coordinates].reverse() },
+      };
+    }
+
     traceSource.setData({ type: 'FeatureCollection', features });
 
     // Pan to the bounding box of the highlighted segments
@@ -998,8 +1136,9 @@ export default function MapView({ tilesBase, ready }) {
       );
     }
 
-    // Show segment info popup for single-segment trace clicks
-    if (features.length === 1) {
+    // Show segment info popup for single-segment trace clicks, but not
+    // when a candidate evaluation popup is already being shown.
+    if (features.length === 1 && !candidatePopupRef.current) {
       const feat = features[0];
       // segId is the WASM runtime segment_id — include it so the popup
       // doesn't show "— (decode first)" for Internal ID.
@@ -1059,7 +1198,7 @@ export default function MapView({ tilesBase, ready }) {
 
   const replayLayerIds = [
     'replay-radius-fill', 'replay-radius-line',
-    'replay-candidates-circle',
+    'replay-candidates-line', 'replay-candidates-arrow',
     'replay-cloud-circle',
     'replay-frontier-circle',
     'replay-leg-from', 'replay-leg-to',
@@ -1123,7 +1262,7 @@ export default function MapView({ tilesBase, ready }) {
     replayStepRef.current   = replayStep;
 
     // ── Push GeoJSON to sources ─────────────────────────────────────────────
-    const gj = stateToGeoJSON(visualState);
+    const gj = stateToGeoJSON(visualState, id => getSegGeomCache().get(id));
     map.getSource('replay-radius')     ?.setData(gj.radiusFC);
     map.getSource('replay-candidates') ?.setData(gj.candFC);
     map.getSource('replay-cloud')      ?.setData(gj.cloudFC);
@@ -1275,6 +1414,7 @@ export default function MapView({ tilesBase, ready }) {
     const snapSource        = map.getSource('lrp-snap');
     const displSource       = map.getSource('lrp-displacement');
     const uncertaintySource = map.getSource('offset-uncertainty');
+    const palSource         = map.getSource('pal-point');
 
     const emptyFC = { type: 'FeatureCollection', features: [] };
     if (!decodeResult) {
@@ -1283,6 +1423,7 @@ export default function MapView({ tilesBase, ready }) {
       snapSource?.setData(emptyFC);
       displSource?.setData(emptyFC);
       uncertaintySource?.setData(emptyFC);
+      palSource?.setData(emptyFC);
       setInfoProps(null);
       setInfoAnchor(null);
       setLrpInfo(null);
@@ -1362,9 +1503,34 @@ export default function MapView({ tilesBase, ready }) {
     }
     uncertaintySource?.setData({ type: 'FeatureCollection', features: uncertaintyFeatures });
 
+    // ── PointAlongLine result point ───────────────────────────────────────────
+    if (decodeResult.ok && decodeResult.location_type === 'PointAlongLine' &&
+        decodeResult.point_lon != null && decodeResult.point_lat != null) {
+      palSource?.setData({
+        type: 'FeatureCollection',
+        features: [{
+          type: 'Feature',
+          geometry: { type: 'Point', coordinates: [decodeResult.point_lon, decodeResult.point_lat] },
+          properties: {
+            orientation: decodeResult.orientation,
+            side_of_road: decodeResult.side_of_road,
+          },
+        }],
+      });
+    } else {
+      palSource?.setData(emptyFC);
+    }
+
     // ── Fit camera — always include all LRP positions AND the decoded path ──────
     const lrpCoords = lrps.map(l => [l.lon, l.lat]);
-    const fitCoords = [...lrpCoords, ...(wktCoords ?? [])];
+    const fitCoords = [
+      ...lrpCoords,
+      ...(wktCoords ?? []),
+      ...(decodeResult.ok && decodeResult.location_type === 'PointAlongLine' &&
+          decodeResult.point_lon != null
+        ? [[decodeResult.point_lon, decodeResult.point_lat]]
+        : []),
+    ];
 
     if (fitCoords.length > 0) {
       const lngs = fitCoords.map(c => c[0]);
@@ -1490,8 +1656,8 @@ export default function MapView({ tilesBase, ready }) {
             <table>
               <tbody>
                 {[
-                  ['FRC',       `${infoProps.frc} — ${infoProps.frc_name}`],
-                  ['FOW',       `${infoProps.fow} — ${infoProps.fow_name}`],
+                  ['FRC',       `${infoProps.frc_name} (${infoProps.frc})`],
+                  ['FOW',       `${infoProps.fow_name} (${infoProps.fow})`],
                   ['Direction', infoProps.direction],
                   ['Length',    `${infoProps.length_m} m`],
                   ['Tile',         infoProps.tile],
@@ -1591,18 +1757,18 @@ export default function MapView({ tilesBase, ready }) {
       )}
 
       {/* Candidate info popup */}
-      {candInfo && (
+      {candidatePopup && (
         <div ref={candPanelRef} className="seg-info-panel cand-panel"
           style={candPos ? { position: 'absolute', left: candPos.left, top: candPos.top, right: 'auto', bottom: 'auto' } : popupStyle(candAnchor, 320, 320)}>
           <header className="seg-info-header" onMouseDown={candMouseDown}>
             <span>
-              LRP {candInfo.lrp_idx} candidate
-              {candInfo.winner && <span className="cand-winner-badge"> ★ chosen</span>}
+              LRP {candidatePopup.lrp_idx} candidate
+              {candidatePopup.winner && <span className="cand-winner-badge"> ★ chosen</span>}
             </span>
-            <button className="seg-info-close" onClick={() => { setCandInfo(null); setCandAnchor(null); candResetPos(); }}>✕</button>
+            <button className="seg-info-close" onClick={() => { clearCandidatePopup(); setCandAnchor(null); candResetPos(); }}>✕</button>
           </header>
           <div className="seg-info-body">
-            <CandidatePopupBody p={candInfo} />
+            <CandidatePopupBody p={candidatePopup} />
           </div>
         </div>
       )}
@@ -1707,20 +1873,33 @@ function CandidatePopupBody({ p }) {
   const accepted     = p.ctype === 'accepted';
   const resultLabel  = RESULT_LABEL[p.ctype] ?? p.ctype;
   const verdictLine  = !accepted ? formatVerdict(p.verdict_json) : null;
+  const segKey       = p.source_id ?? p.segment_id;
 
   return (
     <table className="cand-table">
       <tbody>
+        {/* Verdict */}
         <tr>
           <td className="seg-info-key">Result</td>
           <td><b className={accepted ? 'cand-accepted' : 'cand-rejected'}>{resultLabel}</b></td>
         </tr>
         {verdictLine &&
           <tr><td className="seg-info-key"></td><td className="cand-verdict-detail">{verdictLine}</td></tr>}
-        {p.segment_id != null &&
-          <tr><td className="seg-info-key">Seg ID</td><td><b>{p.segment_id}</b></td></tr>}
+
+        {/* Segment */}
+        <tr><td colSpan={2} className="cand-section">Segment</td></tr>
+        {segKey != null &&
+          <tr><td className="seg-info-key">Key</td><td><b>{segKey}</b></td></tr>}
         {p.traversal &&
           <tr><td className="seg-info-key">Traversal</td><td><b>{p.traversal}</b></td></tr>}
+        {p.frc_name != null &&
+          <tr><td className="seg-info-key">FRC</td><td><b>{p.frc_name} ({p.frc})</b></td></tr>}
+        {p.fow_name != null &&
+          <tr><td className="seg-info-key">FOW</td><td><b>{p.fow_name} ({p.fow})</b></td></tr>}
+        {p.direction != null &&
+          <tr><td className="seg-info-key">Direction</td><td><b>{p.direction}</b></td></tr>}
+        {p.length_m != null &&
+          <tr><td className="seg-info-key">Length</td><td><b>{p.length_m} m</b></td></tr>}
 
         {/* Projection */}
         <tr><td colSpan={2} className="cand-section">Projection</td></tr>

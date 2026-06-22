@@ -285,6 +285,35 @@ html, body, #root, .app {
   gap: 3px;
 }
 
+/* PointAlongLine result info block */
+.pal-point-info {
+  background: rgba(255, 107, 53, 0.1);
+  border: 1px solid rgba(255, 107, 53, 0.3);
+  border-radius: 4px;
+  padding: 6px 8px;
+  margin: 8px 0 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.pal-point-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+.pal-label {
+  color: #ff9966;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.pal-value {
+  color: #e8e8f0;
+  font-family: monospace;
+  font-size: 11px;
+  text-align: right;
+}
+
 .diag-suggestions {
   margin-top: 4px;
 }

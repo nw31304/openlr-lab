@@ -217,6 +217,39 @@ pub fn path_band_wkt(
     )
 }
 
+/// Walk `dist_m` meters from the start of the path (applying `first_seg_traversal` to the
+/// first segment, Forward to all subsequent segments) and return the interpolated WGS84
+/// coordinate (lon, lat) at that position.
+///
+/// Used for PointAlongLine decoding: `dist_m = first_lrp_arc_m + pos_offset_m`.
+pub fn point_at_path_distance(
+    path: &[SegmentId],
+    dist_m: f64,
+    first_seg_traversal: TraversalDir,
+    graph: &Graph,
+) -> Option<(f64, f64)> {
+    // Collect all vertices of the path in traversal order into one flat list.
+    // Consecutive segments share an endpoint — deduplicate at segment boundaries.
+    let mut all_verts: Vec<(f64, f64)> = Vec::new();
+    for (i, seg_id) in path.iter().enumerate() {
+        let seg = graph.segments.get(seg_id)?;
+        let trav = if i == 0 { first_seg_traversal } else { TraversalDir::Forward };
+        let verts: &[(f64, f64)] = &seg.geometry;
+        let ordered: Vec<(f64, f64)> = match trav {
+            TraversalDir::Forward  => verts.to_vec(),
+            TraversalDir::Backward => verts.iter().rev().copied().collect(),
+        };
+        if i == 0 {
+            all_verts.extend_from_slice(&ordered);
+        } else {
+            // Skip the first vertex (it's the same as the last of the previous segment).
+            all_verts.extend_from_slice(&ordered[1..]);
+        }
+    }
+    if all_verts.is_empty() { return None; }
+    Some(interpolate_at(&all_verts, dist_m.max(0.0)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
