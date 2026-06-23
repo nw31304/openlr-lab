@@ -20,6 +20,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use duckdb::{params, Connection};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::time::Duration;
 use osmpbf::{Element, ElementReader, RelMemberType};
 use tracing::{info, warn};
 
@@ -255,6 +256,7 @@ pub(crate) fn make_spinner(show: bool, msg: &'static str) -> ProgressBar {
             .expect("valid template"),
     );
     pb.set_message(msg);
+    pb.enable_steady_tick(Duration::from_millis(120));
     pb
 }
 
@@ -352,6 +354,7 @@ fn flush_way_batch(
 fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, show_progress: bool) -> Result<usize> {
     let pb = make_spinner(show_progress, "Pass 1/2  scanning ways ");
     let mut ways_scanned: u64 = 0;
+    let mut elements_seen: u64 = 0;
 
     let reader = ElementReader::from_path(pbf_path)?;
 
@@ -362,6 +365,10 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
 
     reader.for_each(|el| {
         if err.is_some() { return; }
+        elements_seen += 1;
+        if elements_seen % 100_000 == 0 {
+            pb.set_position(ways_scanned);
+        }
         match el {
             Element::Way(w) => {
                 let mut highway:          Option<&str> = None;
@@ -419,9 +426,6 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
 
                 way_batch.push(WayRecord { id: w.id(), frc, fow, direction, node_ids: node_ids_to_blob(&node_ids) });
                 ways_scanned += 1;
-                if ways_scanned % (WAY_BATCH as u64) == 0 {
-                    pb.set_position(ways_scanned);
-                }
 
                 if way_batch.len() >= WAY_BATCH {
                     if let Err(e) = flush_way_batch(conn, &mut way_batch, &mut delta_batch) {
