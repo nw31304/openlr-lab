@@ -126,6 +126,14 @@ pub struct BuildArgs {
     #[arg(long, requires = "low_memory")]
     pub duckdb_memory_mb: Option<u64>,
 
+    /// Directory for DuckDB spill files when the memory limit is exceeded.
+    /// Defaults to a subdirectory of --output so spill files land on the
+    /// same disk as the output archive.  Override this if --output is on a
+    /// slow or small disk and you have a faster/larger scratch partition.
+    /// Must NOT be on a tmpfs/ramfs — spill files can be several GB.
+    #[arg(long, requires = "low_memory")]
+    pub duckdb_temp_dir: Option<PathBuf>,
+
     /// Show indicatif progress bars for each pipeline stage.
     /// Silent by default; pass this flag for interactive builds.
     #[arg(long)]

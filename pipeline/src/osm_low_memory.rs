@@ -311,7 +311,7 @@ pub(crate) fn make_bar(show: bool, total: u64, msg: &'static str) -> ProgressBar
 
 // ── DuckDB setup ──────────────────────────────────────────────────────────────
 
-fn setup_duckdb(memory_mb_override: Option<u64>) -> Result<Connection> {
+fn setup_duckdb(memory_mb_override: Option<u64>, temp_dir: &Path) -> Result<Connection> {
     let limit_mb = match memory_mb_override {
         Some(mb) => mb,
         None => {
@@ -322,13 +322,12 @@ fn setup_duckdb(memory_mb_override: Option<u64>) -> Result<Connection> {
         }
     };
 
-    // Use a temp dir under the OS temp directory so DuckDB can spill large
-    // intermediate results (e.g. the node-ref GROUP BY for continental PBFs)
-    // to disk rather than OOMing.  The path must not contain single quotes.
-    let tmp_base = std::env::temp_dir();
-    let tmp_dir  = tmp_base.join(format!("openlrlens_{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir).ok();
-    let tmp_str = tmp_dir.to_string_lossy().replace('\'', "");
+    // Enable DuckDB disk spilling: when the memory limit is exceeded during large
+    // operations (e.g. GROUP BY on 300-400M rows for continental PBFs), DuckDB
+    // streams intermediate state through this directory rather than OOMing.
+    // The caller is responsible for choosing a path on real disk (not tmpfs).
+    std::fs::create_dir_all(temp_dir).ok();
+    let tmp_str = temp_dir.to_string_lossy().replace('\'', "");
 
     let conn = Connection::open_in_memory().context("open DuckDB")?;
     conn.execute_batch(&format!(
@@ -1278,10 +1277,15 @@ pub fn run_pipeline(
     release_label:    &str,
     tile_zoom:        u8,
     duckdb_memory_mb: Option<u64>,
+    duckdb_temp_dir:  Option<&Path>,
     show_progress:    bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
-    let conn = setup_duckdb(duckdb_memory_mb)?;
+    // Default spill directory is a subdirectory of the output dir so it lands
+    // on the same disk as the output archive (not tmpfs).
+    let default_tmp = output_dir.join(format!(".duckdb_tmp_{}", std::process::id()));
+    let temp_dir    = duckdb_temp_dir.unwrap_or(&default_tmp);
+    let conn = setup_duckdb(duckdb_memory_mb, temp_dir)?;
 
     // Phase 1: extract ways and relations.
     info!("low-memory: Pass 1 — extract ways");
@@ -1308,6 +1312,14 @@ pub fn run_pipeline(
     // Phase 4: tile and write PMTiles.
     info!("low-memory: tiling");
     tile_from_duckdb(&conn, tile_zoom, output_dir, extent_slug, release_label, show_progress)?;
+
+    // Drop the connection before removing the spill directory (DuckDB closes
+    // its temp files on drop; removing them while open would fail on Windows).
+    drop(conn);
+    if duckdb_temp_dir.is_none() {
+        // Only clean up the default temp dir we created; leave user-supplied dirs alone.
+        let _ = std::fs::remove_dir_all(&default_tmp);
+    }
 
     Ok(())
 }

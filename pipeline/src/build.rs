@@ -29,6 +29,7 @@ pub async fn run_osm(
     tile_zoom:        u8,
     low_memory:       bool,
     duckdb_memory_mb: Option<u64>,
+    duckdb_temp_dir:  Option<&Path>,
     show_progress:    bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output)?;
@@ -56,6 +57,7 @@ pub async fn run_osm(
         let output_dir  = output.to_path_buf();
         let extent_slug = extent_slug.clone();
         let release_lm  = release_label.to_string();
+        let tmp_dir     = duckdb_temp_dir.map(|p| p.to_path_buf());
         return tokio::task::spawn_blocking(move || {
             crate::osm_low_memory::run_pipeline(
                 &pbf_path,
@@ -66,6 +68,7 @@ pub async fn run_osm(
                 &release_lm,
                 tile_zoom,
                 duckdb_memory_mb,
+                tmp_dir.as_deref(),
                 show_progress,
             )
         })
@@ -176,6 +179,7 @@ pub async fn run_generic(
     tile_zoom:         u8,
     low_memory:        bool,
     duckdb_memory_mb:  Option<u64>,
+    duckdb_temp_dir:   Option<&Path>,
     show_progress:     bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output)?;

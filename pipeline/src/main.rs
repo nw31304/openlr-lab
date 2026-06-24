@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
                     args.tile_zoom,
                     args.low_memory,
                     args.duckdb_memory_mb,
+                    args.duckdb_temp_dir.as_deref(),
                     args.progress,
                 )
                 .await?;
@@ -111,6 +112,7 @@ async fn main() -> Result<()> {
                             args.tile_zoom,
                             args.low_memory,
                             args.duckdb_memory_mb,
+                            args.duckdb_temp_dir.as_deref(),
                             args.progress,
                         )
                         .await?;
