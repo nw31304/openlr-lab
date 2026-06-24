@@ -1,6 +1,5 @@
 /// DuckDB-backed GeoJSONL pipeline, activated when `--low-memory` is passed
-/// with `--roads` input.  The in-memory default (`build::run_generic`) is
-/// unchanged; this path is opt-in.
+/// with `--roads` input.
 ///
 /// Unlike the OSM path there is no two-pass scan: every GeoJSONL line contains
 /// its own geometry, attributes, and node IDs, so extract + quantize are a
@@ -21,6 +20,7 @@ use tracing::{info, warn};
 use crate::osm_low_memory::{
     geom_to_blob, make_bar, make_spinner, remove_collinear_lm, tile_from_duckdb,
 };
+use crate::partition::available_ram_bytes;
 use crate::split::haversine_m;
 use crate::tile::lon_lat_to_tile_xy;
 
@@ -40,23 +40,22 @@ fn node_gers(id: i64) -> [u8; 16] {
 
 // ── DuckDB setup ──────────────────────────────────────────────────────────────
 
-fn setup_duckdb(memory_mb_override: Option<u64>) -> Result<Connection> {
-    use sysinfo::System;
+fn setup_duckdb(memory_mb_override: Option<u64>, temp_dir: &Path) -> Result<Connection> {
     let limit_mb = match memory_mb_override {
         Some(mb) => mb,
         None => {
-            let mut sys = System::new();
-            sys.refresh_memory();
-            let avail = sys.available_memory(); // bytes
-            let mb = ((avail as f64 * 0.40) / 1_048_576.0) as u64;
-            mb.max(1_024)
+            let avail = available_ram_bytes();
+            ((avail as f64 * 0.40) / 1_048_576.0) as u64
         }
-    };
+    }.max(1_024);
 
-    let conn = Connection::open_in_memory().context("open DuckDB")?;
+    std::fs::create_dir_all(temp_dir).context("create DuckDB temp dir")?;
+    let db_file = temp_dir.join("pipeline.duckdb");
+    let conn = Connection::open(&db_file).context("open DuckDB")?;
     conn.execute_batch(&format!(
         "PRAGMA threads={threads}; \
          SET memory_limit='{limit_mb}MB'; \
+         SET preserve_insertion_order=false; \
          CREATE TABLE q_edges ( \
              edge_idx INTEGER, \
              start_gers BLOB, end_gers BLOB, parent_gers BLOB, \
@@ -75,7 +74,6 @@ fn setup_duckdb(memory_mb_override: Option<u64>) -> Result<Connection> {
 // ── Edge batch ────────────────────────────────────────────────────────────────
 
 struct EdgeBatch {
-    edge_idx:   u32,
     start_gers: [u8; 16],
     end_gers:   [u8; 16],
     parent_gers:[u8; 16],
@@ -103,7 +101,6 @@ fn map_flowdir(flowdir: i64) -> u8 {
 /// Returns None for blank lines or degenerate geometry (< 2 vertices).
 fn parse_line(
     line: &str,
-    edge_idx: u32,
     tile_zoom: u8,
     seg_to_to_int: &mut std::collections::HashMap<i64, i64>,
 ) -> Result<Option<EdgeBatch>> {
@@ -171,7 +168,6 @@ fn parse_line(
     seg_to_to_int.insert(id, to_int);
 
     Ok(Some(EdgeBatch {
-        edge_idx,
         start_gers: node_gers(from_int),
         end_gers:   node_gers(to_int),
         parent_gers: segment_gers(id),
@@ -186,74 +182,79 @@ fn parse_line(
     }))
 }
 
-// ── Batch flush helpers ───────────────────────────────────────────────────────
-
-const EDGE_BATCH_SIZE: usize = 10_000;
-const NODE_BATCH_SIZE: usize = 20_000;
-
-fn flush_edges(conn: &Connection, batch: &[EdgeBatch]) -> Result<()> {
-    if batch.is_empty() { return Ok(()); }
-    conn.execute_batch("BEGIN").context("BEGIN edges")?;
-    let result: Result<()> = (|| {
-        let mut stmt = conn.prepare(
-            "INSERT INTO q_edges VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ).context("prepare INSERT q_edges")?;
-        for e in batch {
-            let geom_blob = geom_to_blob(&e.geom);
-            stmt.execute(params![
-                e.edge_idx as i64,
-                &e.start_gers[..],
-                &e.end_gers[..],
-                &e.parent_gers[..],
-                &geom_blob,
-                e.length_cm as i64,
-                e.frc as i64,
-                e.fow as i64,
-                e.direction as i64,
-                e.tile_x as i64,
-                e.tile_y as i64,
-                e.tile_id as i64,
-            ]).context("INSERT q_edge")?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK");
-        return result;
-    }
-    conn.execute_batch("COMMIT").context("COMMIT edges")?;
-    Ok(())
-}
-
-fn flush_nodes(
-    conn: &Connection,
-    batch: &[(Vec<u8>, i32, i32, u32, u32)],
-) -> Result<()> {
-    if batch.is_empty() { return Ok(()); }
-    conn.execute_batch("BEGIN").context("BEGIN nodes")?;
-    let result: Result<()> = (|| {
-        let mut stmt = conn.prepare(
-            "INSERT INTO q_nodes VALUES (?, ?, ?, ?, ?)",
-        ).context("prepare INSERT q_nodes")?;
-        for (gers, lon_e7, lat_e7, tile_x, tile_y) in batch {
-            stmt.execute(params![
-                gers,
-                *lon_e7, *lat_e7,
-                *tile_x as i64,
-                *tile_y as i64,
-            ]).context("INSERT q_node")?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK");
-        return result;
-    }
-    conn.execute_batch("COMMIT").context("COMMIT nodes")?;
-    Ok(())
-}
-
 // ── Phase 1: Extract + quantize from GeoJSONL ─────────────────────────────────
+
+fn process_geojsonl_file(
+    path: &Path,
+    tile_zoom: u8,
+    seg_to_to_int: &mut std::collections::HashMap<i64, i64>,
+    seen_nodes: &mut HashSet<[u8; 16]>,
+    edge_idx: &mut u32,
+    edge_app: &mut duckdb::Appender<'_>,
+    node_app: &mut duckdb::Appender<'_>,
+    pb: &indicatif::ProgressBar,
+) -> Result<()> {
+    let file = File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let path_str = path.to_string_lossy().to_lowercase();
+    let reader: Box<dyn BufRead> = if path_str.ends_with(".gz") {
+        Box::new(BufReader::new(GzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+
+    let mut n_skip = 0usize;
+    for (line_no, line_result) in reader.lines().enumerate() {
+        let line = line_result
+            .with_context(|| format!("read line {} of {}", line_no + 1, path.display()))?;
+        let line = line.trim();
+        if line.is_empty() { continue; }
+
+        match parse_line(line, tile_zoom, seg_to_to_int) {
+            Ok(Some(e)) => {
+                if seen_nodes.insert(e.start_gers) {
+                    let (lon_e7, lat_e7) = (e.geom[0].0, e.geom[0].1);
+                    let (tx, ty) = lon_lat_to_tile_xy(
+                        lon_e7 as f64 / 1e7, lat_e7 as f64 / 1e7, tile_zoom,
+                    );
+                    node_app.append_row(params![
+                        &e.start_gers[..], lon_e7, lat_e7, tx as i64, ty as i64
+                    ]).context("append q_node")?;
+                }
+                if seen_nodes.insert(e.end_gers) {
+                    let last = *e.geom.last().unwrap();
+                    let (lon_e7, lat_e7) = (last.0, last.1);
+                    let (tx, ty) = lon_lat_to_tile_xy(
+                        lon_e7 as f64 / 1e7, lat_e7 as f64 / 1e7, tile_zoom,
+                    );
+                    node_app.append_row(params![
+                        &e.end_gers[..], lon_e7, lat_e7, tx as i64, ty as i64
+                    ]).context("append q_node")?;
+                }
+
+                let geom_blob = geom_to_blob(&e.geom);
+                edge_app.append_row(params![
+                    *edge_idx as i64,
+                    &e.start_gers[..], &e.end_gers[..], &e.parent_gers[..],
+                    geom_blob, e.length_cm as i64,
+                    e.frc as i64, e.fow as i64, e.direction as i64,
+                    e.tile_x as i64, e.tile_y as i64, e.tile_id as i64,
+                ]).context("append q_edge")?;
+                *edge_idx += 1;
+                pb.inc(1);
+            }
+            Ok(None) => { n_skip += 1; }
+            Err(err) => {
+                warn!(path = %path.display(), line = line_no + 1, error = %err, "parse error, skipped");
+                n_skip += 1;
+            }
+        }
+    }
+    if n_skip > 0 {
+        warn!(path = %path.display(), n_skip, "lines skipped");
+    }
+    Ok(())
+}
 
 /// Single-pass extract: reads GeoJSONL lines, quantizes in-place, inserts to
 /// `q_edges` and `q_nodes`.  Returns `seg_to_to_int` for restriction loading.
@@ -265,81 +266,12 @@ fn extract_quantize(
 ) -> Result<std::collections::HashMap<i64, i64>> {
     let mut seg_to_to_int = std::collections::HashMap::new();
     let mut seen_nodes: HashSet<[u8; 16]> = HashSet::new();
-
     let mut edge_idx: u32 = 0;
-    let mut edge_batch: Vec<EdgeBatch>  = Vec::with_capacity(EDGE_BATCH_SIZE);
-    let mut node_batch: Vec<(Vec<u8>, i32, i32, u32, u32)> = Vec::with_capacity(NODE_BATCH_SIZE);
+
+    let mut edge_app = conn.appender("q_edges").context("appender q_edges")?;
+    let mut node_app = conn.appender("q_nodes").context("appender q_nodes")?;
 
     let pb = make_spinner(show_progress, "Extracting GeoJSONL     ");
-
-    let process_file = |path: &Path,
-                        seg_to_to_int: &mut std::collections::HashMap<i64, i64>,
-                        seen_nodes: &mut HashSet<[u8; 16]>,
-                        edge_idx: &mut u32,
-                        edge_batch: &mut Vec<EdgeBatch>,
-                        node_batch: &mut Vec<(Vec<u8>, i32, i32, u32, u32)>,
-                        pb_ref: &indicatif::ProgressBar| -> Result<()> {
-        let file = File::open(path)
-            .with_context(|| format!("open {}", path.display()))?;
-        let path_str = path.to_string_lossy().to_lowercase();
-        let reader: Box<dyn BufRead> = if path_str.ends_with(".gz") {
-            Box::new(BufReader::new(GzDecoder::new(file)))
-        } else {
-            Box::new(BufReader::new(file))
-        };
-
-        let mut n_skip = 0usize;
-        for (line_no, line_result) in reader.lines().enumerate() {
-            let line = line_result
-                .with_context(|| format!("read line {} of {}", line_no + 1, path.display()))?;
-            let line = line.trim();
-            if line.is_empty() { continue; }
-
-            match parse_line(line, *edge_idx, tile_zoom, seg_to_to_int) {
-                Ok(Some(e)) => {
-                    // Emit start node if not seen.
-                    if seen_nodes.insert(e.start_gers) {
-                        let (lon_e7, lat_e7) = (e.geom[0].0, e.geom[0].1);
-                        let (tx, ty) = lon_lat_to_tile_xy(
-                            lon_e7 as f64 / 1e7, lat_e7 as f64 / 1e7, tile_zoom,
-                        );
-                        node_batch.push((e.start_gers.to_vec(), lon_e7, lat_e7, tx, ty));
-                    }
-                    // Emit end node if not seen.
-                    if seen_nodes.insert(e.end_gers) {
-                        let last = *e.geom.last().unwrap();
-                        let (lon_e7, lat_e7) = (last.0, last.1);
-                        let (tx, ty) = lon_lat_to_tile_xy(
-                            lon_e7 as f64 / 1e7, lat_e7 as f64 / 1e7, tile_zoom,
-                        );
-                        node_batch.push((e.end_gers.to_vec(), lon_e7, lat_e7, tx, ty));
-                    }
-
-                    *edge_idx += 1;
-                    edge_batch.push(e);
-                    pb_ref.inc(1);
-
-                    if edge_batch.len() >= EDGE_BATCH_SIZE {
-                        flush_edges(conn, edge_batch)?;
-                        edge_batch.clear();
-                    }
-                    if node_batch.len() >= NODE_BATCH_SIZE {
-                        flush_nodes(conn, node_batch)?;
-                        node_batch.clear();
-                    }
-                }
-                Ok(None) => { n_skip += 1; }
-                Err(err) => {
-                    warn!(path = %path.display(), line = line_no + 1, error = %err, "parse error, skipped");
-                    n_skip += 1;
-                }
-            }
-        }
-        if n_skip > 0 {
-            warn!(path = %path.display(), n_skip, "lines skipped");
-        }
-        Ok(())
-    };
 
     if roads_path.is_dir() {
         let mut entries: Vec<_> = std::fs::read_dir(roads_path)
@@ -355,18 +287,20 @@ fn extract_quantize(
         entries.sort();
         let bar = make_bar(show_progress, entries.len() as u64, "GeoJSONL files          ");
         for path in &entries {
-            process_file(path, &mut seg_to_to_int, &mut seen_nodes,
-                         &mut edge_idx, &mut edge_batch, &mut node_batch, &pb)?;
+            process_geojsonl_file(path, tile_zoom, &mut seg_to_to_int, &mut seen_nodes,
+                                  &mut edge_idx, &mut edge_app, &mut node_app, &pb)?;
             bar.inc(1);
         }
         bar.finish_and_clear();
     } else {
-        process_file(roads_path, &mut seg_to_to_int, &mut seen_nodes,
-                     &mut edge_idx, &mut edge_batch, &mut node_batch, &pb)?;
+        process_geojsonl_file(roads_path, tile_zoom, &mut seg_to_to_int, &mut seen_nodes,
+                              &mut edge_idx, &mut edge_app, &mut node_app, &pb)?;
     }
 
-    flush_edges(conn, &edge_batch)?;
-    flush_nodes(conn, &node_batch)?;
+    edge_app.flush().context("flush q_edges")?;
+    node_app.flush().context("flush q_nodes")?;
+    drop(edge_app);
+    drop(node_app);
     pb.finish_and_clear();
 
     let edge_count: i64 = conn.query_row("SELECT COUNT(*) FROM q_edges", [], |r| r.get(0))?;
@@ -460,17 +394,20 @@ fn load_restrictions(
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub(crate) fn run_pipeline(
-    roads_path:       &Path,
+    roads_path:        &Path,
     restrictions_path: Option<&Path>,
-    output_dir:       &Path,
-    extent_slug:      &str,
-    tile_zoom:        u8,
-    duckdb_memory_mb: Option<u64>,
-    show_progress:    bool,
+    output_dir:        &Path,
+    extent_slug:       &str,
+    tile_zoom:         u8,
+    duckdb_memory_mb:  Option<u64>,
+    duckdb_temp_dir:   Option<&Path>,
+    show_progress:     bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
+    let default_tmp = output_dir.join(format!(".duckdb_tmp_{}", std::process::id()));
+    let temp_dir    = duckdb_temp_dir.unwrap_or(&default_tmp);
 
-    let conn = setup_duckdb(duckdb_memory_mb)?;
+    let conn = setup_duckdb(duckdb_memory_mb, temp_dir)?;
 
     // Phase 1: extract + quantize.
     let seg_to_to_int = extract_quantize(roads_path, &conn, tile_zoom, show_progress)?;
@@ -484,5 +421,9 @@ pub(crate) fn run_pipeline(
     // Phase 3: tile + write PMTiles.
     tile_from_duckdb(&conn, tile_zoom, output_dir, extent_slug, "generic", show_progress)?;
 
+    drop(conn);
+    if duckdb_temp_dir.is_none() {
+        let _ = std::fs::remove_dir_all(&default_tmp);
+    }
     Ok(())
 }

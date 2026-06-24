@@ -202,6 +202,7 @@ pub async fn run_generic(
         let out_dir     = output.to_path_buf();
         let ext_slug    = extent_slug.clone();
         let label_owned = label.to_string();
+        let tmp_dir     = duckdb_temp_dir.map(|p| p.to_path_buf());
         tokio::task::spawn_blocking(move || {
             crate::generic_low_memory::run_pipeline(
                 &roads,
@@ -210,6 +211,7 @@ pub async fn run_generic(
                 &ext_slug,
                 tile_zoom,
                 duckdb_memory_mb,
+                tmp_dir.as_deref(),
                 show_progress,
             )
         })
