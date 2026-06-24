@@ -6,7 +6,9 @@
 /// than O(all data).
 ///
 /// Stages and their DuckDB tables:
-///   Pass 1 (PBF ways+relations) → ways, node_ref_deltas, restrictions_raw
+///   Pass 1 (PBF ways+relations) → ways, restrictions_raw; node counts kept in
+///                                  a Rust HashMap, written to node_ref_deltas
+///                                  as pre-aggregated rows after the scan
 ///   Derived                      → intersection_nodes, unique_refs
 ///   Pass 2 (PBF nodes)          → node_coords
 ///   Bbox filter                  → prunes ways, node_coords in-place
@@ -346,49 +348,15 @@ fn setup_duckdb(memory_mb_override: Option<u64>) -> Result<Connection> {
 
 // ── Phase 1: Extract ways and relations ──────────────────────────────────────
 
-/// Compact `node_ref_deltas` in place: replace N rows with one row per unique
-/// node carrying the running delta sum.  Called periodically during pass 1 to
-/// keep the table bounded at ~COMPACT_INTERVAL × WAY_BATCH × avg_refs rows
-/// rather than growing to the full 300-400 M rows for continent-scale data.
-/// After the final compaction, `compute_derived_tables` only needs a cheap
-/// WHERE filter instead of a full GROUP BY on hundreds of millions of rows.
-fn compact_node_ref_deltas(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE _nrd_compact AS \
-             SELECT node_id, SUM(delta) AS delta FROM node_ref_deltas GROUP BY node_id; \
-         DROP TABLE node_ref_deltas; \
-         ALTER TABLE _nrd_compact RENAME TO node_ref_deltas;"
-    ).context("compact node_ref_deltas")
-}
-
-fn flush_way_batch(
-    conn: &Connection,
-    ways: &mut Vec<WayRecord>,
-    deltas: &mut Vec<(i64, i64)>,
-) -> Result<()> {
+fn flush_way_batch(conn: &Connection, ways: &mut Vec<WayRecord>) -> Result<()> {
     if ways.is_empty() { return Ok(()); }
-
-    // Ways: Appender bypasses SQL parsing overhead for bulk inserts.
-    {
-        let mut app = conn.appender("ways").context("appender ways")?;
-        for w in ways.iter() {
-            app.append_row(params![w.id, w.frc as i64, w.fow as i64, w.direction as i64, &w.node_ids])
-                .context("append way")?;
-        }
-        app.flush().context("flush ways")?;
+    let mut app = conn.appender("ways").context("appender ways")?;
+    for w in ways.iter() {
+        app.append_row(params![w.id, w.frc as i64, w.fow as i64, w.direction as i64, &w.node_ids])
+            .context("append way")?;
     }
+    app.flush().context("flush ways")?;
     ways.clear();
-
-    // Node-ref deltas: Appender — previously a huge VALUES string that DuckDB
-    // parsed slowly (~1.5 MB SQL per batch of 5000 ways).
-    if !deltas.is_empty() {
-        let mut app = conn.appender("node_ref_deltas").context("appender node_ref_deltas")?;
-        for (nid, d) in deltas.iter() {
-            app.append_row(params![*nid, *d]).context("append delta")?;
-        }
-        app.flush().context("flush node_ref_deltas")?;
-        deltas.clear();
-    }
     Ok(())
 }
 
@@ -409,12 +377,15 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
     };
     let reader = ElementReader::new(counting);
 
-    let mut way_batch: Vec<WayRecord>        = Vec::with_capacity(WAY_BATCH + 64);
-    let mut delta_batch: Vec<(i64, i64)>     = Vec::with_capacity(WAY_BATCH * 12);
-    let mut restriction_batch: Vec<(i64, i64, i64)> = Vec::with_capacity(8_192);
-    let mut err: Option<anyhow::Error>        = None;
-    let mut batch_count: u64                  = 0;
-    const COMPACT_INTERVAL: u64               = 50;
+    let mut way_batch: Vec<WayRecord>                = Vec::with_capacity(WAY_BATCH + 64);
+    // Node-ref counts are accumulated in Rust so DuckDB never needs to GROUP BY
+    // hundreds of millions of raw delta rows.  For continent-scale data this map
+    // holds ~50-150M entries (≈1-2.4 GB); that is cheaper than the alternative
+    // GROUP BY which requires both the raw table and its aggregation in DuckDB
+    // simultaneously and reliably OOMs at continental scale.
+    let mut node_counts: HashMap<i64, i64>           = HashMap::new();
+    let mut restriction_batch: Vec<(i64, i64, i64)>  = Vec::with_capacity(8_192);
+    let mut err: Option<anyhow::Error>               = None;
 
     reader.for_each(|el| {
         if err.is_some() { return; }
@@ -470,25 +441,20 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
                 let node_ids: Vec<i64> = w.refs().collect();
                 if node_ids.len() < 2 { return; }
 
-                // Node-ref deltas: endpoints get delta=2, interior get delta=1.
+                // Accumulate node-ref counts in a Rust HashMap (no DuckDB writes
+                // per way batch); written to DuckDB in one pass after the loop.
                 let last = node_ids.len() - 1;
                 for (i, &nid) in node_ids.iter().enumerate() {
                     let delta: i64 = if i == 0 || i == last { 2 } else { 1 };
-                    delta_batch.push((nid, delta));
+                    *node_counts.entry(nid).or_insert(0) += delta;
                 }
 
                 way_batch.push(WayRecord { id: w.id(), frc, fow, direction, node_ids: node_ids_to_blob(&node_ids) });
                 ways_scanned += 1;
 
                 if way_batch.len() >= WAY_BATCH {
-                    if let Err(e) = flush_way_batch(conn, &mut way_batch, &mut delta_batch) {
+                    if let Err(e) = flush_way_batch(conn, &mut way_batch) {
                         err = Some(e); return;
-                    }
-                    batch_count += 1;
-                    if batch_count % COMPACT_INTERVAL == 0 {
-                        if let Err(e) = compact_node_ref_deltas(conn) {
-                            err = Some(e); return;
-                        }
                     }
                 }
             }
@@ -528,8 +494,8 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
     if let Some(e) = err { return Err(e); }
     pb.finish_and_clear(); // reading done; dismiss bar before slow DuckDB flush
 
-    // Flush remaining ways and deltas.
-    flush_way_batch(conn, &mut way_batch, &mut delta_batch)?;
+    // Flush remaining ways.
+    flush_way_batch(conn, &mut way_batch)?;
 
     // Insert restrictions via Appender.
     if !restriction_batch.is_empty() {
@@ -539,6 +505,18 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
         }
         app.flush().context("flush restrictions_raw")?;
     }
+
+    // Write the pre-aggregated node counts to DuckDB in a single Appender pass.
+    // Because counts are already summed in the HashMap, compute_derived_tables
+    // can use a plain WHERE filter — no GROUP BY ever touches this table.
+    {
+        let mut app = conn.appender("node_ref_deltas").context("appender node_ref_deltas")?;
+        for (nid, delta) in &node_counts {
+            app.append_row(params![*nid, *delta]).context("append node_ref_delta")?;
+        }
+        app.flush().context("flush node_ref_deltas")?;
+    }
+    drop(node_counts); // free the HashMap before pass 2 starts
 
     let way_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM ways", [], |r| r.get(0))
@@ -558,8 +536,8 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
 
 fn compute_derived_tables(conn: &Connection, show_progress: bool) -> Result<usize> {
     let pb = make_spinner(show_progress, "Building intersection index");
-    // node_ref_deltas is already compacted (running sums) by compact_node_ref_deltas()
-    // called periodically during pass 1 — no GROUP BY needed here.
+    // node_ref_deltas contains pre-aggregated rows (one per unique node) written
+    // by extract_pass1 from a Rust HashMap — no GROUP BY needed here.
     conn.execute_batch(
         "CREATE TABLE intersection_nodes AS \
              SELECT node_id FROM node_ref_deltas WHERE delta >= 2; \
