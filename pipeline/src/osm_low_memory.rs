@@ -14,7 +14,6 @@
 ///   Tile                         → PMTiles via StreamingWriter
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as FmtWrite;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
@@ -353,34 +352,25 @@ fn flush_way_batch(
 ) -> Result<()> {
     if ways.is_empty() { return Ok(()); }
 
-    // Ways: prepared statement inside a transaction.
-    conn.execute_batch("BEGIN").context("BEGIN ways")?;
-    let result: Result<()> = (|| {
-        let mut stmt = conn
-            .prepare("INSERT INTO ways VALUES (?, ?, ?, ?, ?)")
-            .context("prepare INSERT ways")?;
+    // Ways: Appender bypasses SQL parsing overhead for bulk inserts.
+    {
+        let mut app = conn.appender("ways").context("appender ways")?;
         for w in ways.iter() {
-            stmt.execute(params![w.id, w.frc as i64, w.fow as i64, w.direction as i64, &w.node_ids])
-                .context("INSERT way")?;
+            app.append_row(params![w.id, w.frc as i64, w.fow as i64, w.direction as i64, &w.node_ids])
+                .context("append way")?;
         }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK");
-        return result;
+        app.flush().context("flush ways")?;
     }
-    conn.execute_batch("COMMIT").context("COMMIT ways")?;
     ways.clear();
 
-    // Node-ref deltas: bulk VALUES string (no BLOBs, just integers — safe).
+    // Node-ref deltas: Appender — previously a huge VALUES string that DuckDB
+    // parsed slowly (~1.5 MB SQL per batch of 5000 ways).
     if !deltas.is_empty() {
-        let mut sql = String::with_capacity(deltas.len() * 18);
-        sql.push_str("INSERT INTO node_ref_deltas VALUES ");
-        for (i, (nid, d)) in deltas.iter().enumerate() {
-            if i > 0 { sql.push(','); }
-            write!(sql, "({},{})", nid, d).unwrap();
+        let mut app = conn.appender("node_ref_deltas").context("appender node_ref_deltas")?;
+        for (nid, d) in deltas.iter() {
+            app.append_row(params![*nid, *d]).context("append delta")?;
         }
-        conn.execute_batch(&sql).context("INSERT node_ref_deltas")?;
+        app.flush().context("flush node_ref_deltas")?;
         deltas.clear();
     }
     Ok(())
@@ -512,27 +502,18 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
     })?;
 
     if let Some(e) = err { return Err(e); }
+    pb.finish_and_clear(); // reading done; dismiss bar before slow DuckDB flush
 
     // Flush remaining ways and deltas.
     flush_way_batch(conn, &mut way_batch, &mut delta_batch)?;
 
-    // Insert restrictions (small, use prepared statement).
+    // Insert restrictions via Appender.
     if !restriction_batch.is_empty() {
-        conn.execute_batch("BEGIN").context("BEGIN restrictions")?;
-        let res: Result<()> = (|| {
-            let mut stmt = conn
-                .prepare("INSERT INTO restrictions_raw VALUES (?, ?, ?)")
-                .context("prepare INSERT restrictions_raw")?;
-            for (f, v, t) in &restriction_batch {
-                stmt.execute(params![f, v, t]).context("INSERT restriction")?;
-            }
-            Ok(())
-        })();
-        if let Err(e) = res {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
+        let mut app = conn.appender("restrictions_raw").context("appender restrictions_raw")?;
+        for (f, v, t) in &restriction_batch {
+            app.append_row(params![f, v, t]).context("append restriction")?;
         }
-        conn.execute_batch("COMMIT").context("COMMIT restrictions")?;
+        app.flush().context("flush restrictions_raw")?;
     }
 
     let way_count: i64 = conn
@@ -544,7 +525,6 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
     let restr_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM restrictions_raw", [], |r| r.get(0))
         .context("count restrictions")?;
-    pb.finish_and_clear();
     info!(ways = way_count, node_ref_deltas = delta_count, restrictions = restr_count,
           "Pass 1 complete");
     Ok(way_count as usize)
@@ -552,7 +532,8 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
 
 // ── Derived tables ────────────────────────────────────────────────────────────
 
-fn compute_derived_tables(conn: &Connection) -> Result<usize> {
+fn compute_derived_tables(conn: &Connection, show_progress: bool) -> Result<usize> {
+    let pb = make_spinner(show_progress, "Building intersection index");
     conn.execute_batch(
         "CREATE TABLE intersection_nodes AS \
              SELECT node_id FROM node_ref_deltas GROUP BY node_id HAVING SUM(delta) >= 2; \
@@ -562,6 +543,7 @@ fn compute_derived_tables(conn: &Connection) -> Result<usize> {
          CREATE INDEX idx_intersection ON intersection_nodes(node_id);"
     )
     .context("compute derived tables")?;
+    pb.finish_and_clear();
 
     let ix_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM intersection_nodes", [], |r| r.get(0))
@@ -619,6 +601,8 @@ fn extract_pass2(pbf_path: &Path, conn: &Connection, show_progress: bool) -> Res
         }
     })?;
     if let Some(e) = err { return Err(e); }
+    pb.finish_and_clear(); // reading done; dismiss bar before slow DuckDB flush
+
     flush_node_batch(conn, &mut batch)?;
 
     conn.execute_batch("DROP TABLE _node_staging").context("drop staging")?;
@@ -626,7 +610,6 @@ fn extract_pass2(pbf_path: &Path, conn: &Connection, show_progress: bool) -> Res
     let stored: i64 = conn
         .query_row("SELECT COUNT(*) FROM node_coords", [], |r| r.get(0))
         .context("count node_coords")?;
-    pb.finish_and_clear();
     info!(nodes_loaded = stored, "Pass 2 complete");
     Ok(stored as usize)
 }
@@ -634,14 +617,15 @@ fn extract_pass2(pbf_path: &Path, conn: &Connection, show_progress: bool) -> Res
 fn flush_node_batch(conn: &Connection, batch: &mut Vec<(i64, f64, f64)>) -> Result<usize> {
     if batch.is_empty() { return Ok(0); }
 
-    // Bulk-insert into staging.
-    let mut sql = String::with_capacity(batch.len() * 40);
-    sql.push_str("INSERT INTO _node_staging VALUES ");
-    for (i, (id, lon, lat)) in batch.iter().enumerate() {
-        if i > 0 { sql.push(','); }
-        write!(sql, "({},{},{})", id, lon, lat).unwrap();
+    // Bulk-insert into staging via Appender — previously an 8 MB VALUES string
+    // per 200k-node batch, which DuckDB's SQL parser handled very slowly.
+    {
+        let mut app = conn.appender("_node_staging").context("appender _node_staging")?;
+        for (id, lon, lat) in batch.iter() {
+            app.append_row(params![*id, *lon, *lat]).context("append node")?;
+        }
+        app.flush().context("flush _node_staging")?;
     }
-    conn.execute_batch(&sql).context("INSERT _node_staging")?;
 
     // Semi-join: only keep nodes referenced by road ways.
     conn.execute_batch(
@@ -659,7 +643,8 @@ fn flush_node_batch(conn: &Connection, batch: &mut Vec<(i64, f64, f64)>) -> Resu
 
 // ── Bbox filter ───────────────────────────────────────────────────────────────
 
-fn apply_bbox_filter(bbox: Bbox, conn: &Connection) -> Result<()> {
+fn apply_bbox_filter(bbox: Bbox, conn: &Connection, show_progress: bool) -> Result<()> {
+    let pb = make_spinner(show_progress, "Applying bbox filter     ");
     // 1. Find node IDs inside the bbox.
     let bbox_nodes: HashSet<i64> = {
         let mut stmt = conn.prepare(
@@ -721,6 +706,7 @@ fn apply_bbox_filter(bbox: Bbox, conn: &Connection) -> Result<()> {
     )
     .context("prune node_coords")?;
 
+    pb.finish_and_clear();
     let ways_left: i64 = conn.query_row("SELECT COUNT(*) FROM ways", [], |r| r.get(0))?;
     let nodes_left: i64 = conn.query_row("SELECT COUNT(*) FROM node_coords", [], |r| r.get(0))?;
     info!(ways = ways_left, nodes = nodes_left, "after bbox filter");
@@ -1295,7 +1281,7 @@ pub fn run_pipeline(
 
     // Build intersection_nodes and unique_refs.
     info!("low-memory: computing intersection nodes");
-    compute_derived_tables(&conn)?;
+    compute_derived_tables(&conn, show_progress)?;
 
     // Phase 2: extract node coordinates.
     info!("low-memory: Pass 2 — extract node coordinates");
@@ -1304,7 +1290,7 @@ pub fn run_pipeline(
     // Optional bbox filter.
     if let Some(b) = bbox {
         info!(?b, "low-memory: applying bbox filter");
-        apply_bbox_filter(b, &conn)?;
+        apply_bbox_filter(b, &conn, show_progress)?;
     }
 
     // Phase 3: adapt + split + quantize.
