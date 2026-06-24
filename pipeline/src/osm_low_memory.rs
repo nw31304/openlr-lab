@@ -590,30 +590,28 @@ fn compute_derived_tables(conn: &Connection, show_progress: bool) -> Result<usiz
 
 // ── Phase 2: Extract node coordinates ─────────────────────────────────────────
 
-fn extract_pass2(pbf_path: &Path, conn: &Connection, show_progress: bool) -> Result<usize> {
-    let file_size = std::fs::metadata(pbf_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+fn extract_pass2(
+    pbf_path:   &Path,
+    conn:       &Connection,
+    unique_ids: &HashSet<i64>,
+    show_progress: bool,
+) -> Result<usize> {
+    let file_size = std::fs::metadata(pbf_path).map(|m| m.len()).unwrap_or(0);
     let bytes_read = Arc::new(AtomicU64::new(0));
     let pb = make_bytes_bar(show_progress, file_size, "Pass 2/2  scanning nodes");
-    let mut nodes_scanned: u64 = 0;
     let mut elements_seen: u64 = 0;
-    // Staging table for batch semi-joins.
-    conn.execute_batch(
-        "CREATE TEMP TABLE _node_staging (id BIGINT, lon DOUBLE, lat DOUBLE)"
-    )
-    .context("create _node_staging")?;
-
-    let mut batch: Vec<(i64, f64, f64)> = Vec::with_capacity(NODE_BATCH);
     let mut err: Option<anyhow::Error> = None;
+
+    // Write matching nodes directly to node_coords via Appender — no staging
+    // table, no DuckDB hash join.  Membership is checked against the Rust
+    // HashSet loaded from unique_refs, which is O(1) per node and uses ~1 GB.
+    let mut app = conn.appender("node_coords").context("appender node_coords")?;
 
     let file = std::fs::File::open(pbf_path)
         .with_context(|| format!("open {}", pbf_path.display()))?;
-    let counting = CountingReader {
-        inner: std::io::BufReader::new(file),
-        count: Arc::clone(&bytes_read),
-    };
+    let counting = CountingReader { inner: std::io::BufReader::new(file), count: Arc::clone(&bytes_read) };
     let reader = ElementReader::new(counting);
+
     reader.for_each(|el| {
         if err.is_some() { return; }
         elements_seen += 1;
@@ -625,53 +623,22 @@ fn extract_pass2(pbf_path: &Path, conn: &Connection, show_progress: bool) -> Res
             Element::DenseNode(n) => (n.id(), n.lon(), n.lat()),
             _ => return,
         };
-        batch.push((id, lon, lat));
-        nodes_scanned += 1;
-        if batch.len() >= NODE_BATCH {
-            if let Err(e) = flush_node_batch(conn, &mut batch) {
-                err = Some(e);
+        if unique_ids.contains(&id) {
+            if let Err(e) = app.append_row(params![id, lon, lat]) {
+                err = Some(anyhow::anyhow!("append node_coords: {e}"));
             }
         }
     })?;
+
     if let Some(e) = err { return Err(e); }
-    pb.finish_and_clear(); // reading done; dismiss bar before slow DuckDB flush
-
-    flush_node_batch(conn, &mut batch)?;
-
-    conn.execute_batch("DROP TABLE _node_staging").context("drop staging")?;
+    pb.finish_and_clear();
+    app.flush().context("flush node_coords")?;
 
     let stored: i64 = conn
         .query_row("SELECT COUNT(*) FROM node_coords", [], |r| r.get(0))
         .context("count node_coords")?;
     info!(nodes_loaded = stored, "Pass 2 complete");
     Ok(stored as usize)
-}
-
-fn flush_node_batch(conn: &Connection, batch: &mut Vec<(i64, f64, f64)>) -> Result<usize> {
-    if batch.is_empty() { return Ok(0); }
-
-    // Bulk-insert into staging via Appender — previously an 8 MB VALUES string
-    // per 200k-node batch, which DuckDB's SQL parser handled very slowly.
-    {
-        let mut app = conn.appender("_node_staging").context("appender _node_staging")?;
-        for (id, lon, lat) in batch.iter() {
-            app.append_row(params![*id, *lon, *lat]).context("append node")?;
-        }
-        app.flush().context("flush _node_staging")?;
-    }
-
-    // Semi-join: only keep nodes referenced by road ways.
-    conn.execute_batch(
-        "INSERT INTO node_coords \
-         SELECT s.id, s.lon, s.lat FROM _node_staging s \
-         WHERE s.id IN (SELECT node_id FROM unique_refs); \
-         DELETE FROM _node_staging;"
-    )
-    .context("node_coords semi-join flush")?;
-
-    let n = batch.len();
-    batch.clear();
-    Ok(n)
 }
 
 // ── Bbox filter ───────────────────────────────────────────────────────────────
@@ -1319,11 +1286,30 @@ pub fn run_pipeline(
 
     // Build intersection_nodes and unique_refs.
     info!("low-memory: computing intersection nodes");
-    compute_derived_tables(&conn, show_progress)?;
+    let ref_count = compute_derived_tables(&conn, show_progress)?;
+
+    // Load unique_refs into a Rust HashSet so pass 2 can filter nodes without
+    // a DuckDB hash join.  The semi-join approach (WHERE id IN unique_refs)
+    // forces DuckDB to materialise a ~2-3 GB hash table on every batch call,
+    // which exceeds the budget when the buffer pool is already loaded.
+    // A Rust HashSet<i64> for ~100M nodes costs ~1 GB and is checked in O(1).
+    info!("low-memory: loading unique node refs");
+    let mut unique_ids: HashSet<i64> = HashSet::with_capacity(ref_count + 64);
+    {
+        let mut stmt = conn.prepare("SELECT node_id FROM unique_refs")
+            .context("prepare unique_refs query")?;
+        for row in stmt.query_map([], |r| r.get::<_, i64>(0))
+            .context("query unique_refs")?
+        {
+            unique_ids.insert(row.context("read unique_refs row")?);
+        }
+    }
+    info!(loaded = unique_ids.len(), "unique node refs ready");
 
     // Phase 2: extract node coordinates.
     info!("low-memory: Pass 2 — extract node coordinates");
-    extract_pass2(pbf_path, &conn, show_progress)?;
+    extract_pass2(pbf_path, &conn, &unique_ids, show_progress)?;
+    drop(unique_ids);
 
     // Optional bbox filter.
     if let Some(b) = bbox {
