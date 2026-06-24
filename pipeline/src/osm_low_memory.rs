@@ -874,9 +874,6 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
         last_id   = batch.last().unwrap().id;
         ways_done += batch.len() as i64;
         pb.inc(batch.len() as u64);
-        if ways_done % 500_000 == 0 {
-            info!(progress = ways_done, way_count, edges = edge_idx, "adapt+split progress");
-        }
     }
 
     edge_app.flush().context("flush q_edges")?;
@@ -1128,9 +1125,6 @@ pub(crate) fn tile_from_duckdb(
                     cur_edges.clear();
                     done_tiles += 1;
                     pb.inc(1);
-                    if done_tiles % 10_000 == 0 {
-                        info!(done = done_tiles, total = total_tiles, "tiling progress");
-                    }
                 }
             }
             cur_tile = Some((tile_x, tile_y, tile_id));
