@@ -361,11 +361,6 @@ fn build_directory(tile_entries: &[(u64, u64, u32)]) -> Result<DirectoryParts> {
     }
 }
 
-/// Write a PMTiles v3 archive.  Tiles must be sorted by tile_id ascending (clustering).
-/// Handles arbitrarily large tile counts via a 2-level directory when needed.
-pub(crate) fn write_pmtiles_file_pub(tiles: &[(u64, Vec<u8>)], output_path: &Path, tile_zoom: u8) -> Result<()> {
-    write_pmtiles_file(tiles, output_path, tile_zoom)
-}
 
 fn write_pmtiles_file(tiles: &[(u64, Vec<u8>)], output_path: &Path, tile_zoom: u8) -> Result<()> {
     // Build tile data section and tile entry list.

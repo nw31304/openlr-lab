@@ -767,7 +767,6 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
     // Each batch is O(log N + batch_size) with the index, not O(offset + batch_size).
     const STREAM_BATCH: i64 = 50_000;
     let mut last_id: i64 = i64::MIN;
-    let mut ways_done: i64 = 0;
 
     loop {
         let batch: Vec<WayRecord> = {
@@ -871,8 +870,7 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
             }
         }
 
-        last_id   = batch.last().unwrap().id;
-        ways_done += batch.len() as i64;
+        last_id = batch.last().unwrap().id;
         pb.inc(batch.len() as u64);
     }
 
@@ -992,7 +990,7 @@ pub(crate) fn tile_from_duckdb(
     let mut to_edge_map:   HashMap<([u8; 16], [u8; 16]), u32> = HashMap::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT edge_idx, start_gers, end_gers, parent_gers, tile_x, tile_y, tile_id FROM q_edges"
+            "SELECT edge_idx, start_gers, end_gers, parent_gers, tile_id FROM q_edges"
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -1000,9 +998,7 @@ pub(crate) fn tile_from_duckdb(
             let start_blob:  Vec<u8> = row.get(1)?;
             let end_blob:    Vec<u8> = row.get(2)?;
             let parent_blob: Vec<u8> = row.get(3)?;
-            let tile_x: u32  = row.get::<_, i64>(4)? as u32;
-            let tile_y: u32  = row.get::<_, i64>(5)? as u32;
-            let tile_id: u64 = row.get::<_, i64>(6)? as u64;
+            let tile_id: u64 = row.get::<_, i64>(4)? as u64;
 
             let start_gers  = blob_to_gers(&start_blob);
             let end_gers    = blob_to_gers(&end_blob);

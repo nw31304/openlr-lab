@@ -10,6 +10,7 @@ pub struct Bbox {
 }
 
 impl Bbox {
+    #[allow(dead_code)]
     pub fn slug(&self) -> String {
         format!("{:.4},{:.4},{:.4},{:.4}", self.west, self.south, self.east, self.north)
     }

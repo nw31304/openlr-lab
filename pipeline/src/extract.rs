@@ -11,6 +11,7 @@ use crate::{extent::Bbox, http::Client};
 // ── Overture segment types ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct OvertureSegment {
     pub id: String,
     /// WGS84 coords decoded from WKB geometry column.
@@ -37,6 +38,7 @@ pub struct ConnectorRef {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct RoadFlagEntry {
     /// Flag names active for this span (e.g. "is_bridge", "is_tunnel", "is_link").
     pub values: Vec<String>,
@@ -53,6 +55,7 @@ pub struct AccessRestriction {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct AccessWhen {
     pub heading: Option<String>,  // "forward" | "backward"
     pub during: Option<String>,
@@ -257,6 +260,7 @@ fn query_parquet_file(path: &Path, bbox: Option<Bbox>) -> Result<Vec<OvertureSeg
 /// Parses a hex-encoded WKB LineString (type 2) or LinearRing (WKB type 2).
 /// Supports both little-endian (01) and big-endian (00) byte order.
 /// Ignores Z/M variants by masking off the high bits of the geometry type.
+#[allow(dead_code)]
 pub fn parse_linestring_wkb(hex: &str) -> Result<Vec<(f64, f64)>> {
     let hex = hex.trim();
     if hex.len() < 10 {

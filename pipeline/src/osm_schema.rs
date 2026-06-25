@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 /// Compile-time embed of the default schema so tests and binary both resolve it
 /// without depending on the working directory at runtime.
+#[allow(dead_code)]
 pub const DEFAULT_SCHEMA_STR: &str = include_str!("../schema/osm-default.toml");
 
 /// A single OSM highway value → FRC/FOW mapping rule.
@@ -47,6 +48,7 @@ impl OsmSchemaMapping {
     }
 
     /// Load the embedded default schema (compile-time baked in).
+    #[allow(dead_code)]
     pub fn load_default() -> Self {
         // The embedded string is valid TOML — unwrap is safe here.
         toml::from_str(DEFAULT_SCHEMA_STR).expect("embedded osm-default.toml is invalid TOML")
