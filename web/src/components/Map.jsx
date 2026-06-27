@@ -75,7 +75,7 @@ const CUSTOM_LAYER_IDS = new Set([
   'highlighted-segment-halo', 'highlighted-segment-line',
   'trace-segment-halo', 'trace-segment-line',
   'replay-radius-fill', 'replay-radius-line',
-  'replay-route-line',
+  'replay-route-casing', 'replay-route-line',
   'replay-candidates-circle',
   'replay-cloud-circle',
   'replay-frontier-circle',
@@ -217,6 +217,50 @@ function fmtDist(m) {
   return `${(m / 1000).toFixed(2)} km`;
 }
 
+// Clip a polyline [lon,lat][] to start at the nearest point to (snapLon, snapLat).
+// Returns the tail portion of the polyline from that snap point onward.
+function clipGeomFromPoint(coords, snapLon, snapLat) {
+  if (!coords || coords.length < 2) return coords;
+  let bestIdx = 0, bestT = 0, bestDist = Infinity;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const ax = coords[i][0], ay = coords[i][1];
+    const bx = coords[i + 1][0], by = coords[i + 1][1];
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((snapLon - ax) * dx + (snapLat - ay) * dy) / len2));
+    const ex = snapLon - (ax + t * dx), ey = snapLat - (ay + t * dy);
+    const d = ex * ex + ey * ey;
+    if (d < bestDist) { bestDist = d; bestIdx = i; bestT = t; }
+  }
+  const clipPt = [
+    coords[bestIdx][0] + bestT * (coords[bestIdx + 1][0] - coords[bestIdx][0]),
+    coords[bestIdx][1] + bestT * (coords[bestIdx + 1][1] - coords[bestIdx][1]),
+  ];
+  return [clipPt, ...coords.slice(bestIdx + 1)];
+}
+
+// Clip a polyline [lon,lat][] to end at the nearest point to (snapLon, snapLat).
+// Returns the head portion of the polyline up to that snap point.
+function clipGeomToPoint(coords, snapLon, snapLat) {
+  if (!coords || coords.length < 2) return coords;
+  let bestIdx = 0, bestT = 0, bestDist = Infinity;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const ax = coords[i][0], ay = coords[i][1];
+    const bx = coords[i + 1][0], by = coords[i + 1][1];
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((snapLon - ax) * dx + (snapLat - ay) * dy) / len2));
+    const ex = snapLon - (ax + t * dx), ey = snapLat - (ay + t * dy);
+    const d = ex * ex + ey * ey;
+    if (d < bestDist) { bestDist = d; bestIdx = i; bestT = t; }
+  }
+  const clipPt = [
+    coords[bestIdx][0] + bestT * (coords[bestIdx + 1][0] - coords[bestIdx][0]),
+    coords[bestIdx][1] + bestT * (coords[bestIdx + 1][1] - coords[bestIdx][1]),
+  ];
+  return [...coords.slice(0, bestIdx + 1), clipPt];
+}
+
 // ── Custom marker images ──────────────────────────────────────────────────────
 
 function addMapImages(map) {
@@ -335,6 +379,7 @@ export default function MapView({ tilesBase, ready }) {
   const replayStep  = useStore(s => s.replayStep);
   const replaySteps = useStore(s => s.replaySteps);
   const replayStats = useStore(s => s.replayStats);
+  const showReplay         = useStore(s => s.showReplay);
   const showTrace          = useStore(s => s.showTrace);
   const candidatePopup     = useStore(s => s.candidatePopup);
   const clearCandidatePopup = useStore(s => s.clearCandidatePopup);
@@ -369,8 +414,9 @@ export default function MapView({ tilesBase, ready }) {
 
     if (!candidatePopup?.snap_lon) {
       setCandAnchor(null);
-      // Remove per-candidate filter on replay arrow layer when popup closes
+      // Hide direction arrows when no candidate is selected
       if (map?.getLayer('replay-candidates-arrow')) {
+        map.setLayoutProperty('replay-candidates-arrow', 'visibility', 'none');
         map.setFilter('replay-candidates-arrow', null);
       }
       return;
@@ -378,13 +424,13 @@ export default function MapView({ tilesBase, ready }) {
     if (!map) return;
     const pt = map.project([candidatePopup.snap_lon, candidatePopup.snap_lat]);
     setCandAnchor({ x: pt.x, y: pt.y });
-    // Filter replay-layer arrows to only the selected traversal direction, preventing
-    // overlapping opposite-direction chevrons when both traversals of the same segment exist
+    // Show arrows filtered to the selected traversal direction only
     if (map.getLayer('replay-candidates-arrow') && candidatePopup.segment_id != null) {
       map.setFilter('replay-candidates-arrow', ['all',
         ['==', ['get', 'segment_id'], candidatePopup.segment_id],
         ['==', ['get', 'traversal'],  candidatePopup.traversal ?? ''],
       ]);
+      map.setLayoutProperty('replay-candidates-arrow', 'visibility', 'visible');
     }
   }, [candidatePopup]);
 
@@ -698,14 +744,19 @@ export default function MapView({ tilesBase, ready }) {
         paint: { 'line-color': '#cc66ff', 'line-width': 2, 'line-opacity': 0.85, 'line-dasharray': [4, 3] },
       });
 
-      // Found route — pulsing line, updated each time a route_found step fires
+      // Found route — dark casing underneath keeps it readable over any basemap colour.
+      map.addLayer({
+        id: 'replay-route-casing', type: 'line', source: 'replay-route',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': '#0f172a', 'line-width': 10, 'line-opacity': 0.75 },
+      });
       map.addLayer({
         id: 'replay-route-line', type: 'line', source: 'replay-route',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: { 'line-color': '#ffe066', 'line-width': 4, 'line-opacity': 0.85 },
+        paint: { 'line-color': '#16a34a', 'line-width': 6, 'line-opacity': 0.95 },
       });
 
-      // Candidate segments — coloured lines (green = accepted, red = rejected)
+      // Candidate segments — thick green (accepted) / thick red (rejected)
       map.addLayer({
         id: 'replay-candidates-line', type: 'line', source: 'replay-candidates',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
@@ -713,30 +764,31 @@ export default function MapView({ tilesBase, ready }) {
           'line-color': ['case',
             ['boolean', ['get', 'winner'], false], '#00ff88',
             ['==', ['get', 'ctype'], 'accepted'],  '#22cc66',
-            '#dd3333',
+            '#dd2222',
           ],
           'line-width': ['case',
-            ['boolean', ['get', 'winner'], false], 4,
-            ['==', ['get', 'ctype'], 'accepted'],  2.5,
-            1.5,
+            ['boolean', ['get', 'winner'], false], 7,
+            ['==', ['get', 'ctype'], 'accepted'],  5,
+            4,
           ],
           'line-opacity': ['case',
             ['boolean', ['get', 'winner'], false], 1.0,
-            ['==', ['get', 'ctype'], 'accepted'],  0.85,
-            0.6,
+            ['==', ['get', 'ctype'], 'accepted'],  0.9,
+            0.75,
           ],
         },
       });
-      // Direction triangles along each candidate segment
+      // Direction triangles — hidden by default; shown only when a candidate is selected
       map.addLayer({
         id: 'replay-candidates-arrow', type: 'symbol', source: 'replay-candidates',
         layout: {
-          'symbol-placement':  'line',
-          'symbol-spacing':    18,
-          'icon-image':        'direction-triangle',
-          'icon-size':         1.0,
-          'icon-allow-overlap': true,
+          'symbol-placement':      'line',
+          'symbol-spacing':        18,
+          'icon-image':            'direction-triangle',
+          'icon-size':             1.0,
+          'icon-allow-overlap':    true,
           'icon-ignore-placement': true,
+          'visibility':            'none',
         },
         paint: {
           'icon-color':   'white',
@@ -768,17 +820,17 @@ export default function MapView({ tilesBase, ready }) {
         },
       });
 
-      // Leg from/to markers
+      // Leg from/to markers — inserted below lrp-markers-circle so LRP numbers stay readable
       map.addLayer({
         id: 'replay-leg-from', type: 'circle', source: 'replay-leg',
         filter: ['==', ['get', 'role'], 'from'],
         paint: { 'circle-radius': 9, 'circle-color': '#00ff88', 'circle-stroke-width': 2, 'circle-stroke-color': '#fff' },
-      });
+      }, 'lrp-markers-circle');
       map.addLayer({
         id: 'replay-leg-to', type: 'circle', source: 'replay-leg',
         filter: ['==', ['get', 'role'], 'to'],
         paint: { 'circle-radius': 9, 'circle-color': '#ff4444', 'circle-stroke-width': 2, 'circle-stroke-color': '#fff' },
-      });
+      }, 'lrp-markers-circle');
 
       // Sonar-ping ring — tracks the latest A* node; animated via RAF in the replay effect.
       map.addSource('replay-flash', { type: 'geojson', data: emptyFC });
@@ -864,7 +916,12 @@ export default function MapView({ tilesBase, ready }) {
     map.on('moveend', () => loadVisibleTiles(map));
     map.on('zoomend', () => loadVisibleTiles(map));
 
+    // Resize the map whenever its container changes size (panel open/close).
+    const resizeObs = new ResizeObserver(() => map.resize());
+    resizeObs.observe(mapContainer.current);
+
     return () => {
+      resizeObs.disconnect();
       if (pulseRef.current)         { cancelAnimationFrame(pulseRef.current);         pulseRef.current         = null; }
       if (frontierPulseRef.current) { cancelAnimationFrame(frontierPulseRef.current); frontierPulseRef.current = null; }
       if (routePulseRef.current)    { cancelAnimationFrame(routePulseRef.current);    routePulseRef.current    = null; }
@@ -1003,7 +1060,30 @@ export default function MapView({ tilesBase, ready }) {
       return;
     }
     if (!e.features?.length) return;
-    const props = e.features[0].properties;
+
+    // When multiple features overlap near a segment boundary, pick the one whose
+    // polyline geometry is closest to the click point rather than the arbitrary
+    // first feature MapLibre returns.
+    const { lng, lat } = e.lngLat;
+    let bestFeat = e.features[0];
+    let bestDist = Infinity;
+    for (const feat of e.features) {
+      const coords = feat.geometry?.coordinates;
+      if (!coords?.length) continue;
+      let minD = Infinity;
+      for (let i = 0; i < coords.length - 1; i++) {
+        const ax = coords[i][0],   ay = coords[i][1];
+        const bx = coords[i+1][0], by = coords[i+1][1];
+        const dx = bx - ax, dy = by - ay;
+        const len2 = dx * dx + dy * dy;
+        const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((lng - ax) * dx + (lat - ay) * dy) / len2));
+        const ex = lng - (ax + t * dx), ey = lat - (ay + t * dy);
+        const d = ex * ex + ey * ey;
+        if (d < minD) minD = d;
+      }
+      if (minD < bestDist) { bestDist = minD; bestFeat = feat; }
+    }
+    const props = bestFeat.properties;
     const [z, x, y] = props.tile.split('/').map(Number);
     const segId = getSegmentId(z, x, y, props.local_index);
     setHighlightedSegment({ tile: props.tile, local_index: props.local_index });
@@ -1320,10 +1400,21 @@ export default function MapView({ tilesBase, ready }) {
 
     const emptyFC = { type: 'FeatureCollection', features: [] };
     const replaySources = ['replay-radius', 'replay-route', 'replay-candidates', 'replay-cloud', 'replay-frontier', 'replay-leg', 'replay-flash'];
-    const vis = showTrace && replaySteps.length > 0 ? 'visible' : 'none';
-    replayLayerIds.forEach(id => { if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis); });
+    const vis = showReplay && replaySteps.length > 0 ? 'visible' : 'none';
+    // Arrow layer is always hidden here; it is shown only when a candidate is selected.
+    replayLayerIds.forEach(id => {
+      if (id === 'replay-candidates-arrow') return;
+      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
+    });
+    // Hide the full decoded path while replay is active so the per-leg highlight is unambiguous.
+    if (map.getLayer('decoded-path-line')) {
+      map.setLayoutProperty('decoded-path-line', 'visibility', vis === 'visible' ? 'none' : 'visible');
+    }
+    if (map.getLayer('replay-candidates-arrow')) {
+      map.setLayoutProperty('replay-candidates-arrow', 'visibility', 'none');
+    };
 
-    if (!showTrace || !replaySteps.length) {
+    if (!showReplay || !replaySteps.length) {
       replaySources.forEach(s => { map.getSource(s)?.setData(emptyFC); });
       replayVisualRef.current = null;
       replayStepRef.current   = -1;
@@ -1365,18 +1456,24 @@ export default function MapView({ tilesBase, ready }) {
     map.getSource('replay-frontier')   ?.setData(gj.frontierFC);
     map.getSource('replay-leg')        ?.setData(gj.legFC);
 
-    // Route segments — same two-step lookup as the trace-highlight effect
-    const segCache   = getSegGeomCache();
-    const segToTile  = getSegIdToTile();
-    const tileCache  = getTileGeomCache();
-    const routeFeats = (visualState.routeSegIds ?? []).map(id => {
-      let f = segCache.get(id);
-      if (!f) {
-        const m = segToTile.get(id);
-        if (m) f = tileCache.get(m.tile_key)?.find(x => x.properties.local_index === m.local_index);
+    // Route geometry — clip the already-correct decoded path WKT between from_snap and to_snap.
+    // The decoded path is the canonical geometry (assembled and offset-trimmed in Rust from the
+    // full graph); clipping it in JS between the two LRP snap points gives exactly the right
+    // portion of the path for this leg without any segment-assembly or traversal-direction logic.
+    const { routeFromSnap, routeToSnap } = visualState;
+    let routeFeats = [];
+    if (routeFromSnap && routeToSnap) {
+      const wktCoords = parseWktLinestring(decodeResultRef.current?.wkt);
+      if (wktCoords?.length >= 2) {
+        const seg1 = clipGeomFromPoint(wktCoords,  routeFromSnap[0], routeFromSnap[1]);
+        const seg2 = seg1?.length >= 2
+          ? clipGeomToPoint(seg1, routeToSnap[0], routeToSnap[1])
+          : null;
+        if (seg2?.length >= 2) {
+          routeFeats = [{ type: 'Feature', geometry: { type: 'LineString', coordinates: seg2 }, properties: {} }];
+        }
       }
-      return f;
-    }).filter(Boolean);
+    }
     map.getSource('replay-route')?.setData({ type: 'FeatureCollection', features: routeFeats });
 
     // ── Frontier pulse animation ────────────────────────────────────────────
@@ -1400,9 +1497,36 @@ export default function MapView({ tilesBase, ready }) {
     if (currentStep?.type === 'search_started') {
       map.flyTo({
         center:   [currentStep.coord[0], currentStep.coord[1]],
-        zoom:     Math.max(map.getZoom(), 15),
+        zoom:     Math.max(map.getZoom(), 16),
         duration: 400,
       });
+    }
+
+    if (currentStep?.type === 'candidates_ranked') {
+      // Collect the LRP coord from the preceding search_started for this LRP.
+      const pts = [];
+      for (let i = replayStep - 1; i >= 0; i--) {
+        const s = replaySteps[i];
+        if (s.type === 'search_started' && s.lrp_idx === currentStep.lrp_idx) {
+          pts.push(s.coord); break;
+        }
+      }
+      for (const c of currentStep.accepted ?? []) {
+        if (c.projection?.point) pts.push(c.projection.point);
+      }
+      for (const r of currentStep.rejected ?? []) {
+        if (r.point) pts.push(r.point);
+      }
+      if (pts.length > 0) {
+        const lons = pts.map(p => p[0]), lats = pts.map(p => p[1]);
+        const w = Math.min(...lons), e = Math.max(...lons);
+        const s = Math.min(...lats), n = Math.max(...lats);
+        if (w === e && s === n) {
+          map.flyTo({ center: [w, s], zoom: Math.max(map.getZoom(), 16), duration: 300 });
+        } else {
+          map.fitBounds([[w, s], [e, n]], { padding: 120, maxZoom: 17, duration: 400 });
+        }
+      }
     }
 
     if (currentStep?.type === 'route_search_started') {
@@ -1440,9 +1564,12 @@ export default function MapView({ tilesBase, ready }) {
         const elapsed = now - rt0;
         const done    = elapsed >= ROUTE_PULSE_MS;
         const phase   = (elapsed / 500) * Math.PI;
+        const swell   = Math.abs(Math.sin(phase));
         try {
-          map.setPaintProperty('replay-route-line', 'line-width',   done ? 4 : 3 + 3 * Math.abs(Math.sin(phase)));
-          map.setPaintProperty('replay-route-line', 'line-opacity', done ? 0.85 : 0.6 + 0.4 * Math.abs(Math.sin(phase)));
+          map.setPaintProperty('replay-route-line',   'line-width',   done ? 6  : 5  + 4 * swell);
+          map.setPaintProperty('replay-route-line',   'line-opacity', done ? 0.95 : 0.7 + 0.3 * swell);
+          map.setPaintProperty('replay-route-casing', 'line-width',   done ? 10 : 9  + 4 * swell);
+          map.setPaintProperty('replay-route-casing', 'line-opacity', done ? 0.75 : 0.5 + 0.3 * swell);
         } catch (_) { return; }
         if (!done) routePulseRef.current = requestAnimationFrame(animRoute);
         else routePulseRef.current = null;
@@ -1485,7 +1612,7 @@ export default function MapView({ tilesBase, ready }) {
         flashAnimRef.current = requestAnimationFrame(animFlash);
       }
     }
-  }, [showTrace, replayStep, replaySteps, replayStats]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [showReplay, replayStep, replaySteps, replayStats]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Segment layer visibility toggle ──────────────────────────────────────────
 

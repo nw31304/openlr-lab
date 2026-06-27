@@ -373,8 +373,10 @@ fn try_route_combination(
             }
             trace.push_summary(DecodeEvent::RouteFound {
                 leg,
-                path: vec![],
+                path: vec![from.segment_id],
                 length_m: direct_m,
+                from_snap: from.projection.point,
+                to_snap:   to.projection.point,
             });
             total_path_m += direct_m;
             if path.is_empty() {
@@ -444,11 +446,20 @@ fn try_route_combination(
             return None;
         }
 
-        trace.push_summary(DecodeEvent::RouteFound {
-            leg,
-            path: segments.clone(),
-            length_m: full_length_m,
-        });
+        {
+            let mut leg_path = segments.clone();
+            leg_path.insert(0, from.segment_id);
+            if to.segment_id != from.segment_id {
+                leg_path.push(to.segment_id);
+            }
+            trace.push_summary(DecodeEvent::RouteFound {
+                leg,
+                path: leg_path,
+                length_m: full_length_m,
+                from_snap: from.projection.point,
+                to_snap:   to.projection.point,
+            });
+        }
         total_path_m += full_length_m;
 
         if path.is_empty() {

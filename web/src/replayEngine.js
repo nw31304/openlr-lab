@@ -88,7 +88,7 @@ export function buildReplaySteps(events) {
         break;
 
       case 'RouteSearchStarted':
-        phases.push({ label: `Leg ${d.leg} A*`, startStep: steps.length, color: '#0088ff' });
+        phases.push({ label: `Leg ${d.leg + 1} A*`, startStep: steps.length, color: '#0088ff' });
         steps.push({ type: 'route_search_started', leg: d.leg, from: d.from, to: d.to });
         i++;
         break;
@@ -133,7 +133,7 @@ export function buildReplaySteps(events) {
         break;
 
       case 'RouteFound':
-        steps.push({ type: 'route_found', leg: d.leg, path: d.path, length_m: d.length_m });
+        steps.push({ type: 'route_found', leg: d.leg, path: d.path, length_m: d.length_m, from_snap: d.from_snap, to_snap: d.to_snap });
         i++;
         break;
 
@@ -176,6 +176,8 @@ function emptyState() {
     frontier:        [],      // last FRONTIER_SIZE nodes
     currentLeg:      null,    // { leg, fromPt, toPt, fromSegId, toSegId }
     routeSegIds:     [],      // segment IDs of current best route
+    routeFromSnap:   null,    // [lon, lat] snap point of from-candidate
+    routeToSnap:     null,    // [lon, lat] snap point of to-candidate
     lastTermination: null,    // last AStarTerminated step, for failure display
     maxG:            0,
     statusText:      'Ready to replay',
@@ -196,11 +198,14 @@ function applyStep(s, step, maxGTotal) {
       s.phase = 'candidates';
       s.searchRadius = { lon: step.coord[0], lat: step.coord[1], radiusM: step.radius_m, lrpIdx: step.lrp_idx };
       s.statusText   = `LRP ${step.lrp_idx} — searching within ${step.radius_m.toFixed(0)} m`;
-      // Reset A* state from previous legs
-      s.astarNodes   = [];
-      s.frontier     = [];
-      s.routeSegIds  = [];
-      s.currentLeg   = null;
+      // Clear candidates from previous LRP; reset A* state from previous legs
+      s.candidates      = [];
+      s.astarNodes      = [];
+      s.frontier        = [];
+      s.routeSegIds   = [];
+      s.routeFromSnap = null;
+      s.routeToSnap   = null;
+      s.currentLeg    = null;
       break;
 
     case 'candidates_ranked': {
@@ -256,16 +261,16 @@ function applyStep(s, step, maxGTotal) {
         fromSegId: step.from.segment_id,
         toSegId:   step.to.segment_id,
       };
+      // Candidate search is over — clear highlights; A* nodes accumulate separately
+      s.candidates       = [];
       s.astarNodes       = [];
       s.frontier         = [];
-      s.maxG             = 0;
-      s.lastTermination  = null;  // clear termination from previous attempt
-      s.statusText = `Leg ${step.leg} — A* search started`;
-      // Mark the chosen from/to candidates as winners so they render distinctly.
-      const winIds = new Set([step.from.segment_id, step.to.segment_id]);
-      for (const c of s.candidates) {
-        if (winIds.has(c.segmentId)) c.winner = true;
-      }
+      s.routeSegIds   = [];
+      s.routeFromSnap = null;
+      s.routeToSnap   = null;
+      s.maxG          = 0;
+      s.lastTermination  = null;
+      s.statusText = `Leg ${step.leg + 1} — A* search started`;
       break;
     }
 
@@ -277,30 +282,32 @@ function applyStep(s, step, maxGTotal) {
       }
       s.frontier = s.astarNodes.slice(-FRONTIER_SIZE);
       const last = step.nodes[step.nodes.length - 1];
-      s.statusText = `Leg ${step.leg} — A* · ${s.astarNodes.length} nodes · g=${last.g_m.toFixed(0)}m h=${last.h_m.toFixed(0)}m`;
+      s.statusText = `Leg ${step.leg + 1} — A* · ${s.astarNodes.length} nodes · g=${last.g_m.toFixed(0)}m h=${last.h_m.toFixed(0)}m`;
       break;
     }
 
     case 'route_found':
-      s.routeSegIds = step.path;
-      s.frontier    = [];
-      s.statusText  = `Leg ${step.leg} — route found · ${step.length_m.toFixed(0)} m · ${step.path.length} seg${step.path.length !== 1 ? 's' : ''}`;
+      s.routeSegIds   = step.path;
+      s.routeFromSnap = step.from_snap ?? null;
+      s.routeToSnap   = step.to_snap   ?? null;
+      s.frontier      = [];
+      s.statusText     = `Leg ${step.leg + 1} — route found · ${step.length_m.toFixed(0)} m · ${step.path.length} seg${step.path.length !== 1 ? 's' : ''}`;
       break;
 
     case 'astar_terminated':
       s.frontier        = [];
       s.lastTermination = step;
-      s.statusText      = `Leg ${step.leg} — A* terminated`;
+      s.statusText      = `Leg ${step.leg + 1} — A* terminated`;
       break;
 
     case 'route_failed':
       s.frontier   = [];
-      s.statusText = `Leg ${step.leg} — route FAILED`;
+      s.statusText = `Leg ${step.leg + 1} — route FAILED`;
       break;
 
     case 'dnp_checked': {
       const lb = step.interval?.lb ?? 0, ub = step.interval?.ub ?? 0;
-      s.statusText = `Leg ${step.leg} — DNP ${step.actual_m.toFixed(0)} m ∈ [${lb.toFixed(0)}, ${ub.toFixed(0)}] ${step.passed ? '✓' : '✗'}`;
+      s.statusText = `Leg ${step.leg + 1} — DNP ${step.actual_m.toFixed(0)} m ∈ [${lb.toFixed(0)}, ${ub.toFixed(0)}] ${step.passed ? '✓' : '✗'}`;
       break;
     }
 

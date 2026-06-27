@@ -122,6 +122,7 @@ export const useStore = create(persist(
   showLlmSettings: false,
   showTrace: false,
   showResult: false,
+  showReplay: false,
   llmConfig: loadLlmConfig(),
   llmChatOpen: false,
   llmMessages: [],   // { role: 'user'|'assistant', content: string, error?: bool }
@@ -186,6 +187,7 @@ export const useStore = create(persist(
     set(s => ({ llmMessages: [...s.llmMessages, assistantMsg], llmLoading: false }));
   },
   toggleTrace:         () => set(state => ({ showTrace:         !state.showTrace })),
+  toggleReplay:        () => set(state => ({ showReplay:        !state.showReplay })),
   toggleSegmentLayer:  () => set(state => ({ showSegmentLayer:  !state.showSegmentLayer })),
 
   setReplayStep:  (n)  => set(state => ({ replayStep: Math.max(0, Math.min(n, state.replaySteps.length - 1)) })),

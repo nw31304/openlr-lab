@@ -1,8 +1,6 @@
-import React, { useState, useRef } from 'react';
+import React, { useState } from 'react';
 import { useStore, getSegGeomCache } from '../store.js';
-import { useDraggable } from '../hooks.js';
 import { verdictType } from '../replayEngine.js';
-import ReplayPanel from './ReplayPanel.jsx';
 
 const ASTAR_DISPLAY_CAP = 200;
 
@@ -580,12 +578,8 @@ function ResultSection({ decodeResult }) {
 // ── Main panel ────────────────────────────────────────────────────────────────
 
 export default function TracePanel() {
-  const { decodeResult, openlrString, showTrace, params, setParam, toggleTrace,
+  const { decodeResult, openlrString, params, setParam, toggleTrace,
           setTraceHighlight, setTraceLrpFocus, replaySteps, setCandidatePopup } = useStore();
-  const panelRef = useRef(null);
-  const { pos, onMouseDown } = useDraggable(panelRef);
-
-  if (!showTrace) return null;
 
   const traceLevel = params.trace_level ?? 'Summary';
   const trace = decodeResult?.trace;
@@ -605,13 +599,9 @@ export default function TracePanel() {
     setParam('trace_level', traceLevel === 'Full' ? 'Summary' : 'Full');
   };
 
-  const panelStyle = pos
-    ? { left: pos.left, top: pos.top, right: 'auto', bottom: 'auto', height: '85vh', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '10px' }
-    : undefined;
-
   return (
-    <div ref={panelRef} className="trace-panel" style={panelStyle}>
-      <div className="trace-panel-hdr draggable-header" onMouseDown={onMouseDown}>
+    <div className="trace-panel">
+      <div className="trace-panel-hdr">
         <span className="trace-panel-title">⚡ Decode Trace</span>
         <div className="trace-panel-actions">
           <button
@@ -679,7 +669,6 @@ export default function TracePanel() {
           </>
         )}
       </div>
-      {replaySteps?.length > 0 && <ReplayPanel />}
     </div>
   );
 }

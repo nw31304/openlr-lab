@@ -221,6 +221,11 @@ pub enum DecodeEvent {
         leg: usize,
         path: Vec<SegmentId>,
         length_m: f64,
+        /// Snap point of the from-candidate on its segment (lon, lat).
+        /// Used by the JS visualiser to clip the decoded-path WKT to just this leg.
+        from_snap: (f64, f64),
+        /// Snap point of the to-candidate on its segment (lon, lat).
+        to_snap: (f64, f64),
     },
     RouteFailed {
         leg: usize,

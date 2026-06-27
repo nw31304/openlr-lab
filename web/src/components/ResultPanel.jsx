@@ -1,6 +1,5 @@
-import React, { useRef } from 'react';
+import React from 'react';
 import { useStore } from '../store.js';
-import { useDraggable } from '../hooks.js';
 import { diagnoseFailure, diagnoseSuccess } from '../diagnosis.js';
 import { renderLlmText } from '../renderLlmText.jsx';
 
@@ -8,13 +7,13 @@ const FOW_NAMES = ['Undef', 'Motorway', 'Dual C/W', 'Single C/W', 'Roundabout', 
 const FRC_NAMES = ['FRC0', 'FRC1', 'FRC2', 'FRC3', 'FRC4', 'FRC5', 'FRC6', 'FRC7'];
 
 export default function ResultPanel() {
-  const { decodeResult, showResult, hideResult, highlightedSegment, setHighlightedSegment,
+  const { decodeResult, toggleResult, highlightedSegment, setHighlightedSegment,
           requestInfoSegment, showTrace, toggleTrace, debugDecode, params,
           llmConfig, llmChatOpen, toggleLlmChat, toggleLlmSettings } = useStore();
-  const panelRef = useRef(null);
-  const { pos, onMouseDown } = useDraggable(panelRef);
 
-  if (!decodeResult || !showResult) return null;
+  if (!decodeResult) return (
+    <div className="result-panel-empty">Decode a reference to see results.</div>
+  );
 
   const diagnosis        = decodeResult.ok ? null : diagnoseFailure(decodeResult);
   const successWarning   = decodeResult.ok ? diagnoseSuccess(decodeResult) : null;
@@ -28,20 +27,13 @@ export default function ResultPanel() {
                    : null; // full trace + panel open = nothing more to offer
   const debugAction = (!hasTrace || !isFull) ? debugDecode : toggleTrace;
 
-  const panelStyle = pos
-    ? { left: pos.left, top: pos.top, right: 'auto' }
-    : (showTrace ? { right: '476px' } : undefined);
-
   return (
-    <div ref={panelRef} className="result-panel" style={panelStyle}>
-      <div
-        className={`result-header ${decodeResult.ok ? 'ok' : 'err'} draggable-header`}
-        onMouseDown={onMouseDown}
-      >
+    <div className="result-panel">
+      <div className={`result-header ${decodeResult.ok ? 'ok' : 'err'}`}>
         <span>{decodeResult.ok
           ? (decodeResult.location_type === 'PointAlongLine' ? '✓ Decoded (Point)' : '✓ Decoded')
           : '✗ Failed'}</span>
-        <button className="seg-info-close" onClick={hideResult}>✕</button>
+        <button className="seg-info-close" onClick={toggleResult} title="Close results panel">✕</button>
       </div>
       <div className="result-body">
         {decodeResult.ok ? (
