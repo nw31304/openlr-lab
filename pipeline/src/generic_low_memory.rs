@@ -410,6 +410,7 @@ pub(crate) fn run_pipeline(
     std::fs::create_dir_all(output_dir)?;
     let default_tmp = output_dir.join(format!(".duckdb_tmp_{}", std::process::id()));
     let temp_dir    = duckdb_temp_dir.unwrap_or(&default_tmp);
+    let _tmp_guard = duckdb_temp_dir.is_none().then(|| crate::build::TempDirGuard(default_tmp.clone()));
 
     let conn = setup_duckdb(duckdb_memory_mb, temp_dir)?;
 
@@ -426,8 +427,5 @@ pub(crate) fn run_pipeline(
     tile_from_duckdb(&conn, tile_zoom, output_dir, extent_slug, "generic", show_progress)?;
 
     drop(conn);
-    if duckdb_temp_dir.is_none() {
-        let _ = std::fs::remove_dir_all(&default_tmp);
-    }
     Ok(())
 }

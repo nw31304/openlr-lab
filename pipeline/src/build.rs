@@ -13,6 +13,21 @@ use crate::{
     schema::SchemaMapping,
 };
 
+// ── DuckDB temp-dir RAII guard ────────────────────────────────────────────────
+
+/// Removes a DuckDB spill directory when dropped.
+///
+/// Created only when the pipeline allocates the default temp dir (i.e. the
+/// caller did not supply `--duckdb-temp-dir`).  Ensures cleanup happens on
+/// both success and early-return-via-`?` failure paths.
+pub(crate) struct TempDirGuard(pub PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 // ── OSM PBF build path ────────────────────────────────────────────────────────
 
 /// Build a PMTiles archive from a local OSM PBF file.

@@ -1270,6 +1270,9 @@ pub fn run_pipeline(
     // on the same disk as the output archive (not tmpfs).
     let default_tmp = output_dir.join(format!(".duckdb_tmp_{}", std::process::id()));
     let temp_dir    = duckdb_temp_dir.unwrap_or(&default_tmp);
+    // Guard cleans up the default temp dir on drop (success or early `?` failure).
+    // Not created for user-supplied dirs — we leave those alone.
+    let _tmp_guard = duckdb_temp_dir.is_none().then(|| crate::build::TempDirGuard(default_tmp.clone()));
     let conn = setup_duckdb(duckdb_memory_mb, temp_dir)?;
 
     // Phase 1: extract ways and relations.
@@ -1317,13 +1320,8 @@ pub fn run_pipeline(
     info!("low-memory: tiling");
     tile_from_duckdb(&conn, tile_zoom, output_dir, extent_slug, release_label, show_progress)?;
 
-    // Drop the connection before removing the spill directory (DuckDB closes
-    // its temp files on drop; removing them while open would fail on Windows).
+    // Drop the connection before the guard removes the spill directory (DuckDB
+    // closes its temp files on drop; removing them while open would fail on Windows).
     drop(conn);
-    if duckdb_temp_dir.is_none() {
-        // Only clean up the default temp dir we created; leave user-supplied dirs alone.
-        let _ = std::fs::remove_dir_all(&default_tmp);
-    }
-
     Ok(())
 }
