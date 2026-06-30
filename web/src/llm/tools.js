@@ -39,7 +39,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'get_lrp_candidates',
       description:
-        'Ranked candidate segments for one LRP, with projection geometry and 6-term score breakdown. Set include_rejected=true to see rejection reasons.',
+        'Ranked candidate segments for one LRP, with projection geometry and score breakdown. Set include_rejected=true to see rejection reasons.',
       parameters: {
         type: 'object',
         properties: {
@@ -79,7 +79,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'get_route_segments',
       description:
-        'Ordered segment list for a successfully routed leg, with per-segment length_m, FRC, FOW, and direction. Also returns segment_sum_m (sum of all segment lengths in this leg) and snap coordinates at each end.',
+        'Ordered segment list for a successfully routed leg, with per-segment length_m, FRC, FOW, direction, and cumulative distance. Also returns segment_sum_m and snap coordinates at each end.',
       parameters: {
         type: 'object',
         properties: {
@@ -115,7 +115,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'get_segments_near',
       description:
-        'Find all loaded road segments within radius_m of a coordinate. Returns up to 50 segments sorted by distance, each with source_key (stable ID like "372358612-1"), FRC, FOW, direction, and length. Useful for understanding what roads are available near an LRP that produced no or few candidates.',
+        'Find all loaded road segments within radius_m of a coordinate. Returns up to 20 segments sorted by distance, each with source_key (stable ID like "372358612-1"), FRC, FOW, direction, and length. Useful for understanding what roads are available near an LRP that produced no or few candidates.',
       parameters: {
         type: 'object',
         properties: {
@@ -174,54 +174,111 @@ export const TOOL_DEFINITIONS = [
   },
 ];
 
-// Extract all instances of one event variant from a trace event array.
-// Trace events are serde "externally tagged" enums: { VariantName: { ...fields } }
+// ── TOON (Token-Oriented Object Notation) helpers ─────────────────────────────
+// Compact tabular format: field names appear once in a header; data rows contain
+// only values. Vendor-neutral — any capable LLM can parse it from the header.
+//
+// Format:  label[N]{col1,col2,...}:\n  v1,v2,...\n  v1,v2,...
+
+function fmtVal(v) {
+  if (v === null || v === undefined) return 'null';
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'null';
+  return String(v);
+}
+
+// Render one TOON table: "label[N]{col,...}:\n  r1c1,r1c2,...\n  ..."
+function toToon(label, rows, fields) {
+  if (!rows || !rows.length) return `${label}[0]{${fields.join(',')}}:`;
+  const header = `${label}[${rows.length}]{${fields.join(',')}}:`;
+  const dataRows = rows.map(r => '  ' + fields.map(f => fmtVal(r[f])).join(','));
+  return [header, ...dataRows].join('\n');
+}
+
+// Build a complete tool response from scalar key-value pairs and TOON tables.
+// scalars: plain object — rendered as "key: value" lines (nulls omitted).
+// tables:  [{ label, rows, fields }] — rendered as TOON blocks separated by blank lines.
+function toonResponse(scalars, tables = []) {
+  const parts = [];
+  for (const [k, v] of Object.entries(scalars)) {
+    if (v === null || v === undefined) continue;
+    parts.push(`${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
+  }
+  for (const { label, rows, fields } of tables) {
+    parts.push('');
+    parts.push(toToon(label, rows, fields));
+  }
+  return parts.join('\n');
+}
+
+// Round to N decimal places (avoids floating-point noise in output).
+function r1(v) { return v != null && Number.isFinite(v) ? Math.round(v * 10)    / 10    : null; }
+function r3(v) { return v != null && Number.isFinite(v) ? Math.round(v * 1000)  / 1000  : null; }
+
+// Extract verdict key and numeric excess from a Rust externally-tagged enum value.
+// e.g. "FailBearing" → { verdict: "FailBearing", excess: null }
+//      { FailBearing: { excess_deg: 33.2 } } → { verdict: "FailBearing", excess: 33.2 }
+function parseVerdict(raw) {
+  if (!raw || raw === 'Pass') return { verdict: 'Pass', excess: null };
+  if (typeof raw === 'string') return { verdict: raw, excess: null };
+  const key = Object.keys(raw)[0];
+  const data = raw[key];
+  const excess = data?.excess_deg ?? data?.score ?? null;
+  return { verdict: key, excess: excess != null ? r1(excess) : null };
+}
+
+// ── Trace event extractor ─────────────────────────────────────────────────────
+
 function getTraceEvents(events, variant) {
   return (events ?? [])
     .filter(e => e[variant] !== undefined)
     .map(e => e[variant]);
 }
 
-// Execute a tool call.  Returns a JSON string ready to send back as a tool result.
+// ── Tool executor ─────────────────────────────────────────────────────────────
+
 export function executeTool(name, args, { decodeResult, params, decoder }) {
   if (!decodeResult) return JSON.stringify({ error: 'No decode result available.' });
 
   const events = decodeResult.trace?.events ?? [];
 
   switch (name) {
+
     case 'get_decode_summary': {
       const segs = decodeResult.segments ?? [];
       const totalLengthM = segs.reduce((sum, s) => sum + (s.length_m ?? 0), 0);
-      return JSON.stringify({
-        ok: decodeResult.ok,
-        format: decodeResult.format ?? null,
-        error: decodeResult.error ?? null,
-        segment_count: segs.length,
-        lrp_count: decodeResult.lrps?.length ?? 0,
-        // Untrimmed decoded path: sum of length_m gives the full route length before offsets
-        path_segments: segs.map(s => ({
-          segment_id: s.segment_id,
-          frc:        s.frc,
-          fow:        s.fow,
-          direction:  s.direction,
-          length_m:   s.length_m,
-        })),
-        path_total_length_m: Math.round(totalLengthM * 10) / 10,
-        pos_offset_m: decodeResult.pos_offset_lb != null
-          ? { lb: decodeResult.pos_offset_lb, ub: decodeResult.pos_offset_ub }
-          : null,
-        neg_offset_m: decodeResult.neg_offset_lb != null
-          ? { lb: decodeResult.neg_offset_lb, ub: decodeResult.neg_offset_ub }
-          : null,
-        params: {
-          search_radius_m:        params?.candidate_search_radius_m,
-          bearing_tolerance_deg:  params?.max_bearing_deviation_deg,
-          dnp_tolerance_pct:      params?.dnp_tolerance_pct,
-          lfrcnp_tolerance:       params?.lfrcnp_tolerance,
-          max_candidate_score:    params?.max_candidate_score,
-          max_candidates_per_lrp: params?.max_candidates_per_lrp,
-        },
-      });
+
+      const scalars = {
+        ok:                    decodeResult.ok,
+        format:                decodeResult.format ?? null,
+        error:                 decodeResult.error  ?? null,
+        segment_count:         segs.length,
+        lrp_count:             decodeResult.lrps?.length ?? 0,
+        path_total_length_m:   r1(totalLengthM),
+        pos_offset_m:          decodeResult.pos_offset_lb != null
+          ? `[${decodeResult.pos_offset_lb},${decodeResult.pos_offset_ub}]` : null,
+        neg_offset_m:          decodeResult.neg_offset_lb != null
+          ? `[${decodeResult.neg_offset_lb},${decodeResult.neg_offset_ub}]` : null,
+        search_radius_m:       params?.candidate_search_radius_m,
+        bearing_tolerance_deg: params?.max_bearing_deviation_deg,
+        dnp_tolerance_pct:     params?.dnp_tolerance_pct,
+        lfrcnp_tolerance:      params?.lfrcnp_tolerance,
+        max_candidate_score:   params?.max_candidate_score,
+        max_candidates_per_lrp: params?.max_candidates_per_lrp,
+      };
+
+      const pathRows = segs.map(s => ({
+        seg_id:    s.segment_id,
+        frc:       s.frc,
+        fow:       s.fow,
+        direction: s.direction,
+        length_m:  r1(s.length_m),
+      }));
+
+      return toonResponse(scalars,
+        pathRows.length
+          ? [{ label: 'path', rows: pathRows, fields: ['seg_id','frc','fow','direction','length_m'] }]
+          : []
+      );
     }
 
     case 'get_parsed_reference': {
@@ -251,32 +308,49 @@ export function executeTool(name, args, { decodeResult, params, decoder }) {
       const data = ranked.find(e => e.lrp_idx === lrp_index);
       if (!data) return JSON.stringify({ error: `No candidate trace data for LRP ${lrp_index}.` });
 
-      const accepted = (data.accepted ?? []).map(c => ({
-        segment_id:   c.segment_id,
-        traversal:    c.traversal,
-        distance_m:   c.projection?.distance_m,
-        bearing_deg:  c.projection?.bearing_deg,
-        arc_offset_m: c.projection?.arc_offset_m,
-        score:        c.score,
+      const acceptedRows = (data.accepted ?? []).map(c => ({
+        seg_id:      c.segment_id,
+        traversal:   c.traversal,
+        dist_m:      r1(c.projection?.distance_m),
+        bearing_deg: r1(c.projection?.bearing_deg),
+        dist_sc:     r3(c.score?.distance_score),
+        bear_sc:     r3(c.score?.bearing_score),
+        frc_sc:      r3(c.score?.frc_score),
+        fow_sc:      r3(c.score?.fow_score),
+        total:       r3(c.score?.total),
       }));
 
-      const result = {
+      const scalars = {
         lrp_index,
-        accepted_count: accepted.length,
+        accepted_count: acceptedRows.length,
         rejected_count: data.rejected_count ?? data.rejected?.length ?? 0,
-        accepted,
       };
 
+      const tables = [{
+        label:  'accepted',
+        rows:   acceptedRows,
+        fields: ['seg_id','traversal','dist_m','bearing_deg','dist_sc','bear_sc','frc_sc','fow_sc','total'],
+      }];
+
       if (include_rejected) {
-        result.rejected = (data.rejected ?? []).map(r => ({
-          segment_id: r.segment_id,
-          distance_m: r.projection?.distance_m,
-          bearing_deg: r.projection?.bearing_deg,
-          verdict:    r.verdict,
-        }));
+        const rejectedRows = (data.rejected ?? []).map(r => {
+          const { verdict, excess } = parseVerdict(r.verdict);
+          return {
+            seg_id:      r.segment_id,
+            dist_m:      r.projection?.distance_m != null ? r1(r.projection.distance_m) : null,
+            bearing_deg: r.projection?.bearing_deg != null ? r1(r.projection.bearing_deg) : null,
+            verdict,
+            excess,
+          };
+        });
+        tables.push({
+          label:  'rejected',
+          rows:   rejectedRows,
+          fields: ['seg_id','dist_m','bearing_deg','verdict','excess'],
+        });
       }
 
-      return JSON.stringify(result);
+      return toonResponse(scalars, tables);
     }
 
     case 'get_leg_summary': {
@@ -311,11 +385,11 @@ export function executeTool(name, args, { decodeResult, params, decoder }) {
           passed:    d.passed,
         } : null,
         astar: a ? {
-          nodes_expanded:       a.nodes_expanded,
-          edges_skipped_frc:    a.edges_skipped_frc,
+          nodes_expanded:          a.nodes_expanded,
+          edges_skipped_frc:       a.edges_skipped_frc,
           edges_skipped_direction: a.edges_skipped_direction,
-          edges_skipped_turn:   a.edges_skipped_turn,
-          edges_skipped_distance: a.edges_skipped_distance,
+          edges_skipped_turn:      a.edges_skipped_turn,
+          edges_skipped_distance:  a.edges_skipped_distance,
           reason: a.reason,
         } : null,
       });
@@ -327,30 +401,37 @@ export function executeTool(name, args, { decodeResult, params, decoder }) {
       const data = found.find(e => e.leg === leg_index);
       if (!data) return JSON.stringify({ error: `No successful route found for leg ${leg_index}.` });
 
-      // Cross-reference decodeResult.segments (which carries length_m, frc, fow, direction)
-      // against the path segment IDs from the trace event.
       const segById = new Map((decodeResult.segments ?? []).map(s => [s.segment_id, s]));
-      const path = (data.path ?? []).map(id => {
+      let cumul = 0;
+      const segRows = (data.path ?? []).map(id => {
         const info = segById.get(id);
+        const len = info?.length_m ?? null;
+        if (len != null) cumul += len;
         return {
-          segment_id: id,
-          length_m:   info?.length_m  ?? null,
-          frc:        info?.frc       ?? null,
-          fow:        info?.fow       ?? null,
-          direction:  info?.direction ?? null,
+          seg_id:    id,
+          frc:       info?.frc       ?? null,
+          fow:       info?.fow       ?? null,
+          direction: info?.direction ?? null,
+          length_m:  r1(len),
+          cumul_m:   r1(cumul),
         };
       });
-      const sumLengthM = path.reduce((s, seg) => s + (seg.length_m ?? 0), 0);
+      const sumLengthM = segRows.reduce((s, seg) => s + (seg.length_m ?? 0), 0);
 
-      return JSON.stringify({
-        leg_index,
-        segment_count:   path.length,
-        length_m:        data.length_m,
-        segment_sum_m:   Math.round(sumLengthM * 10) / 10,
-        from_snap:       data.from_snap,
-        to_snap:         data.to_snap,
-        path,
-      });
+      const fromSnap = data.from_snap;
+      const toSnap   = data.to_snap;
+
+      return toonResponse(
+        {
+          leg_index,
+          segment_count: segRows.length,
+          length_m:      r1(data.length_m),
+          segment_sum_m: r1(sumLengthM),
+          from_snap: fromSnap ? `${fromSnap[0]},${fromSnap[1]}` : null,
+          to_snap:   toSnap   ? `${toSnap[0]},${toSnap[1]}`     : null,
+        },
+        [{ label: 'segments', rows: segRows, fields: ['seg_id','frc','fow','direction','length_m','cumul_m'] }]
+      );
     }
 
     case 'get_segment_neighbors': {
@@ -359,14 +440,31 @@ export function executeTool(name, args, { decodeResult, params, decoder }) {
       const raw = decoder.get_segment_neighbors(segment_id);
       const data = JSON.parse(raw);
       if (data.error) return raw;
-      const annotate = s => ({
-        ...s,
-        frc_label: FRC_LABELS[s.frc] ?? null,
-        fow_label: FOW_LABELS_FULL[s.fow] ?? null,
+
+      const neighborFields = ['seg_id','source_key','frc','fow','direction','length_m','can_arrive','can_depart'];
+      const mapNeighbor = s => ({
+        seg_id:     s.segment_id,
+        source_key: s.source_key ?? null,
+        frc:        s.frc,
+        fow:        s.fow,
+        direction:  s.direction,
+        length_m:   r1(s.length_m),
+        can_arrive: s.can_arrive,
+        can_depart: s.can_depart,
       });
-      data.predecessors = (data.predecessors ?? []).map(annotate);
-      data.successors   = (data.successors   ?? []).map(annotate);
-      return JSON.stringify(data);
+
+      return toonResponse(
+        {
+          segment_id,
+          direction:  data.direction,
+          start_node: data.start_node?.node_id,
+          end_node:   data.end_node?.node_id,
+        },
+        [
+          { label: 'at_start_node', rows: (data.start_node?.segments ?? []).map(mapNeighbor), fields: neighborFields },
+          { label: 'at_end_node',   rows: (data.end_node?.segments   ?? []).map(mapNeighbor), fields: neighborFields },
+        ]
+      );
     }
 
     case 'get_segment': {
@@ -375,7 +473,6 @@ export function executeTool(name, args, { decodeResult, params, decoder }) {
       const raw = decoder.get_segment(segment_id);
       const data = JSON.parse(raw);
       if (data.error) return raw;
-      // Annotate frc/fow with human labels
       data.frc_label = FRC_LABELS[data.frc] ?? null;
       data.fow_label = FOW_LABELS_FULL[data.fow] ?? null;
       return JSON.stringify(data);
@@ -386,14 +483,22 @@ export function executeTool(name, args, { decodeResult, params, decoder }) {
       if (!decoder) return JSON.stringify({ error: 'Decoder not available.' });
       const raw = decoder.get_segments_near(lat, lon, radius_m);
       const data = JSON.parse(raw);
-      if (data.segments) {
-        data.segments = data.segments.map(s => ({
-          ...s,
-          frc_label: FRC_LABELS[s.frc] ?? null,
-          fow_label: FOW_LABELS[s.fow] ?? null,
-        }));
-      }
-      return JSON.stringify(data);
+      if (!data.segments) return raw;
+
+      const segRows = data.segments.map(s => ({
+        seg_id:     s.segment_id,
+        source_key: s.source_key ?? null,
+        frc:        s.frc,
+        fow:        s.fow,
+        direction:  s.direction,
+        length_m:   r1(s.length_m),
+        dist_m:     r1(s.distance_m),
+      }));
+
+      return toonResponse(
+        { lat, lon, radius_m: data.query?.radius_m ?? radius_m, count: segRows.length },
+        [{ label: 'segments', rows: segRows, fields: ['seg_id','source_key','frc','fow','direction','length_m','dist_m'] }]
+      );
     }
 
     case 'retry_decode': {

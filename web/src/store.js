@@ -219,10 +219,15 @@ export const useStore = create(persist(
     // Rebuild system context each turn so parameter changes are reflected immediately
     const systemContext = buildSystemContext(decodeResult, params);
 
+    // Cap history at 20 entries (~10 exchange pairs) to bound context window growth.
+    // The model can re-call tools if it needs data that has aged out.
+    const MAX_API_HISTORY = 20;
+    const trimmedHistory = llmApiHistory.slice(-MAX_API_HISTORY);
+
     // apiHistory is the full multi-turn API conversation (includes tool call/result turns)
     let apiHistory = [
       { role: 'system', content: systemContext },
-      ...llmApiHistory,
+      ...trimmedHistory,
       { role: 'user', content },
     ];
 

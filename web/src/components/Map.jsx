@@ -601,9 +601,64 @@ export default function MapView({ tilesBase, ready }) {
         map.setLayoutProperty('replay-candidates-arrow', 'visibility', 'none');
         map.setFilter('replay-candidates-arrow', null);
       }
+      // Restore snap markers and displacement lines to winning-candidate positions.
+      const lrps = decodeResultRef.current?.lrps ?? [];
+      if (map?.getSource('lrp-snap')) {
+        map.getSource('lrp-snap').setData({
+          type: 'FeatureCollection',
+          features: lrps.filter(l => l.snap_lon != null).map((lrp, idx) => ({
+            type: 'Feature',
+            geometry: { type: 'Point', coordinates: [lrp.snap_lon, lrp.snap_lat] },
+            properties: {
+              index: idx,
+              is_endpoint: lrp.snap_is_endpoint ?? false,
+              bearing: compassBearing(lrp.lon, lrp.lat, lrp.snap_lon, lrp.snap_lat),
+            },
+          })),
+        });
+        map.getSource('lrp-displacement').setData({
+          type: 'FeatureCollection',
+          features: lrps.filter(l => l.snap_lon != null).map((lrp, idx) => ({
+            type: 'Feature',
+            geometry: { type: 'LineString', coordinates: [[lrp.lon, lrp.lat], [lrp.snap_lon, lrp.snap_lat]] },
+            properties: { index: idx },
+          })),
+        });
+      }
       return;
     }
     if (!map) return;
+
+    // Show only the clicked LRP's tether, pointing to this candidate's snap point.
+    // All other LRPs' displacement lines are hidden while the popup is open so the
+    // user sees only the snap relevant to the candidate they selected.
+    const popupLrpIdx = candidatePopup.lrp_idx;
+    const lrps = decodeResultRef.current?.lrps ?? [];
+    if (map.getSource('lrp-snap') && popupLrpIdx != null) {
+      const lrp = lrps[popupLrpIdx];
+      if (lrp) {
+        map.getSource('lrp-snap').setData({
+          type: 'FeatureCollection',
+          features: [{
+            type: 'Feature',
+            geometry: { type: 'Point', coordinates: [candidatePopup.snap_lon, candidatePopup.snap_lat] },
+            properties: {
+              index: popupLrpIdx,
+              is_endpoint: false,
+              bearing: compassBearing(lrp.lon, lrp.lat, candidatePopup.snap_lon, candidatePopup.snap_lat),
+            },
+          }],
+        });
+        map.getSource('lrp-displacement').setData({
+          type: 'FeatureCollection',
+          features: [{
+            type: 'Feature',
+            geometry: { type: 'LineString', coordinates: [[lrp.lon, lrp.lat], [candidatePopup.snap_lon, candidatePopup.snap_lat]] },
+            properties: { index: popupLrpIdx },
+          }],
+        });
+      }
+    }
 
     // Defer anchor projection until after the fitBounds animation (triggered by
     // the traceHighlightSegIds effect in the same render cycle) completes.
@@ -1781,11 +1836,10 @@ export default function MapView({ tilesBase, ready }) {
     map.getSource('replay-frontier')   ?.setData(gj.frontierFC);
     map.getSource('replay-leg')        ?.setData(gj.legFC);
 
-    // Route geometry — clip the already-correct decoded path WKT between from_snap and to_snap.
-    // The decoded path is the canonical geometry (assembled and offset-trimmed in Rust from the
-    // full graph); clipping it in JS between the two LRP snap points gives exactly the right
-    // portion of the path for this leg without any segment-assembly or traversal-direction logic.
-    const { routeFromSnap, routeToSnap } = visualState;
+    // Route geometry — prefer clipping the decoded-path WKT (available on successful decodes);
+    // fall back to assembling from routeSegIds (works for failed decodes where a leg succeeded
+    // but the overall decode did not, so wkt is null).
+    const { routeFromSnap, routeToSnap, routeSegIds } = visualState;
     let routeFeats = [];
     if (routeFromSnap && routeToSnap) {
       const wktCoords = parseWktLinestring(decodeResultRef.current?.wkt);
@@ -1798,6 +1852,20 @@ export default function MapView({ tilesBase, ready }) {
           routeFeats = [{ type: 'Feature', geometry: { type: 'LineString', coordinates: seg2 }, properties: {} }];
         }
       }
+    }
+    if (routeFeats.length === 0 && routeSegIds?.length > 0) {
+      // Fallback: assemble from cached segment geometries (handles failed-decode legs).
+      const segCache  = getSegGeomCache();
+      const segToTile = getSegIdToTile();
+      const tileCache = getTileGeomCache();
+      routeFeats = routeSegIds.map(id => {
+        let f = segCache.get(id);
+        if (!f) {
+          const m = segToTile.get(id);
+          if (m) f = tileCache.get(m.tile_key)?.find(x => x.properties.local_index === m.local_index);
+        }
+        return f;
+      }).filter(Boolean);
     }
     map.getSource('replay-route')?.setData({ type: 'FeatureCollection', features: routeFeats });
 

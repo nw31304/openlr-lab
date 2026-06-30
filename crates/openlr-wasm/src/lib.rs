@@ -644,7 +644,7 @@ impl Decoder {
     }
 
     /// Find segments in the loaded graph whose geometry comes within `radius_m` of (lat, lon).
-    /// Results are sorted by distance and capped at 50.  Caps radius at 500 m.
+    /// Results are sorted by distance and capped at 20.  Caps radius at 500 m.
     pub fn get_segments_near(&self, lat: f64, lon: f64, radius_m: f64) -> String {
         let cap = radius_m.min(500.0);
         let mut hits: Vec<(f64, u32, u8, u8, &'static str, f64, Option<String>)> = self.loader.graph.segments.iter()
@@ -665,7 +665,7 @@ impl Decoder {
             })
             .collect();
         hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let segments: Vec<serde_json::Value> = hits.iter().take(50).map(|(dist, id, frc, fow, dir, len, src_key)| {
+        let segments: Vec<serde_json::Value> = hits.iter().take(20).map(|(dist, id, frc, fow, dir, len, src_key)| {
             serde_json::json!({
                 "segment_id":  id,
                 "source_key":  src_key,

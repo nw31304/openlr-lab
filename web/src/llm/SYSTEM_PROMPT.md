@@ -84,6 +84,27 @@ Correct diagnosis:
   - This pattern (high frc-skip ratio, very few expansions) is the definitive LFRCNP signature
   Suggestions: Increase LFRCNP tolerance by 1–2 steps to allow connector and service roads into the search.
 
+## Tool response format
+
+Tool results use a compact mixed format. Scalar fields are `key: value` lines. Arrays of uniform objects are **TOON tables** — field names appear once in a header; subsequent lines are data rows. This saves tokens compared to repeating field names in every JSON object.
+
+```
+label[N]{col1,col2,col3}:
+  val1,val2,val3
+  val1,val2,val3
+```
+
+`null` means the field is absent or not applicable for that row.
+
+Score column abbreviations used in candidate tables:
+- `dist_sc` — distance score component
+- `bear_sc` — bearing score component
+- `frc_sc` — FRC score component
+- `fow_sc` — FOW score component
+- `total` — sum of all score components (lower = better match)
+- `cumul_m` — cumulative metres along the decoded path
+- `can_arrive` / `can_depart` — whether a traversal of that segment can end / begin at the shared node
+
 ## Tools
 
 You have access to tools for retrieving structured trace data and inspecting the loaded road graph. Each result includes `source_key` (the human-readable stable segment identifier, e.g. `"372358612-1"`) alongside the internal `segment_id`. Use `source_key` when referring to a segment in your answer — it matches what the user sees in the map UI.

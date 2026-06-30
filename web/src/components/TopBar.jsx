@@ -45,7 +45,7 @@ export default function TopBar() {
       <input
         className="openlr-input"
         type="text"
-        placeholder="Paste OpenLR string (v3 base64 or TPEG hex)…"
+        placeholder="Paste OpenLR string (v3 or TPEG, base64)…"
         value={openlrString}
         onChange={e => setOpenlrString(e.target.value)}
         onKeyDown={e => e.key === 'Enter' && runDecode()}
