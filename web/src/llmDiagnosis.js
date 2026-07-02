@@ -1,5 +1,5 @@
 import { chatComplete } from './llmClient.js';
-import { SYSTEM_PROMPT } from './llm/systemPrompt.js';
+import SYSTEM_PROMPT from './llm/SYSTEM_PROMPT.md?raw';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

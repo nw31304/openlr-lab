@@ -4,8 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
-    "build": "vite build",
-    "build:prompt": "node src/llm/build-prompt.js"
+    "build": "vite build"
   },
   "dependencies": {
     "maplibre-gl": "^4",
