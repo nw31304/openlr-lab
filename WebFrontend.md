@@ -230,25 +230,28 @@ Key React effects in `Map.jsx` that react to Zustand state:
 
 ## 6. Tile decoder (`tileDecoder.js`)
 
-Decodes the custom OLRL v2 binary tile payload into GeoJSON features. Used both by
+Decodes the custom OLRL v3 binary tile payload into GeoJSON features. Used both by
 the segment-inspector layer (in `Map.jsx`) and at decode time (in `store.js`) to build
 `_tileGeomCache`.
 
 ### Binary layout read by the JS decoder
 
 ```
-Header            40 bytes
-Segment array     segment_count × 32 bytes
-Seg GERS-id table segment_count × 16 bytes   (new in v2)
-Geometry pool     geom_vertex_count × 8 bytes  (lon_e7: i32, lat_e7: i32, LE)
-Node table        node_count × 28 bytes
-Intra restrictions restriction_count × 16 bytes
-Cross restrictions xrestriction_count × 40 bytes
+Header              40 bytes
+Segment array       segment_count × 32 bytes
+Geometry pool       geom_vertex_count × 8 bytes  (lon_e7: i32, lat_e7: i32, LE)
+Node table          node_count × 28 bytes
+Intra restrictions  restriction_count × 16 bytes
+Cross restrictions  xrestriction_count × 16 bytes
+String pool         string_pool_length bytes (UTF-8 stable IDs)
 ```
 
+Each segment record carries `(stable_id_offset u32, stable_id_len u8)` at bytes [20–24]
+pointing into the string pool. Each node record carries the same at bytes [8–12].
+
 Each feature's `properties` includes: `frc`, `frc_name`, `fow`, `fow_name`, `direction`,
-`length_m`, `tile` (`"z/x/y"`), `local_index` (segment array index), `osm_way_id`
-(extracted from the GERS-id stable-ID encoding — bytes 8–15 must be zero).
+`length_m`, `tile` (`"z/x/y"`), `local_index` (segment array index), `stable_id`
+(opaque provider-defined text key — e.g. `"372358612-1"` for OSM, a UUID for others).
 
 The `local_index` property is the canonical join key between JS feature caches and
 WASM segment references.

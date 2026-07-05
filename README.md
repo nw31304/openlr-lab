@@ -76,29 +76,34 @@ The app expects a tile server at `http://localhost:5176` by default. You can ove
 ### 3. Build a tile archive (optional — if you have road network data)
 
 ```sh
-# List available Overture releases
-cargo run -p pipeline -- list-releases
+# NZ from a local PBF (~5 s)
+cargo run --release --bin openlrlens-build -- \
+  build --extent NZ --pbf new-zealand-latest.osm.pbf --output ./out/nz-osm
 
-# Build a PMTiles archive for a bounding box
-cargo run -p pipeline -- build \
-  --release 2024-07-22.0 \
-  --extent 4.7,52.2,5.1,52.5 \
-  --output amsterdam.pmtiles
-
-# Or build from generic GeoJSONL (any source with frc/fow/flowdir attributes)
-cargo run -p pipeline -- build \
-  --geojsonl roads.geojsonl.gz \
-  --output roads.pmtiles
+# Large region from PBF with low-memory DuckDB backend
+cargo run \
+  --release \
+  --bin openlrlens-build -- \
+  build \
+  --extent world \
+  --pbf out/europe-latest.osm.pbf \
+  --output ./out/eur-osm \
+  --low-memory \
+  --progress \
+  --compress-tiles \
+  --duckdb-memory-mb 15000 \
+  --duckdb-temp-dir ./tmp/
 
 # Merge regional archives into one
-cargo run -p pipeline -- merge region-a.pmtiles region-b.pmtiles --output combined.pmtiles
+cargo run --release --bin openlrlens-build -- \
+  merge --output out/world/world.pmtiles out/nz-osm out/eur-osm
 ```
 
 Serve the resulting `.pmtiles` file with any PMTiles-compatible tile server (e.g. [`pmtiles serve`](https://github.com/protomaps/go-pmtiles)) and point the app at it.
 
 ## Tile format
 
-Custom binary payload (magic `OLRL`, version 1). All integers little-endian, single zoom level (default z12). Segments are post-split at every interior connector — junctions are never elided. See `CLAUDE.md §4–5` for the full layout.
+Custom binary payload (magic `OLRL`, version 3). All integers little-endian, single zoom level (default z12). Segments are post-split at every interior connector — junctions are never elided. Each segment and node carries a provider-defined opaque stable ID (UTF-8 string, stored in a per-tile string pool). See `CLAUDE.md §4–5` for the full layout.
 
 ## License
 

@@ -167,18 +167,18 @@ Uses `rayon::par_iter` over `OsmData.ways`. For each `OsmWay`, `split_way()`:
 
 ### Stable ID encoding for OSM
 
-The OSM path cannot use Overture GERS UUIDs. Instead it derives stable 16-byte IDs
-from the numeric OSM IDs with disjoint namespaces:
+The pipeline derives stable text IDs from the numeric OSM IDs. These are stored in the
+tile's string pool as opaque UTF-8 strings.
 
 ```
-Node ID:  [0u8; 8] ++ (node_id as u64).to_le_bytes()   → bytes 0–7 = 0
-Way ID:   (way_id as u64).to_le_bytes() ++ [0u8; 8]    → bytes 8–15 = 0
+Segment stable ID:  "{way_id}-{split_index}"   e.g. "372358612-1"
+Node stable ID:     "{node_id}"                e.g. "271370492"
 ```
 
-These spaces are disjoint by construction (a node ID has zeroes in bytes 0–7; a way ID
-has zeroes in bytes 8–15). The tile restriction lookup requires
-`from_segment_gers == parent_gers_id` (way encoding) and
-`via_connector_gers == end/start_node_gers` (node encoding).
+Internally the pipeline uses 16-byte binary keys for HashMap lookups (disjoint
+namespaces: node keys have zeroes in bytes 0–7, way keys have zeroes in bytes 8–15).
+These binary keys are never written to the tile — only the text strings reach the
+string pool.
 
 ### Node deduplication
 
@@ -191,9 +191,9 @@ if they disagree, this silently keeps an arbitrary copy.
 Each `OsmRestriction {from_way_id, via_node_id, to_way_id}` maps to:
 ```rust
 RestrictionTriple {
-    from_segment_gers:  encode_way_id(from_way_id),
-    via_connector_gers: encode_node_id(via_node_id),
-    to_segment_gers:    encode_way_id(to_way_id),
+    from_segment_id:  encode_way_id(from_way_id),   // 16-byte internal key
+    via_connector_id: encode_node_id(via_node_id),
+    to_segment_id:    encode_way_id(to_way_id),
     flags: encode_restriction_flags(HEADING_ANY, HEADING_ANY),
 }
 ```
@@ -322,11 +322,12 @@ a = sin²(dlat/2) + cos(lat1) × cos(lat2) × sin²(dlon/2)
 d = 2R × arcsin(√a)
 ```
 
-### GERS ID parsing
+### Stable ID parsing (Overture path)
 
-`parse_gers_id(s)`: strips hyphens, hex-decodes, asserts exactly 16 bytes.
-`parse_gers_id_or_warn(s, parent_id)`: calls above; on failure logs warn and **returns
-`[0u8; 16]`**. This is a known bug — zero is a valid GERS ID and collisions are silent.
+`parse_hex_id(s)`: strips hyphens, hex-decodes, asserts exactly 16 bytes. Used to
+parse Overture connector/segment IDs into internal binary keys.
+`parse_hex_id_or_warn(s, parent_id)`: calls above; on failure logs warn and **returns
+`[0u8; 16]`**. This is a known bug — zero is a valid key and collisions are silent.
 
 ---
 
@@ -483,12 +484,12 @@ has not been verified.** This must be confirmed.
 
 ### Tile payload binary format
 
-Version 2 (current). All integers little-endian.
+Version 3 (current). All integers little-endian.
 
 ```
 Header (40 bytes):
   magic:               [u8; 4]  = b"OLRL"
-  version:             u8       = 2
+  version:             u8       = 3
   flags:               u8       = 0
   _pad:                [u8; 2]
   segment_count:       u32
@@ -496,33 +497,33 @@ Header (40 bytes):
   restriction_count:   u32      (intra-tile restrictions)
   geom_vertex_count:   u32
   xrestriction_count:  u32      (cross-tile restrictions)
-  _reserved:           [u8; 12]
+  string_pool_length:  u32      (byte length of string pool)
+  _reserved:           [u8; 8]
 
 Segment array: segment_count × 32 bytes
-  start_node:    u32  (tile-local node index)
-  end_node:      u32
-  geom_offset:   u32  (vertex index into geometry pool, not byte offset)
-  geom_len:      u16  (vertex count)
-  length_cm:     u32
-  attrs:         u8   frc[2:0] | fow[5:3] | direction[7:6]
-                        direction: 0=Both 1=Forward 2=Backward
-  flags:         u8   = 0 (reserved)
-  _reserved:     [u8; 12]
-
-Segment GERS-id table: segment_count × 16 bytes
-  parent_gers_id for each segment (indexed by local segment index)
-  Used for cross-tile restriction matching.
+  start_node:        u32  (tile-local node index)
+  end_node:          u32
+  geom_offset:       u32  (vertex index into geometry pool, not byte offset)
+  geom_len:          u16  (vertex count)
+  length_cm:         u32
+  attrs:             u8   frc[2:0] | fow[5:3] | direction[7:6]
+  _reserved:         u8
+  stable_id_offset:  u32  (byte offset into string pool)
+  stable_id_len:     u8   (byte length in string pool)
+  _reserved:         [u8; 7]
 
 Geometry pool: geom_vertex_count × 8 bytes
   lon_e7:   i32  (WGS84 × 1e7, absolute — not delta-coded)
   lat_e7:   i32
 
 Node table: node_count × 28 bytes
-  lon_e7:   i32
-  lat_e7:   i32
-  gers_id:  [u8; 16]
-  flags:    u8   bit0 = boundary node
-  _pad:     [u8; 3]
+  lon_e7:            i32
+  lat_e7:            i32
+  stable_id_offset:  u32  (byte offset into string pool)
+  stable_id_len:     u8   (byte length in string pool)
+  _reserved:         [u8; 11]
+  flags:             u8   bit0 = boundary node
+  _pad:              [u8; 3]
 
 Intra-tile restriction table: restriction_count × 16 bytes
   from_seg:  u32  (local segment index)
@@ -531,12 +532,19 @@ Intra-tile restriction table: restriction_count × 16 bytes
   flags:     u8   bits[1:0]=from_heading, bits[3:2]=to_heading
   _pad:      [u8; 3]
 
-Cross-tile restriction table: xrestriction_count × 40 bytes
-  from_gers:       [u8; 16]  (GERS id of from-segment)
-  via_node_local:  u32       (local node index in this tile)
-  to_gers:         [u8; 16]  (GERS id of to-segment)
+Cross-tile restriction table: xrestriction_count × 16 bytes
+  from_id_offset:  u32  (byte offset into string pool)
+  from_id_len:     u8
+  via_node_local:  u32  (local node index in this tile)
+  to_id_offset:    u32
+  to_id_len:       u8
   flags:           u8
-  _pad:            [u8; 3]
+  _pad:            u8
+
+String pool: string_pool_length bytes
+  Concatenated UTF-8 stable ID strings. No separators — records reference
+  substrings by (offset, len). Stable IDs are provider-defined opaque text
+  (OSM IDs, UUIDs, database keys, etc.).
 ```
 
 `attrs` byte packing:
@@ -727,6 +735,12 @@ BUILD FLAGS:
   --tile-zoom <8–15>      PMTiles zoom level [12]
   --ram-gb <f>            override RAM detection (Overture multi-partition only)
   --bytes-per-segment <n> RAM estimate per segment (Overture only)
+  --low-memory            use DuckDB-backed low-memory path (OSM PBF and GeoJSONL)
+  --compress-tiles        gzip-compress individual tile payloads in the archive
+  --progress              show progress bars during processing
+  --duckdb-memory-mb <n>  DuckDB memory limit in MB [40% of available RAM]
+  --duckdb-temp-dir <dir> directory for DuckDB scratch files [auto under --output]
+  --roads <path>          GeoJSONL road network input (alternative to --pbf)
 
 MERGE FLAGS:
   <INPUTS>...             .pmtiles files or directories (first .pmtiles found in each dir)
@@ -895,7 +909,7 @@ to the cross-tile table. Whether the decoder reads these has not been confirmed.
 
 ## 17. Known correctness issues not yet fixed
 
-1. **`parse_gers_id_or_warn` zero-collision** (`split.rs:258`): returns `[0u8;16]`
+1. **`parse_hex_id_or_warn` zero-collision** (`split.rs`): returns `[0u8;16]`
    on parse failure. Should be a hard error propagated up.
 
 2. **Duplicate tile ID check missing in merge**: overlapping regional archives produce
@@ -948,7 +962,7 @@ web/
     App.jsx           Top-level: WASM init, tile base URL, PMTiles setup; renders all panels
     App.css           Global styles
     store.js          Zustand store; decode orchestration (start/load_tile/decode); 3-cache pattern
-    tileDecoder.js    OLRL v2 binary tile payload → GeoJSON features (custom format decoder)
+    tileDecoder.js    OLRL v3 binary tile payload → GeoJSON features (custom format decoder)
     wasm.js           WASM module loader
     hooks.js          useDraggable hook (panels)
     components/
@@ -975,26 +989,28 @@ germany-latest.osm.pbf       4.5 GB — kept to avoid 57-min re-download
 ```bash
 cd /Users/dave/projects/rust/openlr_lens
 
-# Recompile after source changes
-cargo build --release -p openlrlens-build
-
 # NZ — fast schema iteration (~5 s, uses cached PBF)
-./target/release/openlrlens-build build \
-  --pbf new-zealand-latest.osm.pbf --extent NZ --output out/nz-osm
+cargo run --release --bin openlrlens-build -- \
+  build --pbf new-zealand-latest.osm.pbf --extent NZ --output out/nz-osm --progress
 
 # Germany — scalability reference (~94 s processing, PBF already present)
-./target/release/openlrlens-build build \
-  --pbf germany-latest.osm.pbf --extent DE --output out/de-osm
+cargo run --release --bin openlrlens-build -- \
+  build --pbf germany-latest.osm.pbf --extent DE --output out/de-osm --progress
 
 # Germany from URL (re-downloads 4.5 GB)
-./target/release/openlrlens-build build \
-  --pbf https://download.geofabrik.de/europe/germany-latest.osm.pbf \
-  --extent DE --output out/de-osm
+cargo run --release --bin openlrlens-build -- \
+  build --pbf https://download.geofabrik.de/europe/germany-latest.osm.pbf \
+  --extent DE --output out/de-osm --progress
+
+# Large region with low-memory DuckDB backend
+cargo run --release --bin openlrlens-build -- \
+  build --extent world --pbf out/europe-latest.osm.pbf \
+  --output ./out/eur-osm --low-memory --progress \
+  --compress-tiles --duckdb-memory-mb 15000 --duckdb-temp-dir ./tmp/
 
 # Merge regional archives into one
-./target/release/openlrlens-build merge \
-  --output out/world/openlrlens-world.pmtiles \
-  out/nz-osm out/de-osm
+cargo run --release --bin openlrlens-build -- \
+  merge --output out/world/openlrlens-world.pmtiles out/nz-osm out/de-osm
 
 # View in browser
 cd web && npm run dev
@@ -1008,7 +1024,7 @@ cd web && npm run dev
 
 ### Correctness (fix before trusting decode results)
 
-- [ ] Fix `parse_gers_id_or_warn` → propagate `Result`, hard error on bad IDs
+- [ ] Fix `parse_hex_id_or_warn` → propagate `Result`, hard error on bad IDs
 - [ ] Verify decoder reads and applies `xrestriction_count` cross-tile entries
 - [ ] Add `quantize_coord` bounds check: `assert!(deg.abs() <= 180.0)` (lon) / `90.0` (lat)
 - [ ] Add inverted-bbox check in `extent::resolve()`

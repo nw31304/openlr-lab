@@ -16,9 +16,9 @@ queries at runtime. Two decode formats: **OpenLR binary v3** (TomTom; 11.25° be
    positions. The graph model is strictly node-to-node edges. Missing splits → junctions silently
    vanish; A* routes around them. Fails in dense urban areas, passes in sparse rural ones.
 
-2. **Stable, deterministic ids derived from GERS — never build/row order.** Turn restrictions and
-   cross-tile stitching reference segments/nodes by id. A rebuild must produce the same ids or
-   every restriction and boundary link breaks.
+2. **Stable, deterministic ids derived from the source data — never build/row order.** Turn
+   restrictions and cross-tile stitching reference segments/nodes by stable ID. A rebuild must
+   produce the same ids or every restriction and boundary link breaks.
 
 3. **A* state is `(node, incoming_segment)` from day one.** The closed/visited set is keyed on
    the pair, not the bare node. Retrofitting this later is surgery on the most correctness-critical
@@ -88,24 +88,24 @@ Pipeline binary: `pipeline/`. Web frontend: `web/` (Vite + React + MapLibre GL J
 | geom_len | u16 | 2 | vertex count |
 | length_cm | u32 | 4 | precomputed; never re-derive from geometry |
 | frc/fow/direction | u8 | 1 | packed |
-| flags | u8 | 1 | |
-| reserved | — | 12 | |
+| _reserved | u8 | 1 | |
+| stable_id_offset | u32 | 4 | byte offset into tile string pool |
+| stable_id_len | u8 | 1 | byte length in string pool (0–255) |
+| _reserved | — | 7 | |
 
-**Identity (Invariant 2):** segment identity inside a tile is its array index; global stable id
-(full GERS UUID, 16 bytes) lives in side tables (`local index → GERS id`). Cross-tile references
-use the global GERS id. **Never a hash** — collisions are a silent Invariant-2 violation.
-
-**`stable_id` byte layout** (OSM tiles): bytes 0–7 = source integer (i64 LE), bytes 8–11 =
-split index (u32 LE), bytes 12–15 = 0. Produces `source_key` strings like `"372358612-1"`.
-Full GERS UUIDs have non-zero bytes 12–15. Decoded by `segment_source_key()` in `openlr-wasm`.
+**Identity (Invariant 2):** segment identity inside a tile is its array index. The stable ID is
+an opaque UTF-8 string stored in the tile's string pool and referenced by (offset, len) from the
+segment record. Its meaning is entirely provider-defined: an OSM way ID, a UUID, a database key,
+or any other text. The decoder and UI treat it as opaque. **Never a hash** — collisions are a
+silent Invariant-2 violation.
 
 ### Node table (per tile)
-`local index → { lon_e7, lat_e7, gers_id[16], flags }`. Boundary nodes (flags bit 0) require
-cross-tile stitching by GERS id.
+`local index → { lon_e7, lat_e7, stable_id_offset u32, stable_id_len u8, flags u8 }`. Boundary
+nodes (flags bit 0) require cross-tile stitching by stable ID string.
 
 ### Turn restriction table (per tile)
 `(from_seg, via_node, to_seg)` — cannot live in segment records. Intra-tile: local indices.
-Cross-tile: global GERS ids.
+Cross-tile: stable ID strings (from/to segment IDs referenced via string pool).
 
 ---
 
@@ -115,26 +115,35 @@ Custom binary payload, not MVT. All integers little-endian.
 
 ```
 Header (40 bytes)
-  magic:              [u8; 4] = b"OLRL"
-  version:            u8      = 1
-  flags:              u8      = 0
-  _pad:               [u8; 2]
-  segment_count:      u32
-  node_count:         u32
-  restriction_count:  u32     // intra-tile
-  geom_vertex_count:  u32
-  xrestriction_count: u32     // cross-tile
-  _reserved:          [u8; 12]
+  magic:               [u8; 4] = b"OLRL"
+  version:             u8      = 3
+  flags:               u8      = 0
+  _pad:                [u8; 2]
+  segment_count:       u32
+  node_count:          u32
+  restriction_count:   u32     // intra-tile
+  geom_vertex_count:   u32
+  xrestriction_count:  u32     // cross-tile
+  string_pool_length:  u32     // byte length of string pool section
+  _reserved:           [u8; 8]
 
 Segment array:       segment_count × 32 bytes  (layout per §4)
 Geometry pool:       geom_vertex_count × 8 bytes  (lon_e7: i32, lat_e7: i32)
-Node table:          node_count × 28 bytes  (lon_e7, lat_e7, gers_id[16], flags u8, pad[3])
+Node table:          node_count × 28 bytes
+  lon_e7: i32, lat_e7: i32,
+  stable_id_offset: u32, stable_id_len: u8,
+  _reserved: [u8; 11], flags: u8, _pad: [u8; 3]
 Intra restrictions:  restriction_count × 16 bytes  (from_seg u32, via_node u32, to_seg u32, flags u8, pad[3])
-Cross restrictions:  xrestriction_count × 40 bytes (from_gers[16], via_node_local u32, to_gers[16], flags u8, pad[3])
+Cross restrictions:  xrestriction_count × 16 bytes
+  from_id_offset: u32, from_id_len: u8,
+  via_node_local: u32,
+  to_id_offset: u32, to_id_len: u8,
+  flags: u8, _pad: u8
+String pool:         string_pool_length bytes  (concatenated UTF-8 stable ID strings)
 ```
 
 Coordinate precision: 1e-7 degrees ≈ 1 cm. `geom_offset` is a vertex index (not byte offset).
-`geom_len` counts vertices.
+`geom_len` counts vertices. String pool offsets are byte offsets (not string indices).
 
 **Single zoom level** (default z12, ~10 km cells). `z/x/y` is purely the addressing convention
 — not a level-of-detail pyramid. Every tile holds all FRCs. Manifest records the zoom level.
