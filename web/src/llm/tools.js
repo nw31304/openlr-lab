@@ -97,7 +97,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'get_segment',
       description:
-        'Full attributes and geometry for one segment by its internal segment ID. Returns FRC, FOW, direction, length, geometry, tile location, and source_key (the human-readable stable ID such as "372358612-1"). Use this to inspect any segment seen in candidate lists, path breakdowns, or rejection reasons.',
+        'Full attributes and geometry for one segment by its internal segment ID. Returns FRC, FOW, direction, length, geometry, tile location, and stable_id (the human-readable stable ID such as "372358612-1"). Use this to inspect any segment seen in candidate lists, path breakdowns, or rejection reasons.',
       parameters: {
         type: 'object',
         properties: {
@@ -115,7 +115,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'get_segments_near',
       description:
-        'Find all loaded road segments within radius_m of a coordinate. Returns up to 20 segments sorted by distance, each with source_key (stable ID like "372358612-1"), FRC, FOW, direction, and length. Useful for understanding what roads are available near an LRP that produced no or few candidates.',
+        'Find all loaded road segments within radius_m of a coordinate. Returns up to 20 segments sorted by distance, each with stable_id (stable ID like "372358612-1"), FRC, FOW, direction, and length. Useful for understanding what roads are available near an LRP that produced no or few candidates.',
       parameters: {
         type: 'object',
         properties: {
@@ -137,7 +137,7 @@ export const TOOL_DEFINITIONS = [
         + 'segment that shares that node, with can_arrive/can_depart flags and turn-restriction flags. '
         + 'For bidirectional (Both) segments each endpoint is simultaneously entry and exit, '
         + 'so both groups show full connectivity. '
-        + 'Each neighbour includes source_key (the human-readable stable ID such as "372358612-1"), '
+        + 'Each neighbour includes stable_id (the human-readable stable ID such as "372358612-1"), '
         + 'internal segment_id, FRC, FOW, direction, and length. '
         + 'Use this to understand junction topology, diagnose why A* took or avoided a turn, '
         + 'or explore the road network around a candidate segment.',
@@ -495,7 +495,7 @@ function parseVerdict(raw) {
 
 function resolveSourceKey(decoder, segId) {
   if (!decoder) return null;
-  try { return JSON.parse(decoder.get_segment(segId))?.source_key ?? null; } catch { return null; }
+  try { return JSON.parse(decoder.get_segment(segId))?.stable_id ?? null; } catch { return null; }
 }
 
 // ── Trace event extractor ─────────────────────────────────────────────────────
@@ -548,7 +548,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
 
       const pathRows = segs.map(s => ({
         seg_id:     s.segment_id,
-        source_key: s.source_id ?? s.source_key ?? null,
+        stable_id: s.stable_id ?? s.stable_id ?? null,
         frc:        s.frc,
         fow:        s.fow,
         direction:  s.direction,
@@ -557,7 +557,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
 
       return toonResponse(scalars,
         pathRows.length
-          ? [{ label: 'path', rows: pathRows, fields: ['seg_id','source_key','frc','fow','direction','length_m'] }]
+          ? [{ label: 'path', rows: pathRows, fields: ['seg_id','stable_id','frc','fow','direction','length_m'] }]
           : []
       );
     }
@@ -592,7 +592,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
 
       const acceptedRows = (data.accepted ?? []).map(c => ({
         seg_id:      c.segment_id,
-        source_key:  resolveSourceKey(decoder, c.segment_id),
+        stable_id:  resolveSourceKey(decoder, c.segment_id),
         traversal:   c.traversal,
         dist_m:      r1(c.projection?.distance_m),
         bearing_deg: r1(c.projection?.bearing_deg),
@@ -612,7 +612,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
       const tables = [{
         label:  'accepted',
         rows:   acceptedRows,
-        fields: ['seg_id','source_key','traversal','dist_m','bearing_deg','dist_sc','bear_sc','frc_sc','fow_sc','total'],
+        fields: ['seg_id','stable_id','traversal','dist_m','bearing_deg','dist_sc','bear_sc','frc_sc','fow_sc','total'],
       }];
 
       if (include_rejected) {
@@ -620,7 +620,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
           const { verdict, excess } = parseVerdict(r.verdict);
           return {
             seg_id:      r.segment_id,
-            source_key:  resolveSourceKey(decoder, r.segment_id),
+            stable_id:  resolveSourceKey(decoder, r.segment_id),
             dist_m:      r.projection?.distance_m != null ? r1(r.projection.distance_m) : null,
             bearing_deg: r.projection?.bearing_deg != null ? r1(r.projection.bearing_deg) : null,
             verdict,
@@ -630,7 +630,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
         tables.push({
           label:  'rejected',
           rows:   rejectedRows,
-          fields: ['seg_id','source_key','dist_m','bearing_deg','verdict','excess'],
+          fields: ['seg_id','stable_id','dist_m','bearing_deg','verdict','excess'],
         });
       }
 
@@ -695,7 +695,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
         if (len != null) cumul += len;
         return {
           seg_id:    id,
-          source_key: info?.source_id ?? info?.source_key ?? resolveSourceKey(decoder, id),
+          stable_id: info?.stable_id ?? info?.stable_id ?? resolveSourceKey(decoder, id),
           frc:       info?.frc       ?? null,
           fow:       info?.fow       ?? null,
           direction: info?.direction ?? null,
@@ -717,7 +717,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
           from_snap: fromSnap ? `${fromSnap[0]},${fromSnap[1]}` : null,
           to_snap:   toSnap   ? `${toSnap[0]},${toSnap[1]}`     : null,
         },
-        [{ label: 'segments', rows: segRows, fields: ['seg_id','source_key','frc','fow','direction','length_m','cumul_m'] }]
+        [{ label: 'segments', rows: segRows, fields: ['seg_id','stable_id','frc','fow','direction','length_m','cumul_m'] }]
       );
     }
 
@@ -728,10 +728,10 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
       const data = JSON.parse(raw);
       if (data.error) return raw;
 
-      const neighborFields = ['seg_id','source_key','frc','fow','direction','length_m','can_arrive','can_depart'];
+      const neighborFields = ['seg_id','stable_id','frc','fow','direction','length_m','can_arrive','can_depart'];
       const mapNeighbor = s => ({
         seg_id:     s.segment_id,
-        source_key: s.source_key ?? null,
+        stable_id: s.stable_id ?? null,
         frc:        s.frc,
         fow:        s.fow,
         direction:  s.direction,
@@ -774,7 +774,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
 
       const segRows = data.segments.map(s => ({
         seg_id:     s.segment_id,
-        source_key: s.source_key ?? null,
+        stable_id: s.stable_id ?? null,
         frc:        s.frc,
         fow:        s.fow,
         direction:  s.direction,
@@ -784,7 +784,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
 
       return toonResponse(
         { lat, lon, radius_m: data.query?.radius_m ?? radius_m, count: segRows.length },
-        [{ label: 'segments', rows: segRows, fields: ['seg_id','source_key','frc','fow','direction','length_m','dist_m'] }]
+        [{ label: 'segments', rows: segRows, fields: ['seg_id','stable_id','frc','fow','direction','length_m','dist_m'] }]
       );
     }
 
@@ -1151,10 +1151,10 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
       const segRows = [];
       for (const seg_id of segment_ids) {
         const s = JSON.parse(decoder.get_segment(seg_id));
-        if (s.error) { segRows.push({ seg_id, source_key: null, frc: null, length_m: null }); continue; }
+        if (s.error) { segRows.push({ seg_id, stable_id: null, frc: null, length_m: null }); continue; }
         const len = s.length_m ?? 0;
         totalLength += len;
-        segRows.push({ seg_id, source_key: s.source_key ?? null, frc: s.frc, length_m: r1(len) });
+        segRows.push({ seg_id, stable_id: s.stable_id ?? null, frc: s.frc, length_m: r1(len) });
       }
 
       const dnpPasses = windowLb != null ? totalLength >= windowLb && totalLength <= windowUb : null;
@@ -1169,7 +1169,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
           dnp_raw_encoded:    lrp.dnp_lb != null ? `[${r1(lrp.dnp_lb)},${r1(lrp.dnp_ub ?? lrp.dnp_lb)}]` : null,
           dnp_passes:         dnpPasses,
         },
-        [{ label: 'segments', rows: segRows, fields: ['seg_id','source_key','frc','length_m'] }]
+        [{ label: 'segments', rows: segRows, fields: ['seg_id','stable_id','frc','length_m'] }]
       );
     }
 
@@ -1209,10 +1209,10 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
       const geom      = hintSeg.geometry ?? [];
       const nodeCoord = isAtStart ? geom[0] : geom[geom.length - 1];
 
-      const fields = ['seg_id','source_key','frc','fow','direction','length_m','can_arrive','can_depart','restricted_from_self','restricted_into_self'];
+      const fields = ['seg_id','stable_id','frc','fow','direction','length_m','can_arrive','can_depart','restricted_from_self','restricted_into_self'];
       const rows = (nodeGroup?.segments ?? []).map(s => ({
         seg_id:               s.segment_id,
-        source_key:           s.source_key ?? null,
+        stable_id:           s.stable_id ?? null,
         frc:                  s.frc,
         fow:                  s.fow,
         direction:            s.direction,
@@ -1284,7 +1284,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
       return JSON.stringify({
         lrp_index,
         segment_id,
-        source_key:           segData.source_key ?? null,
+        stable_id:           segData.stable_id ?? null,
         accepted:             isAccepted,
         verdict,
         excess_deg:           excess,

@@ -73,7 +73,7 @@ export function buildDiagnosticPrompt(decodeResult, params) {
       const SEG_PREVIEW = 15;
       lines.push('Decoded path (ordered segments):');
       for (const s of segs.slice(0, SEG_PREVIEW)) {
-        lines.push(`  seg=${s.source_id ?? s.segment_id}  frc=${s.frc}(${FRC[s.frc] ?? s.frc})  fow=${s.fow}(${FOW[s.fow] ?? s.fow})`);
+        lines.push(`  seg=${s.stable_id ?? s.segment_id}  frc=${s.frc}(${FRC[s.frc] ?? s.frc})  fow=${s.fow}(${FOW[s.fow] ?? s.fow})`);
       }
       if (segs.length > SEG_PREVIEW) {
         lines.push(`  … ${segs.length - SEG_PREVIEW} more segments — call get_decode_summary for full list`);

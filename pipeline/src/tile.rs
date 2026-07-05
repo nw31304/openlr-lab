@@ -81,15 +81,15 @@ struct IntraTileRestriction {
 }
 
 struct CrossTileRestriction {
-    from_gers: [u8; 16],
+    from_id: String,
     via_node_local: u32,
-    to_gers: [u8; 16],
+    to_id: String,
     flags: u8,
 }
 
 /// Compute the tile-local node ordering for a set of edges.
-/// Returns (node_order, node_index) where node_order[i] is the GERS ID of the
-/// i-th local node, and node_index maps GERS ID → local index.
+/// Returns (node_order, node_index) where node_order[i] is the internal binary key of
+/// the i-th local node, and node_index maps key → local index.
 fn compute_tile_node_order(
     tile_edge_indices: &[usize],
     edges: &[QuantizedEdge],
@@ -98,26 +98,39 @@ fn compute_tile_node_order(
     let mut node_index: HashMap<[u8; 16], u32> = HashMap::new();
     for &idx in tile_edge_indices {
         let e = &edges[idx];
-        for gers in [e.start_node_gers, e.end_node_gers] {
-            if !node_index.contains_key(&gers) {
+        for id in [e.start_node_id, e.end_node_id] {
+            if !node_index.contains_key(&id) {
                 let i = node_order.len() as u32;
-                node_order.push(gers);
-                node_index.insert(gers, i);
+                node_order.push(id);
+                node_index.insert(id, i);
             }
         }
     }
     (node_order, node_index)
 }
 
-/// Construct the 16-byte segment stable-id stored in the tile.
-/// Layout: bytes 0–7 = parent GERS bytes 0–7 (source integer), bytes 8–11 = split_idx
-/// (u32 LE), bytes 12–15 = 0.  The JS tile decoder reads this format to produce display
-/// keys such as "434722393-2".
-pub fn seg_stable_id(parent_gers: &[u8; 16], split_idx: u32) -> [u8; 16] {
-    let mut id = [0u8; 16];
-    id[0..8].copy_from_slice(&parent_gers[0..8]);
-    id[8..12].copy_from_slice(&split_idx.to_le_bytes());
-    id
+/// Generate the stable ID string for a split segment.
+/// Way-format key: bytes 0–7 = source integer (LE i64), bytes 8–15 = zero → "{id}-{split_idx}"
+/// Full hex key (any other 128-bit format): hex(parent_id) + "-" + split_idx.
+pub fn seg_stable_id_str(parent_id: &[u8; 16], split_idx: u32) -> String {
+    if parent_id[8..16] == [0u8; 8] {
+        let id = i64::from_le_bytes(parent_id[0..8].try_into().unwrap());
+        format!("{id}-{split_idx}")
+    } else {
+        format!("{}-{split_idx}", hex::encode(parent_id))
+    }
+}
+
+/// Generate the stable ID string for a node.
+/// Node-format key: bytes 0–7 = zero, bytes 8–15 = source integer (LE i64) → "{id}"
+/// Full hex key: hex(node_id).
+pub fn node_stable_id_str(node_id: &[u8; 16]) -> String {
+    if node_id[0..8] == [0u8; 8] {
+        let id = i64::from_le_bytes(node_id[8..16].try_into().unwrap());
+        format!("{id}")
+    } else {
+        hex::encode(node_id)
+    }
 }
 
 fn pack_attrs(frc: u8, fow: u8, direction: Direction) -> u8 {
@@ -139,27 +152,74 @@ fn build_tile_payload(
     intra: &[IntraTileRestriction],
     cross: &[CrossTileRestriction],
 ) -> Vec<u8> {
-    let segment_count    = tile_edge_indices.len() as u32;
-    let node_count       = node_order.len() as u32;
+    let segment_count      = tile_edge_indices.len() as u32;
+    let node_count         = node_order.len() as u32;
     let restriction_count  = intra.len() as u32;
     let xrestriction_count = cross.len() as u32;
 
-    // Build geometry pool, segment records, and stable-id table (local index → source ID).
-    // Each 16-byte entry: bytes 0–7 = parent source integer (i64 LE), bytes 8–11 = split_idx
-    // (u32 LE), bytes 12–15 = 0.  JS decoder reads this as "sourceInt-splitIdx" (e.g. "434722393-2").
+    // ── Build string pool ────────────────────────────────────────────────────────
+    // Layout: segment IDs (in segment-array order), then node IDs (in node-table order),
+    // then cross-restriction from/to IDs (pairs, in cross-restriction order).
+    let mut string_pool: Vec<u8> = Vec::new();
+
+    let mut seg_id_pool: Vec<(u32, u8)> = Vec::with_capacity(tile_edge_indices.len());
+    for &idx in tile_edge_indices {
+        let e = &edges[idx];
+        let s = seg_stable_id_str(&e.parent_id, e.split_idx);
+        let off = string_pool.len() as u32;
+        let len = s.len().min(255) as u8;
+        string_pool.extend_from_slice(&s.as_bytes()[..len as usize]);
+        seg_id_pool.push((off, len));
+    }
+
+    let mut node_id_pool: Vec<(u32, u8)> = Vec::with_capacity(node_order.len());
+    for node_id in node_order {
+        let s = node_stable_id_str(node_id);
+        let off = string_pool.len() as u32;
+        let len = s.len().min(255) as u8;
+        string_pool.extend_from_slice(&s.as_bytes()[..len as usize]);
+        node_id_pool.push((off, len));
+    }
+
+    // Each cross restriction contributes a (from_id, to_id) pair.
+    let mut cross_id_pool: Vec<(u32, u8, u32, u8)> = Vec::with_capacity(cross.len());
+    for r in cross {
+        let from_off = string_pool.len() as u32;
+        let from_len = r.from_id.len().min(255) as u8;
+        string_pool.extend_from_slice(&r.from_id.as_bytes()[..from_len as usize]);
+        let to_off = string_pool.len() as u32;
+        let to_len = r.to_id.len().min(255) as u8;
+        string_pool.extend_from_slice(&r.to_id.as_bytes()[..to_len as usize]);
+        cross_id_pool.push((from_off, from_len, to_off, to_len));
+    }
+
+    let string_pool_length = string_pool.len() as u32;
+
+    // ── Build geometry pool and segment records ──────────────────────────────────
+    // Segment record (32 bytes):
+    //   0..4  start_node u32
+    //   4..8  end_node u32
+    //   8..12 geom_offset u32
+    //  12..14 geom_len u16
+    //  14..18 length_cm u32
+    //  18     attrs u8 (frc[2:0] | fow[5:3] | dir[7:6])
+    //  19     flags u8
+    //  20..24 stable_id_offset u32  (index into string pool)
+    //  24     stable_id_len u8
+    //  25..32 _reserved
     let mut geom_pool: Vec<(i32, i32)> = Vec::new();
     let mut seg_records: Vec<[u8; 32]> = Vec::with_capacity(tile_edge_indices.len());
-    let mut seg_gers_ids: Vec<[u8; 16]> = Vec::with_capacity(tile_edge_indices.len());
 
-    for &idx in tile_edge_indices {
+    for (local_idx, &idx) in tile_edge_indices.iter().enumerate() {
         let e = &edges[idx];
         let geom_offset = geom_pool.len() as u32;
         let geom_len    = e.geometry.len() as u16;
         geom_pool.extend_from_slice(&e.geometry);
 
-        let start_node = node_index[&e.start_node_gers];
-        let end_node   = node_index[&e.end_node_gers];
+        let start_node = node_index[&e.start_node_id];
+        let end_node   = node_index[&e.end_node_id];
         let packed     = pack_attrs(e.frc, e.fow, e.direction);
+        let (sid_off, sid_len) = seg_id_pool[local_idx];
 
         let mut r = [0u8; 32];
         r[0..4].copy_from_slice(&start_node.to_le_bytes());
@@ -168,71 +228,95 @@ fn build_tile_payload(
         r[12..14].copy_from_slice(&geom_len.to_le_bytes());
         r[14..18].copy_from_slice(&e.length_cm.to_le_bytes());
         r[18] = packed;
-        r[19] = 0; // flags reserved
-        // r[20..32] = 0 (reserved)
+        r[19] = 0; // flags
+        r[20..24].copy_from_slice(&sid_off.to_le_bytes());
+        r[24] = sid_len;
+        // r[25..32] = 0 (_reserved)
         seg_records.push(r);
-        seg_gers_ids.push(seg_stable_id(&e.parent_gers_id, e.split_idx));
     }
 
     let geom_vertex_count = geom_pool.len() as u32;
 
-    // 40-byte tile header.  Version 2 adds the stable-id table after the segment array.
+    // ── Tile header (v3) ─────────────────────────────────────────────────────────
     let mut hdr = [0u8; 40];
     hdr[0..4].copy_from_slice(&openlr_graph::tile::TILE_MAGIC);
-    hdr[4] = 2; // version: 2 adds stable-id table
+    hdr[4] = 3; // version 3
     hdr[8..12].copy_from_slice(&segment_count.to_le_bytes());
     hdr[12..16].copy_from_slice(&node_count.to_le_bytes());
     hdr[16..20].copy_from_slice(&restriction_count.to_le_bytes());
     hdr[20..24].copy_from_slice(&geom_vertex_count.to_le_bytes());
     hdr[24..28].copy_from_slice(&xrestriction_count.to_le_bytes());
+    hdr[28..32].copy_from_slice(&string_pool_length.to_le_bytes());
 
+    // ── Layout (v3) ──────────────────────────────────────────────────────────────
+    // header(40) + segs(n×32) + geom(g×8) + nodes(n×28) + intra(r×16) + cross(x×16) + pool
+    // Cross restrictions changed from 40 bytes (v2) to 16 bytes (v3).
     let cap = 40
         + seg_records.len() * 32
-        + seg_gers_ids.len() * 16   // segment GERS-id table
         + geom_pool.len() * 8
         + node_order.len() * 28
         + intra.len() * 16
-        + cross.len() * 40;
+        + cross.len() * 16
+        + string_pool.len();
     let mut payload = Vec::with_capacity(cap);
 
     payload.extend_from_slice(&hdr);
+
     for r in &seg_records {
         payload.extend_from_slice(r);
-    }
-    // Stable-id table: one 16-byte entry per segment, indexed by local segment index.
-    for gers in &seg_gers_ids {
-        payload.extend_from_slice(gers.as_slice());
     }
     for (lon_e7, lat_e7) in &geom_pool {
         payload.extend_from_slice(&lon_e7.to_le_bytes());
         payload.extend_from_slice(&lat_e7.to_le_bytes());
     }
-    for gers in node_order {
-        let (lon_e7, lat_e7) = node_lookup.get(gers).copied().unwrap_or_else(|| {
-            warn!(gers = %hex::encode(gers), "node not found in lookup, using (0,0)");
+    // Node record (28 bytes, v3):
+    //   0..4   lon_e7 i32
+    //   4..8   lat_e7 i32
+    //   8..12  stable_id_offset u32
+    //  12      stable_id_len u8
+    //  13..24  _reserved [u8; 11]
+    //  24      flags u8 (bit 0 = is_boundary)
+    //  25..28  _pad [u8; 3]
+    for (node_local_idx, node_id) in node_order.iter().enumerate() {
+        let (lon_e7, lat_e7) = node_lookup.get(node_id).copied().unwrap_or_else(|| {
+            warn!(id = %hex::encode(node_id), "node not found in lookup, using (0,0)");
             (0, 0)
         });
-        let is_boundary = boundary_nodes.contains(gers);
+        let is_boundary = boundary_nodes.contains(node_id);
+        let (nid_off, nid_len) = node_id_pool[node_local_idx];
         payload.extend_from_slice(&lon_e7.to_le_bytes());
         payload.extend_from_slice(&lat_e7.to_le_bytes());
-        payload.extend_from_slice(gers.as_slice());
-        payload.push(u8::from(is_boundary)); // flags: bit 0 = boundary
-        payload.extend_from_slice(&[0u8; 3]); // _pad
+        payload.extend_from_slice(&nid_off.to_le_bytes());
+        payload.push(nid_len);
+        payload.extend_from_slice(&[0u8; 11]); // _reserved
+        payload.push(u8::from(is_boundary));   // flags
+        payload.extend_from_slice(&[0u8; 3]);  // _pad
     }
     for r in intra {
         payload.extend_from_slice(&r.from_seg.to_le_bytes());
         payload.extend_from_slice(&r.via_node.to_le_bytes());
         payload.extend_from_slice(&r.to_seg.to_le_bytes());
         payload.push(r.flags);
-        payload.extend_from_slice(&[0u8; 3]); // _pad
+        payload.extend_from_slice(&[0u8; 3]);
     }
-    for r in cross {
-        payload.extend_from_slice(&r.from_gers);
+    // Cross restriction record (16 bytes, v3):
+    //   0..4  from_id_offset u32
+    //   4     from_id_len u8
+    //   5..9  via_node_local u32
+    //   9..13 to_id_offset u32
+    //  13     to_id_len u8
+    //  14     flags u8
+    //  15     _pad u8
+    for (r, (from_off, from_len, to_off, to_len)) in cross.iter().zip(cross_id_pool.iter()) {
+        payload.extend_from_slice(&from_off.to_le_bytes());
+        payload.push(*from_len);
         payload.extend_from_slice(&r.via_node_local.to_le_bytes());
-        payload.extend_from_slice(&r.to_gers);
+        payload.extend_from_slice(&to_off.to_le_bytes());
+        payload.push(*to_len);
         payload.push(r.flags);
-        payload.extend_from_slice(&[0u8; 3]); // _pad
+        payload.push(0u8); // _pad
     }
+    payload.extend_from_slice(&string_pool);
 
     payload
 }
@@ -520,10 +604,10 @@ pub fn write_tiles(
     low_memory: bool,
     compress: bool,
 ) -> Result<()> {
-    // Build node coordinate lookup: gers_id → (lon_e7, lat_e7).
+    // Build node coordinate lookup: node_id → (lon_e7, lat_e7).
     let node_lookup: HashMap<[u8; 16], (i32, i32)> = nodes
         .iter()
-        .map(|n| (n.gers_id, (n.lon_e7, n.lat_e7)))
+        .map(|n| (n.node_id, (n.lon_e7, n.lat_e7)))
         .collect();
 
     // Bin edges into tiles by midpoint.
@@ -547,8 +631,8 @@ pub fn write_tiles(
         let tile_ord = tile_key.x ^ (tile_key.y << 16); // cheap tile identity scalar
         for &idx in tile_indices {
             let e = &edges[idx];
-            for gers in [e.start_node_gers, e.end_node_gers] {
-                let entry = node_tile_set.entry(gers).or_insert(tile_ord);
+            for id in [e.start_node_id, e.end_node_id] {
+                let entry = node_tile_set.entry(id).or_insert(tile_ord);
                 if *entry != tile_ord {
                     *entry = u32::MAX; // sentinel: appears in multiple tiles
                 }
@@ -575,14 +659,14 @@ pub fn write_tiles(
         .flat_map(|indices| indices.iter().enumerate().map(|(local, &global)| (global, local as u32)))
         .collect();
 
-    // Via-node tile: node_gers → TileKey (routed by node coordinates).
+    // Via-node tile: node_id → TileKey (routed by node coordinates).
     let node_to_tile: HashMap<[u8; 16], TileKey> = nodes
         .iter()
         .map(|n| {
             let lon = n.lon_e7 as f64 * 1e-7;
             let lat = n.lat_e7 as f64 * 1e-7;
             let (x, y) = lon_lat_to_tile_xy(lon, lat, tile_zoom);
-            (n.gers_id, TileKey { z: tile_zoom, x, y })
+            (n.node_id, TileKey { z: tile_zoom, x, y })
         })
         .collect();
 
@@ -595,22 +679,22 @@ pub fn write_tiles(
     let mut from_edge_map: HashMap<([u8; 16], [u8; 16]), usize> = HashMap::new();
     let mut to_edge_map:   HashMap<([u8; 16], [u8; 16]), usize> = HashMap::new();
     for (i, e) in edges.iter().enumerate() {
-        from_edge_map.insert((e.parent_gers_id, e.end_node_gers), i);
-        to_edge_map.insert(  (e.parent_gers_id, e.start_node_gers), i);
+        from_edge_map.insert((e.parent_id, e.end_node_id),   i);
+        to_edge_map.insert(  (e.parent_id, e.start_node_id), i);
     }
 
     let mut n_resolved = 0usize;
     let mut n_skipped  = 0usize;
     for r in &restrictions {
-        let via_bytes = r.via_connector_gers;
+        let via_bytes = r.via_connector_id;
         let via_tile = match node_to_tile.get(&via_bytes) {
             Some(&t) => t,
             None     => { n_skipped += 1; continue; }
         };
-        let Some(&from_global) = from_edge_map.get(&(r.from_segment_gers, via_bytes)) else {
+        let Some(&from_global) = from_edge_map.get(&(r.from_segment_id, via_bytes)) else {
             n_skipped += 1; continue;
         };
-        let Some(&to_global) = to_edge_map.get(&(r.to_segment_gers, via_bytes)) else {
+        let Some(&to_global) = to_edge_map.get(&(r.to_segment_id, via_bytes)) else {
             n_skipped += 1; continue;
         };
         let via_node_local = match tile_nodes.get(&via_tile).and_then(|(_, idx)| idx.get(&via_bytes)) {
@@ -631,15 +715,13 @@ pub fn write_tiles(
                 flags:    r.flags,
             });
         } else {
-            // Use the split-indexed stable_id so stitch_cross_tile can match against
-            // NetworkSegment.stable_id (which also carries the split index).
-            let from_stable = seg_stable_id(&edges[from_global].parent_gers_id, edges[from_global].split_idx);
-            let to_stable   = seg_stable_id(&edges[to_global].parent_gers_id,   edges[to_global].split_idx);
+            let from_stable = seg_stable_id_str(&edges[from_global].parent_id, edges[from_global].split_idx);
+            let to_stable   = seg_stable_id_str(&edges[to_global].parent_id,   edges[to_global].split_idx);
             tile_cross.entry(via_tile).or_default().push(CrossTileRestriction {
-                from_gers:      from_stable,
+                from_id:       from_stable,
                 via_node_local,
-                to_gers:        to_stable,
-                flags:          r.flags,
+                to_id:         to_stable,
+                flags:         r.flags,
             });
         }
         n_resolved += 1;
@@ -842,14 +924,14 @@ mod tests {
         use openlr_graph::tile::TILE_MAGIC;
         let edges = vec![
             QuantizedEdge {
-                start_node_gers: [1u8; 16],
-                end_node_gers:   [2u8; 16],
-                geometry:        vec![(1_747_700_000i32, -366_000_000), (1_748_000_000, -366_000_000)],
-                length_cm:       10_000,
+                start_node_id: [1u8; 16],
+                end_node_id:   [2u8; 16],
+                geometry:      vec![(1_747_700_000i32, -366_000_000), (1_748_000_000, -366_000_000)],
+                length_cm:     10_000,
                 frc: 3,
                 fow: 3,
                 direction: Direction::Both,
-                parent_gers_id: [0u8; 16],
+                parent_id: [0u8; 16],
                 split_idx: 0,
             },
         ];
@@ -863,32 +945,30 @@ mod tests {
             &[0], &edges, &node_order, &node_index, &node_lookup, &boundary, &[], &[],
         );
 
-        // Magic
         assert_eq!(&payload[0..4], &TILE_MAGIC);
-        // Version
-        assert_eq!(payload[4], 2);
-        // segment_count at bytes 8–11
+        assert_eq!(payload[4], 3); // version 3
         let seg_count = u32::from_le_bytes(payload[8..12].try_into().unwrap());
         assert_eq!(seg_count, 1);
-        // node_count at bytes 12–15
         let node_count = u32::from_le_bytes(payload[12..16].try_into().unwrap());
         assert_eq!(node_count, 2);
-        // geom_vertex_count at bytes 20–23
         let geom_vc = u32::from_le_bytes(payload[20..24].try_into().unwrap());
         assert_eq!(geom_vc, 2);
     }
 
     #[test]
     fn tile_payload_size_formula() {
-        // 1 edge, 3 vertices, 2 nodes → header(40) + seg(32) + seg_gers(16) + geom(3×8) + node(2×28)
+        // v3: header(40) + seg(32) + geom(3×8) + nodes(2×28) + string_pool
+        // parent_id=[0u8;16] → seg_stable_id_str = "0-0" (3 bytes)
+        // node [1u8;16]: bytes[0..8]=[1..] ≠ zero → hex::encode = 32 chars
+        // node [2u8;16]: similarly 32 chars
         let edges = vec![QuantizedEdge {
-            start_node_gers: [1u8; 16],
-            end_node_gers:   [2u8; 16],
-            geometry:        vec![(0i32, 0), (1, 0), (2, 0)],
-            length_cm:       100,
+            start_node_id: [1u8; 16],
+            end_node_id:   [2u8; 16],
+            geometry:      vec![(0i32, 0), (1, 0), (2, 0)],
+            length_cm:     100,
             frc: 2, fow: 3,
             direction: Direction::Both,
-            parent_gers_id: [0u8; 16],
+            parent_id: [0u8; 16],
             split_idx: 0,
         }];
         let node_lookup = HashMap::from([
@@ -900,7 +980,11 @@ mod tests {
         let payload = build_tile_payload(
             &[0], &edges, &node_order, &node_index, &node_lookup, &boundary, &[], &[],
         );
-        let expected = 40 + 32 + 16 + 3 * 8 + 2 * 28;
+        let seg_id_len   = seg_stable_id_str(&[0u8; 16], 0).len();
+        let node1_id_len = node_stable_id_str(&[1u8; 16]).len();
+        let node2_id_len = node_stable_id_str(&[2u8; 16]).len();
+        let pool_len     = seg_id_len + node1_id_len + node2_id_len;
+        let expected     = 40 + 32 + 3 * 8 + 2 * 28 + pool_len;
         assert_eq!(payload.len(), expected, "payload len {}", payload.len());
     }
 

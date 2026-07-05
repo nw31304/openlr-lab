@@ -10,8 +10,8 @@ use openlr_graph::Direction;
 /// NOT recomputed from the quantized geometry (Invariant 4 — stored length is canonical).
 #[derive(Debug, Clone)]
 pub struct QuantizedEdge {
-    pub start_node_gers: [u8; 16],
-    pub end_node_gers: [u8; 16],
+    pub start_node_id: [u8; 16],
+    pub end_node_id: [u8; 16],
     /// (lon_e7, lat_e7) — absolute, not delta-coded (v1).
     pub geometry: Vec<(i32, i32)>,
     /// Length in centimetres (stored as u32; max ~42 km per edge).
@@ -19,16 +19,17 @@ pub struct QuantizedEdge {
     pub frc: u8,
     pub fow: u8,
     pub direction: Direction,
-    pub parent_gers_id: [u8; 16],
-    /// Passed through from [`SplitEdge`]; used by the tile builder to construct the
-    /// per-segment stable-id (bytes 8–11 of the 16-byte entry).
+    /// Internal binary key for the parent segment; used for turn-restriction cross-references.
+    pub parent_id: [u8; 16],
+    /// Passed through from [`SplitEdge`]; combined with `parent_id` in the tile builder
+    /// to produce a unique per-segment stable ID string.
     pub split_idx: u32,
 }
 
 /// A node with quantized coordinates.
 #[derive(Debug, Clone)]
 pub struct QuantizedNode {
-    pub gers_id: [u8; 16],
+    pub node_id: [u8; 16],
     pub lon_e7: i32,
     pub lat_e7: i32,
 }
@@ -47,7 +48,7 @@ pub fn quantize(
     let q_nodes: Vec<QuantizedNode> = nodes
         .into_par_iter()
         .map(|n| QuantizedNode {
-            gers_id: n.gers_id,
+            node_id: n.node_id,
             lon_e7: quantize_coord(n.lon),
             lat_e7: quantize_coord(n.lat),
         })
@@ -67,15 +68,15 @@ fn quantize_edge(edge: SplitEdge) -> QuantizedEdge {
     let length_cm = (edge.length_m * 100.0).round() as u32;
 
     QuantizedEdge {
-        start_node_gers: edge.start_node_gers,
-        end_node_gers:   edge.end_node_gers,
+        start_node_id: edge.start_node_id,
+        end_node_id:   edge.end_node_id,
         geometry,
         length_cm,
-        frc:             edge.frc,
-        fow:             edge.fow,
-        direction:       edge.direction,
-        parent_gers_id:  edge.parent_gers_id,
-        split_idx:       edge.split_idx,
+        frc:           edge.frc,
+        fow:           edge.fow,
+        direction:     edge.direction,
+        parent_id:     edge.parent_id,
+        split_idx:     edge.split_idx,
     }
 }
 
@@ -172,13 +173,13 @@ mod tests {
     #[test]
     fn length_cm_conversion() {
         let edge = SplitEdge {
-            start_node_gers: [0u8; 16],
-            end_node_gers:   [0u8; 16],
-            geometry:        vec![(174.0, -36.0), (174.001, -36.0)],
-            length_m:        111.319,
+            start_node_id: [0u8; 16],
+            end_node_id:   [0u8; 16],
+            geometry:      vec![(174.0, -36.0), (174.001, -36.0)],
+            length_m:      111.319,
             frc: 3, fow: 3,
             direction: Direction::Both,
-            parent_gers_id: [0u8; 16],
+            parent_id: [0u8; 16],
             split_idx: 0,
         };
         let qe = quantize_edge(edge);

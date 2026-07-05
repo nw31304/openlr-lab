@@ -1,6 +1,6 @@
 import maplibregl from 'maplibre-gl';
 import { PMTiles }  from 'pmtiles';
-import { decodeTile } from './decoder.js';
+import { decodeTile } from './tileDecoder.js';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 

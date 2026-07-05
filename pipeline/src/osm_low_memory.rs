@@ -53,7 +53,7 @@ use crate::partition::available_ram_bytes;
 use crate::quantize::quantize_coord;
 use crate::restrictions::{encode_restriction_flags, HEADING_ANY};
 use crate::split::polyline_length_m;
-use crate::tile::{lon_lat_to_tile_xy, seg_stable_id, xyz_to_tile_id};
+use crate::tile::{lon_lat_to_tile_xy, node_stable_id_str, seg_stable_id_str, xyz_to_tile_id};
 
 // ── Batch sizes ───────────────────────────────────────────────────────────────
 
@@ -74,9 +74,9 @@ struct WayRecord {
 struct LmEdge {
     edge_idx: u32,
     split_idx: u32,
-    start_gers: [u8; 16],
-    end_gers: [u8; 16],
-    parent_gers: [u8; 16],
+    start_id: [u8; 16],
+    end_id: [u8; 16],
+    parent_id: [u8; 16],
     geom: Vec<(i32, i32)>,
     length_cm: u32,
     frc: u8,
@@ -92,16 +92,16 @@ struct LmIntraTile {
 }
 
 struct LmCrossTile {
-    from_gers: [u8; 16],
+    from_id: String,
     via_node_local: u32,
-    to_gers: [u8; 16],
+    to_id: String,
     flags: u8,
 }
 
 struct ResolvedRestriction {
-    from_gers: [u8; 16],
-    via_gers: [u8; 16],
-    to_gers: [u8; 16],
+    from_id: [u8; 16],
+    via_id: [u8; 16],
+    to_id: [u8; 16],
     flags: u8,
     from_edge_idx: u32,
     to_edge_idx: u32,
@@ -146,8 +146,8 @@ fn blob_to_node_ids(blob: &[u8]) -> Vec<i64> {
         .collect()
 }
 
-fn blob_to_gers(blob: &[u8]) -> [u8; 16] {
-    blob.try_into().expect("GERS blob must be 16 bytes")
+fn blob_to_id(blob: &[u8]) -> [u8; 16] {
+    blob.try_into().expect("ID blob must be 16 bytes")
 }
 
 // ── Tile payload building (mirrors tile.rs; kept here to avoid cross-module coupling) ─
@@ -160,11 +160,11 @@ fn compute_tile_nodes_lm(edges: &[LmEdge]) -> (Vec<[u8; 16]>, HashMap<[u8; 16], 
     let mut order: Vec<[u8; 16]> = Vec::new();
     let mut index: HashMap<[u8; 16], u32> = HashMap::new();
     for e in edges {
-        for &gers in &[e.start_gers, e.end_gers] {
-            if !index.contains_key(&gers) {
+        for &nid in &[e.start_id, e.end_id] {
+            if !index.contains_key(&nid) {
                 let i = order.len() as u32;
-                order.push(gers);
-                index.insert(gers, i);
+                order.push(nid);
+                index.insert(nid, i);
             }
         }
     }
@@ -182,23 +182,58 @@ fn build_lm_tile_payload(
     intra: &[LmIntraTile],
     cross: &[LmCrossTile],
 ) -> Vec<u8> {
-    let segment_count    = edges.len() as u32;
-    let node_count       = node_order.len() as u32;
+    let segment_count      = edges.len() as u32;
+    let node_count         = node_order.len() as u32;
     let restriction_count  = intra.len() as u32;
     let xrestriction_count = cross.len() as u32;
 
-    let mut geom_pool:     Vec<(i32, i32)> = Vec::new();
-    let mut seg_records:   Vec<[u8; 32]>   = Vec::with_capacity(edges.len());
-    let mut seg_gers_ids:  Vec<[u8; 16]>   = Vec::with_capacity(edges.len());
+    // ── Build string pool ────────────────────────────────────────────────────────
+    let mut string_pool: Vec<u8> = Vec::new();
 
-    for e in edges {
+    let mut seg_id_pool: Vec<(u32, u8)> = Vec::with_capacity(edges.len());
+    for e in edges.iter() {
+        let s = seg_stable_id_str(&e.parent_id, e.split_idx);
+        let off = string_pool.len() as u32;
+        let len = s.len().min(255) as u8;
+        string_pool.extend_from_slice(&s.as_bytes()[..len as usize]);
+        seg_id_pool.push((off, len));
+    }
+
+    let mut node_id_pool: Vec<(u32, u8)> = Vec::with_capacity(node_order.len());
+    for node_id in node_order.iter() {
+        let s = node_stable_id_str(node_id);
+        let off = string_pool.len() as u32;
+        let len = s.len().min(255) as u8;
+        string_pool.extend_from_slice(&s.as_bytes()[..len as usize]);
+        node_id_pool.push((off, len));
+    }
+
+    let mut cross_id_pool: Vec<(u32, u8, u32, u8)> = Vec::with_capacity(cross.len());
+    for r in cross.iter() {
+        let from_off = string_pool.len() as u32;
+        let from_len = r.from_id.len().min(255) as u8;
+        string_pool.extend_from_slice(&r.from_id.as_bytes()[..from_len as usize]);
+        let to_off = string_pool.len() as u32;
+        let to_len = r.to_id.len().min(255) as u8;
+        string_pool.extend_from_slice(&r.to_id.as_bytes()[..to_len as usize]);
+        cross_id_pool.push((from_off, from_len, to_off, to_len));
+    }
+
+    let string_pool_length = string_pool.len() as u32;
+
+    // ── Geometry pool and segment records ────────────────────────────────────────
+    let mut geom_pool:   Vec<(i32, i32)> = Vec::new();
+    let mut seg_records: Vec<[u8; 32]>   = Vec::with_capacity(edges.len());
+
+    for (local_idx, e) in edges.iter().enumerate() {
         let geom_offset = geom_pool.len() as u32;
         let geom_len    = e.geom.len() as u16;
         geom_pool.extend_from_slice(&e.geom);
 
-        let start_node = node_index[&e.start_gers];
-        let end_node   = node_index[&e.end_gers];
+        let start_node = node_index[&e.start_id];
+        let end_node   = node_index[&e.end_id];
         let packed     = pack_attrs_lm(e.frc, e.fow, e.direction);
+        let (sid_off, sid_len) = seg_id_pool[local_idx];
 
         let mut r = [0u8; 32];
         r[0..4].copy_from_slice(&start_node.to_le_bytes());
@@ -207,46 +242,51 @@ fn build_lm_tile_payload(
         r[12..14].copy_from_slice(&geom_len.to_le_bytes());
         r[14..18].copy_from_slice(&e.length_cm.to_le_bytes());
         r[18] = packed;
+        r[20..24].copy_from_slice(&sid_off.to_le_bytes());
+        r[24] = sid_len;
         seg_records.push(r);
-        seg_gers_ids.push(seg_stable_id(&e.parent_gers, e.split_idx));
     }
 
     let geom_vertex_count = geom_pool.len() as u32;
 
+    // ── Header (v3) ───────────────────────────────────────────────────────────────
     let mut hdr = [0u8; 40];
     hdr[0..4].copy_from_slice(b"OLRL");
-    hdr[4] = 2; // version 2: stable-id table present
+    hdr[4] = 3;
     hdr[8..12].copy_from_slice(&segment_count.to_le_bytes());
     hdr[12..16].copy_from_slice(&node_count.to_le_bytes());
     hdr[16..20].copy_from_slice(&restriction_count.to_le_bytes());
     hdr[20..24].copy_from_slice(&geom_vertex_count.to_le_bytes());
     hdr[24..28].copy_from_slice(&xrestriction_count.to_le_bytes());
+    hdr[28..32].copy_from_slice(&string_pool_length.to_le_bytes());
 
     let cap = 40
         + seg_records.len() * 32
-        + seg_gers_ids.len() * 16
         + geom_pool.len() * 8
         + node_order.len() * 28
         + intra.len() * 16
-        + cross.len() * 40;
+        + cross.len() * 16
+        + string_pool.len();
     let mut payload = Vec::with_capacity(cap);
 
     payload.extend_from_slice(&hdr);
-    for r in &seg_records   { payload.extend_from_slice(r); }
-    for g in &seg_gers_ids  { payload.extend_from_slice(g.as_slice()); }
+    for r in &seg_records { payload.extend_from_slice(r); }
     for (lon_e7, lat_e7) in &geom_pool {
         payload.extend_from_slice(&lon_e7.to_le_bytes());
         payload.extend_from_slice(&lat_e7.to_le_bytes());
     }
-    for gers in node_order {
-        let (lon_e7, lat_e7) = node_lookup.get(gers).copied().unwrap_or_else(|| {
-            warn!(gers = %hex::encode(gers), "node not found in lookup");
+    for (node_local_idx, node_id) in node_order.iter().enumerate() {
+        let (lon_e7, lat_e7) = node_lookup.get(node_id).copied().unwrap_or_else(|| {
+            warn!(id = %hex::encode(node_id), "node not found in lookup");
             (0, 0)
         });
-        let is_boundary = node_to_tile.get(gers) != Some(&(tile_x, tile_y));
+        let is_boundary = node_to_tile.get(node_id) != Some(&(tile_x, tile_y));
+        let (nid_off, nid_len) = node_id_pool[node_local_idx];
         payload.extend_from_slice(&lon_e7.to_le_bytes());
         payload.extend_from_slice(&lat_e7.to_le_bytes());
-        payload.extend_from_slice(gers.as_slice());
+        payload.extend_from_slice(&nid_off.to_le_bytes());
+        payload.push(nid_len);
+        payload.extend_from_slice(&[0u8; 11]);
         payload.push(u8::from(is_boundary));
         payload.extend_from_slice(&[0u8; 3]);
     }
@@ -257,13 +297,16 @@ fn build_lm_tile_payload(
         payload.push(r.flags);
         payload.extend_from_slice(&[0u8; 3]);
     }
-    for r in cross {
-        payload.extend_from_slice(&r.from_gers);
+    for (r, (from_off, from_len, to_off, to_len)) in cross.iter().zip(cross_id_pool.iter()) {
+        payload.extend_from_slice(&from_off.to_le_bytes());
+        payload.push(*from_len);
         payload.extend_from_slice(&r.via_node_local.to_le_bytes());
-        payload.extend_from_slice(&r.to_gers);
+        payload.extend_from_slice(&to_off.to_le_bytes());
+        payload.push(*to_len);
         payload.push(r.flags);
-        payload.extend_from_slice(&[0u8; 3]);
+        payload.push(0u8);
     }
+    payload.extend_from_slice(&string_pool);
     payload
 }
 
@@ -343,12 +386,12 @@ fn setup_duckdb(memory_mb_override: Option<u64>, temp_dir: &Path) -> Result<Conn
          CREATE TABLE node_coords (id BIGINT, lon DOUBLE, lat DOUBLE); \
          CREATE TABLE q_edges ( \
              edge_idx INTEGER, split_idx INTEGER, \
-             start_gers BLOB, end_gers BLOB, parent_gers BLOB, \
+             start_id BLOB, end_id BLOB, parent_id BLOB, \
              geom_blob BLOB, length_cm INTEGER, \
              frc INTEGER, fow INTEGER, direction INTEGER, \
              tile_x INTEGER, tile_y INTEGER, tile_id BIGINT); \
-         CREATE TABLE q_nodes (gers_id BLOB, lon_e7 INTEGER, lat_e7 INTEGER, tile_x INTEGER, tile_y INTEGER); \
-         CREATE TABLE restriction_triples (from_gers BLOB, via_gers BLOB, to_gers BLOB, flags INTEGER);",
+         CREATE TABLE q_nodes (node_id BLOB, lon_e7 INTEGER, lat_e7 INTEGER, tile_x INTEGER, tile_y INTEGER); \
+         CREATE TABLE restriction_triples (from_id BLOB, via_id BLOB, to_id BLOB, flags INTEGER);",
         threads = rayon::current_num_threads().min(8),
     ))
     .context("DuckDB schema")?;
@@ -801,7 +844,7 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
 
             if node_ids.len() < 2 { continue; }
 
-            let parent_gers = encode_way_id(way_id);
+            let parent_id = encode_way_id(way_id);
             let last = node_ids.len() - 1;
 
             let mut split_starts: Vec<usize> = vec![0];
@@ -841,8 +884,8 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
 
                 let start_nid  = node_ids[start_idx];
                 let end_nid    = node_ids[end_idx];
-                let start_gers = encode_node_id(start_nid);
-                let end_gers   = encode_node_id(end_nid);
+                let start_id = encode_node_id(start_nid);
+                let end_id   = encode_node_id(end_nid);
 
                 // Assign to the tile of the start node, and also to the tile of the
                 // end node if different.  This ensures A* can always find all segments
@@ -853,7 +896,7 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
                 );
                 edge_app.append_row(params![
                     edge_idx as i64, split_idx as i64,
-                    start_gers.as_slice(), end_gers.as_slice(), parent_gers.as_slice(),
+                    start_id.as_slice(), end_id.as_slice(), parent_id.as_slice(),
                     geom_blob.as_slice(), length_cm as i64,
                     frc as i64, fow as i64, direction as i64,
                     stx as i64, sty as i64, xyz_to_tile_id(tile_zoom, stx, sty) as i64
@@ -861,7 +904,7 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
                 if (etx, ety) != (stx, sty) {
                     edge_app.append_row(params![
                         edge_idx as i64, split_idx as i64,
-                        start_gers.as_slice(), end_gers.as_slice(), parent_gers.as_slice(),
+                        start_id.as_slice(), end_id.as_slice(), parent_id.as_slice(),
                         geom_blob.as_slice(), length_cm as i64,
                         frc as i64, fow as i64, direction as i64,
                         etx as i64, ety as i64, xyz_to_tile_id(tile_zoom, etx, ety) as i64
@@ -870,16 +913,16 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
                 split_idx += 1;
                 edge_idx += 1;
 
-                for (ngers, (nlon, nlat)) in [
-                    (start_gers, geom_f64[0]),
-                    (end_gers,   *geom_f64.last().unwrap()),
+                for (nid, (nlon, nlat)) in [
+                    (start_id, geom_f64[0]),
+                    (end_id,   *geom_f64.last().unwrap()),
                 ] {
-                    if seen_nodes.insert(ngers) {
+                    if seen_nodes.insert(nid) {
                         let lon_e7 = quantize_coord(nlon);
                         let lat_e7 = quantize_coord(nlat);
                         let (ntx, nty) = lon_lat_to_tile_xy(nlon, nlat, tile_zoom);
                         node_app.append_row(params![
-                            ngers.as_slice(), lon_e7, lat_e7,
+                            nid.as_slice(), lon_e7, lat_e7,
                             ntx as i64, nty as i64
                         ]).context("append q_node")?;
                     }
@@ -923,12 +966,12 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
         let from_way: i64 = row.get(0)?;
         let via_node: i64 = row.get(1)?;
         let to_way:   i64 = row.get(2)?;
-        let from_gers = encode_way_id(from_way);
-        let via_gers  = encode_node_id(via_node);
-        let to_gers   = encode_way_id(to_way);
+        let from_id = encode_way_id(from_way);
+        let via_id  = encode_node_id(via_node);
+        let to_id   = encode_way_id(to_way);
         let flags     = encode_restriction_flags(HEADING_ANY, HEADING_ANY);
         restr_stmt.execute(params![
-            from_gers.as_slice(), via_gers.as_slice(), to_gers.as_slice(), flags as i64
+            from_id.as_slice(), via_id.as_slice(), to_id.as_slice(), flags as i64
         ])?;
         restr_count += 1;
     }
@@ -938,9 +981,9 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
     // Indexes for the tile stage.
     conn.execute_batch(
         "CREATE INDEX idx_q_edges_tile ON q_edges(tile_x, tile_y); \
-         CREATE INDEX idx_q_edges_from ON q_edges(parent_gers, end_gers); \
-         CREATE INDEX idx_q_edges_to   ON q_edges(parent_gers, start_gers); \
-         CREATE INDEX idx_q_nodes_gers ON q_nodes(gers_id);"
+         CREATE INDEX idx_q_edges_from ON q_edges(parent_id, end_id); \
+         CREATE INDEX idx_q_edges_to   ON q_edges(parent_id, start_id); \
+         CREATE INDEX idx_q_nodes ON q_nodes(node_id);"
     )
     .context("adapt stage indexes")?;
 
@@ -985,18 +1028,18 @@ pub(crate) fn tile_from_duckdb(
     let mut node_to_tile: HashMap<[u8; 16], (u32, u32)>  = HashMap::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT gers_id, lon_e7, lat_e7, tile_x, tile_y FROM q_nodes"
+            "SELECT node_id, lon_e7, lat_e7, tile_x, tile_y FROM q_nodes"
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let blob: Vec<u8> = row.get(0)?;
-            let gers = blob_to_gers(&blob);
+            let nid = blob_to_id(&blob);
             let lon_e7: i32 = row.get(1)?;
             let lat_e7: i32 = row.get(2)?;
             let tile_x: u32 = row.get::<_, i64>(3)? as u32;
             let tile_y: u32 = row.get::<_, i64>(4)? as u32;
-            node_lookup.insert(gers, (lon_e7, lat_e7));
-            node_to_tile.insert(gers, (tile_x, tile_y));
+            node_lookup.insert(nid, (lon_e7, lat_e7));
+            node_to_tile.insert(nid, (tile_x, tile_y));
         }
     }
     info!(nodes = node_lookup.len(), "node_lookup loaded");
@@ -1008,7 +1051,7 @@ pub(crate) fn tile_from_duckdb(
     let mut edge_split_idx: HashMap<u32, u32> = HashMap::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT edge_idx, split_idx, start_gers, end_gers, parent_gers, tile_id FROM q_edges"
+            "SELECT edge_idx, split_idx, start_id, end_id, parent_id, tile_id FROM q_edges"
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -1019,16 +1062,16 @@ pub(crate) fn tile_from_duckdb(
             let parent_blob: Vec<u8> = row.get(4)?;
             let tile_id: u64 = row.get::<_, i64>(5)? as u64;
 
-            let start_gers  = blob_to_gers(&start_blob);
-            let end_gers    = blob_to_gers(&end_blob);
-            let parent_gers = blob_to_gers(&parent_blob);
+            let start_id  = blob_to_id(&start_blob);
+            let end_id    = blob_to_id(&end_blob);
+            let parent_id = blob_to_id(&parent_blob);
 
             seen_tile_ids.insert(tile_id);
 
             // Same edge may appear twice (start tile + end tile); HashMap insert is
-            // idempotent here since both rows carry identical (parent_gers, end/start_gers).
-            from_edge_map.insert((parent_gers, end_gers),   edge_idx);
-            to_edge_map.insert(  (parent_gers, start_gers), edge_idx);
+            // idempotent here since both rows carry identical (parent_id, end/start_id).
+            from_edge_map.insert((parent_id, end_id),   edge_idx);
+            to_edge_map.insert(  (parent_id, start_id), edge_idx);
             edge_split_idx.insert(edge_idx, split_idx);
         }
     }
@@ -1041,7 +1084,7 @@ pub(crate) fn tile_from_duckdb(
     let mut resolved: Vec<ResolvedRestriction> = Vec::new();
     let mut n_skipped = 0usize;
     {
-        let mut stmt = conn.prepare("SELECT from_gers, via_gers, to_gers, flags FROM restriction_triples")?;
+        let mut stmt = conn.prepare("SELECT from_id, via_id, to_id, flags FROM restriction_triples")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let from_blob: Vec<u8> = row.get(0)?;
@@ -1049,24 +1092,24 @@ pub(crate) fn tile_from_duckdb(
             let to_blob:   Vec<u8> = row.get(2)?;
             let flags: u8          = row.get::<_, i64>(3)? as u8;
 
-            let from_gers = blob_to_gers(&from_blob);
-            let via_gers  = blob_to_gers(&via_blob);
-            let to_gers   = blob_to_gers(&to_blob);
+            let from_id = blob_to_id(&from_blob);
+            let via_id  = blob_to_id(&via_blob);
+            let to_id   = blob_to_id(&to_blob);
 
-            let from_edge_idx = match from_edge_map.get(&(from_gers, via_gers)) {
+            let from_edge_idx = match from_edge_map.get(&(from_id, via_id)) {
                 Some(&i) => i, None => { n_skipped += 1; continue; }
             };
-            let to_edge_idx = match to_edge_map.get(&(to_gers, via_gers)) {
+            let to_edge_idx = match to_edge_map.get(&(to_id, via_id)) {
                 Some(&i) => i, None => { n_skipped += 1; continue; }
             };
-            let (via_tile_x, via_tile_y) = match node_to_tile.get(&via_gers) {
+            let (via_tile_x, via_tile_y) = match node_to_tile.get(&via_id) {
                 Some(&t) => t, None => { n_skipped += 1; continue; }
             };
             let from_split_idx = edge_split_idx.get(&from_edge_idx).copied().unwrap_or(0);
             let to_split_idx   = edge_split_idx.get(&to_edge_idx).copied().unwrap_or(0);
 
             resolved.push(ResolvedRestriction {
-                from_gers, via_gers, to_gers, flags,
+                from_id, via_id, to_id, flags,
                 from_edge_idx, to_edge_idx,
                 from_split_idx, to_split_idx,
                 via_tile_x, via_tile_y,
@@ -1100,7 +1143,7 @@ pub(crate) fn tile_from_duckdb(
 
     {
         let mut stmt = conn.prepare(
-            "SELECT edge_idx, split_idx, start_gers, end_gers, parent_gers, geom_blob, length_cm, \
+            "SELECT edge_idx, split_idx, start_id, end_id, parent_id, geom_blob, length_cm, \
                     frc, fow, direction, tile_x, tile_y, tile_id \
              FROM q_edges ORDER BY tile_id, edge_idx"
         ).context("prepare tiling scan")?;
@@ -1138,9 +1181,9 @@ pub(crate) fn tile_from_duckdb(
             cur_edges.push(LmEdge {
                 edge_idx,
                 split_idx,
-                start_gers:  blob_to_gers(&start),
-                end_gers:    blob_to_gers(&end),
-                parent_gers: blob_to_gers(&parent),
+                start_id:  blob_to_id(&start),
+                end_id:    blob_to_id(&end),
+                parent_id: blob_to_id(&parent),
                 geom:        blob_to_geom(&geom),
                 length_cm:   len_cm,
                 frc, fow, direction: dir,
@@ -1192,7 +1235,7 @@ fn flush_tile(
             .collect();
 
         for r in restrs {
-            let Some(&via_node_local) = node_index.get(&r.via_gers) else { continue };
+            let Some(&via_node_local) = node_index.get(&r.via_id) else { continue };
 
             // A restriction is intra-tile iff both its from and to edges are in this tile.
             let is_intra = local_for_edge.contains_key(&r.from_edge_idx)
@@ -1207,9 +1250,9 @@ fn flush_tile(
                 }
             } else {
                 cross.push(LmCrossTile {
-                    from_gers: seg_stable_id(&r.from_gers, r.from_split_idx),
+                    from_id: seg_stable_id_str(&r.from_id, r.from_split_idx),
                     via_node_local,
-                    to_gers: seg_stable_id(&r.to_gers, r.to_split_idx),
+                    to_id: seg_stable_id_str(&r.to_id, r.to_split_idx),
                     flags: r.flags,
                 });
             }

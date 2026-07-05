@@ -22,7 +22,7 @@
 //! const result = JSON.parse(dec.decode());
 //! if (result.ok) {
 //!     console.log(result.wkt);          // "LINESTRING (...)"
-//!     console.log(result.segments);     // [{ frc, fow, osm_way_id }, ...]
+//!     console.log(result.segments);     // [{ frc, fow, stable_id }, ...]
 //! }
 //! ```
 
@@ -79,9 +79,8 @@ struct SegmentInfo {
     direction: &'static str,
     /// Segment length in metres (precomputed; not re-derived from geometry).
     length_m: f64,
-    /// OSM way ID, present when the tile was built from OSM data.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    osm_way_id: Option<i64>,
+    /// Opaque stable identifier supplied by the tile provider.
+    stable_id: String,
     /// Source tile key, e.g. `"12/2135/1425"`.  Used by the UI to highlight the segment.
     tile: String,
     /// Segment's index within its source tile (matches the GeoJSON `local_index` property).
@@ -387,7 +386,7 @@ impl Decoder {
                                     Direction::Backward => "Backward",
                                 },
                                 length_m: (seg.length_m * 10.0).round() / 10.0,
-                                osm_way_id: seg.osm_way_id(),
+                                stable_id: seg.stable_id.clone(),
                                 tile,
                                 local_index,
                                 segment_id: seg_id.0,
@@ -617,7 +616,7 @@ impl Decoder {
                     .unwrap_or_else(|| ("unknown".to_string(), 0));
                 serde_json::json!({
                     "segment_id": segment_id,
-                    "source_key": segment_source_key(&seg.stable_id),
+                    "stable_id":  seg.stable_id,
                     "frc": seg.frc,
                     "fow": seg.fow,
                     "direction": match seg.direction {
@@ -641,7 +640,7 @@ impl Decoder {
     /// Results are sorted by distance and capped at 20.  Caps radius at 500 m.
     pub fn get_segments_near(&self, lat: f64, lon: f64, radius_m: f64) -> String {
         let cap = radius_m.min(500.0);
-        let mut hits: Vec<(f64, u32, u8, u8, &'static str, f64, Option<String>)> = self.loader.graph.segments.iter()
+        let mut hits: Vec<(f64, u32, u8, u8, &'static str, f64, String)> = self.loader.graph.segments.iter()
             .filter_map(|(seg_id, seg)| {
                 let min_dist = seg.geometry.iter()
                     .map(|&(slon, slat)| haversine_m(slon, slat, lon, lat))
@@ -652,17 +651,17 @@ impl Decoder {
                         Direction::Forward  => "Forward",
                         Direction::Backward => "Backward",
                     };
-                    Some((min_dist, seg_id.0, seg.frc, seg.fow, dir_str, seg.length_m, segment_source_key(&seg.stable_id)))
+                    Some((min_dist, seg_id.0, seg.frc, seg.fow, dir_str, seg.length_m, seg.stable_id.clone()))
                 } else {
                     None
                 }
             })
             .collect();
         hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let segments: Vec<serde_json::Value> = hits.iter().take(20).map(|(dist, id, frc, fow, dir, len, src_key)| {
+        let segments: Vec<serde_json::Value> = hits.iter().take(20).map(|(dist, id, frc, fow, dir, len, stable_id)| {
             serde_json::json!({
                 "segment_id":  id,
-                "source_key":  src_key,
+                "stable_id":   stable_id,
                 "frc":         frc,
                 "fow":         fow,
                 "direction":   dir,
@@ -727,7 +726,7 @@ impl Decoder {
 
                 entries.push(serde_json::json!({
                     "segment_id":            other_id.0,
-                    "source_key":            segment_source_key(&other.stable_id),
+                    "stable_id":             other.stable_id,
                     "frc":                   other.frc,
                     "fow":                   other.fow,
                     "direction":             dir_str,
@@ -930,7 +929,7 @@ impl Decoder {
                         Direction::Backward => "Backward",
                     },
                     length_m: (seg.length_m * 10.0).round() / 10.0,
-                    osm_way_id: seg.osm_way_id(),
+                    stable_id: seg.stable_id.clone(),
                     tile,
                     local_index,
                     segment_id: seg_id.0,
@@ -1012,23 +1011,6 @@ impl Decoder {
 }
 
 // ── Segment source-key helper ─────────────────────────────────────────────────
-
-/// Decode the human-readable source key from a segment's `stable_id`.
-///
-/// Layout (matching tileDecoder.js and the tile build pipeline):
-///   bytes  0–7:  source integer (i64 LE) — OSM way id or similar
-///   bytes  8–11: split index (u32 LE)    — 0 for unsplit segments
-///   bytes 12–15: 0x00 for integer ids; non-zero for full GERS UUIDs
-///
-/// Returns `"{source_int}-{split_idx}"` for integer ids, `None` for GERS UUIDs and
-/// all-zero synthetic ids.
-fn segment_source_key(stable_id: &[u8; 16]) -> Option<String> {
-    if stable_id[12..16] != [0u8; 4] { return None; }
-    let source_int = i64::from_le_bytes(stable_id[0..8].try_into().unwrap());
-    if source_int == 0 { return None; }
-    let split_idx = u32::from_le_bytes(stable_id[8..12].try_into().unwrap());
-    Some(format!("{source_int}-{split_idx}"))
-}
 
 // ── Param merge helper ────────────────────────────────────────────────────────
 

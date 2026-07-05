@@ -354,7 +354,7 @@ export default function ResultPanel() {
                                 setHighlightedSegment(nowActive ? { tile: s.tile, local_index: s.local_index } : null);
                                 if (nowActive) requestInfoSegment(s.tile, s.local_index);
                               }}
-                            >{s.source_id ?? s.segment_id ?? i + 1}</button>
+                            >{s.stable_id ?? s.segment_id ?? i + 1}</button>
                           </td>
                           <td>{FRC_NAMES[s.frc] ?? s.frc}</td>
                           <td>{FOW_NAMES[s.fow] ?? s.fow}</td>

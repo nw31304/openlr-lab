@@ -6,7 +6,7 @@ use crate::schema::SchemaMapping;
 use openlr_graph::Direction;
 
 pub struct AdaptedSegment {
-    pub gers_id: String,
+    pub stable_id: String,
     pub geometry: Vec<(f64, f64)>,
     /// Sorted ascending by `at` position.
     pub connectors: Vec<ConnectorRef>,
@@ -55,7 +55,7 @@ fn adapt_one(seg: OvertureSegment, schema: &SchemaMapping) -> AdaptedSegment {
     });
 
     AdaptedSegment {
-        gers_id: seg.id,
+        stable_id: seg.id,
         geometry: seg.geometry,
         connectors,
         frc,

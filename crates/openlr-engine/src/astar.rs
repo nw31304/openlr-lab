@@ -290,7 +290,7 @@ mod tests {
     use crate::params::DecodeParams;
 
     fn node(id: u32, lon: f64, lat: f64) -> NetworkNode {
-        NetworkNode { id: NodeId(id), lon, lat, stable_id: [0;16], is_boundary: false }
+        NetworkNode { id: NodeId(id), lon, lat, stable_id: String::new(), is_boundary: false }
     }
     fn seg(id: u32, s: u32, e: u32, len: f64) -> NetworkSegment {
         NetworkSegment {
@@ -301,7 +301,7 @@ mod tests {
             length_m: len,
             frc: 3, fow: 3,
             direction: Direction::Both,
-            stable_id: [0u8; 16],
+            stable_id: String::new(),
         }
     }
     fn cand(seg_id: u32, entry: u32, exit: u32) -> ScoredCandidate {

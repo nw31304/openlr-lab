@@ -46,7 +46,7 @@ pub enum ProviderError {
 /// Reads tiles on demand from a `.pmtiles` archive, building an in-memory `Graph`.
 ///
 /// On first access to an area, the 3×3 tile neighbourhood is loaded and merged.
-/// Boundary nodes are stitched by GERS ID across tiles.
+/// Boundary nodes are stitched by stable ID across tiles.
 pub struct PmtilesProvider {
     reader: PmtilesReader,
     loader: TileLoader,

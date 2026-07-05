@@ -26,13 +26,13 @@ use crate::tile::lon_lat_to_tile_xy;
 
 // ── ID encoding (mirrors generic_extract.rs, private here) ───────────────────
 
-fn segment_gers(id: i64) -> [u8; 16] {
+fn segment_id_bytes(id: i64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[0..8].copy_from_slice(&(id as u64).to_le_bytes());
     b
 }
 
-fn node_gers(id: i64) -> [u8; 16] {
+fn node_id_bytes(id: i64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[8..16].copy_from_slice(&(id as u64).to_le_bytes());
     b
@@ -58,12 +58,12 @@ fn setup_duckdb(memory_mb_override: Option<u64>, temp_dir: &Path) -> Result<Conn
          SET preserve_insertion_order=false; \
          CREATE TABLE q_edges ( \
              edge_idx INTEGER, \
-             start_gers BLOB, end_gers BLOB, parent_gers BLOB, \
+             start_id BLOB, end_id BLOB, parent_id BLOB, \
              geom_blob BLOB, length_cm INTEGER, \
              frc INTEGER, fow INTEGER, direction INTEGER, \
              tile_x INTEGER, tile_y INTEGER, tile_id BIGINT); \
-         CREATE TABLE q_nodes (gers_id BLOB, lon_e7 INTEGER, lat_e7 INTEGER, tile_x INTEGER, tile_y INTEGER); \
-         CREATE TABLE restriction_triples (from_gers BLOB, via_gers BLOB, to_gers BLOB, flags INTEGER);",
+         CREATE TABLE q_nodes (node_id BLOB, lon_e7 INTEGER, lat_e7 INTEGER, tile_x INTEGER, tile_y INTEGER); \
+         CREATE TABLE restriction_triples (from_id BLOB, via_id BLOB, to_id BLOB, flags INTEGER);",
         threads = rayon::current_num_threads().min(8),
     ))
     .context("DuckDB schema")?;
@@ -74,9 +74,9 @@ fn setup_duckdb(memory_mb_override: Option<u64>, temp_dir: &Path) -> Result<Conn
 // ── Edge batch ────────────────────────────────────────────────────────────────
 
 struct EdgeBatch {
-    start_gers: [u8; 16],
-    end_gers:   [u8; 16],
-    parent_gers:[u8; 16],
+    start_id: [u8; 16],
+    end_id:   [u8; 16],
+    parent_id:[u8; 16],
     geom:       Vec<(i32, i32)>,    // quantized (lon_e7, lat_e7) vertices
     length_cm:  u32,
     frc:        u8,
@@ -158,9 +158,9 @@ fn parse_line(
     seg_to_to_int.insert(id, to_int);
 
     Ok(Some(EdgeBatch {
-        start_gers:  node_gers(from_int),
-        end_gers:    node_gers(to_int),
-        parent_gers: segment_gers(id),
+        start_id:  node_id_bytes(from_int),
+        end_id:    node_id_bytes(to_int),
+        parent_id: segment_id_bytes(id),
         geom,
         length_cm,
         frc:       frc_raw.clamp(0, 7) as u8,
@@ -202,20 +202,20 @@ fn process_geojsonl_file(
                 let (slon_e7, slat_e7) = e.geom[0];
                 let (elon_e7, elat_e7) = *e.geom.last().unwrap();
 
-                if seen_nodes.insert(e.start_gers) {
+                if seen_nodes.insert(e.start_id) {
                     let (tx, ty) = lon_lat_to_tile_xy(
                         slon_e7 as f64 / 1e7, slat_e7 as f64 / 1e7, tile_zoom,
                     );
                     node_app.append_row(params![
-                        &e.start_gers[..], slon_e7, slat_e7, tx as i64, ty as i64
+                        &e.start_id[..], slon_e7, slat_e7, tx as i64, ty as i64
                     ]).context("append q_node")?;
                 }
-                if seen_nodes.insert(e.end_gers) {
+                if seen_nodes.insert(e.end_id) {
                     let (tx, ty) = lon_lat_to_tile_xy(
                         elon_e7 as f64 / 1e7, elat_e7 as f64 / 1e7, tile_zoom,
                     );
                     node_app.append_row(params![
-                        &e.end_gers[..], elon_e7, elat_e7, tx as i64, ty as i64
+                        &e.end_id[..], elon_e7, elat_e7, tx as i64, ty as i64
                     ]).context("append q_node")?;
                 }
 
@@ -228,7 +228,7 @@ fn process_geojsonl_file(
                 let geom_blob = geom_to_blob(&e.geom);
                 edge_app.append_row(params![
                     *edge_idx as i64,
-                    &e.start_gers[..], &e.end_gers[..], &e.parent_gers[..],
+                    &e.start_id[..], &e.end_id[..], &e.parent_id[..],
                     geom_blob.as_slice(), e.length_cm as i64,
                     e.frc as i64, e.fow as i64, e.direction as i64,
                     stx as i64, sty as i64,
@@ -237,7 +237,7 @@ fn process_geojsonl_file(
                 if (etx, ety) != (stx, sty) {
                     edge_app.append_row(params![
                         *edge_idx as i64,
-                        &e.start_gers[..], &e.end_gers[..], &e.parent_gers[..],
+                        &e.start_id[..], &e.end_id[..], &e.parent_id[..],
                         geom_blob.as_slice(), e.length_cm as i64,
                         e.frc as i64, e.fow as i64, e.direction as i64,
                         etx as i64, ety as i64,
@@ -376,12 +376,12 @@ fn load_restrictions(
                 }
             };
 
-            // Encode: from is a segment GERS, via is a node GERS, to is a segment GERS.
-            let from_gers = segment_gers(from_id);
-            let via_gers  = node_gers(via_node_id);
-            let to_gers   = segment_gers(to_id);
+            // Encode binary IDs: from/to are segment IDs, via is a node ID.
+            let from_id = segment_id_bytes(from_id);
+            let via_id  = node_id_bytes(via_node_id);
+            let to_id   = segment_id_bytes(to_id);
 
-            stmt.execute(params![&from_gers[..], &via_gers[..], &to_gers[..]])
+            stmt.execute(params![&from_id[..], &via_id[..], &to_id[..]])
                 .context("INSERT restriction")?;
             count += 1;
         }

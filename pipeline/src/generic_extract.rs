@@ -14,19 +14,19 @@ use crate::split::{haversine_m, NodeRecord, SplitEdge};
 
 // ── ID encoding ───────────────────────────────────────────────────────────────
 
-/// Segment integer ID → 16-byte GERS-compatible ID.
+/// Segment integer ID → 16-byte internal binary key.
 /// Layout: (id as u64 LE)[0..8] || [0u8; 8]
-/// Disjoint from node IDs (which have zero first-half).
-fn segment_gers(id: i64) -> [u8; 16] {
+/// Disjoint from node keys (which have zero first-half).
+fn segment_id_bytes(id: i64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[0..8].copy_from_slice(&(id as u64).to_le_bytes());
     b
 }
 
-/// Node integer ID → 16-byte GERS-compatible ID.
+/// Node integer ID → 16-byte internal binary key.
 /// Layout: [0u8; 8] || (id as u64 LE)[0..8]
-/// Disjoint from segment IDs (which have zero second-half).
-fn node_gers(id: i64) -> [u8; 16] {
+/// Disjoint from segment keys (which have zero second-half).
+fn node_id_bytes(id: i64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[8..16].copy_from_slice(&(id as u64).to_le_bytes());
     b
@@ -111,28 +111,28 @@ fn parse_feature(
 
     seg_to_to_int.insert(id, to_int);
 
-    let start_gers = node_gers(from_int);
-    let end_gers   = node_gers(to_int);
-    let parent     = segment_gers(id);
+    let start_id = node_id_bytes(from_int);
+    let end_id   = node_id_bytes(to_int);
+    let parent   = segment_id_bytes(id);
 
     let edge = SplitEdge {
-        start_node_gers: start_gers,
-        end_node_gers:   end_gers,
-        geometry:        geometry.clone(),
+        start_node_id: start_id,
+        end_node_id:   end_id,
+        geometry:      geometry.clone(),
         length_m,
         frc,
         fow,
         direction,
-        parent_gers_id:  parent,
+        parent_id:  parent,
         split_idx: 0,
     };
     let start_node = NodeRecord {
-        gers_id: start_gers,
+        node_id: start_id,
         lon: geometry[0].0,
         lat: geometry[0].1,
     };
     let end_node = NodeRecord {
-        gers_id: end_gers,
+        node_id: end_id,
         lon: geometry.last().unwrap().0,
         lat: geometry.last().unwrap().1,
     };
@@ -351,10 +351,10 @@ pub fn read_restrictions_csv(
         };
 
         out.push(RestrictionTriple {
-            from_segment_gers:  segment_gers(from_id),
-            via_connector_gers: node_gers(via_node_id),
-            to_segment_gers:    segment_gers(to_id),
-            flags:              0,
+            from_segment_id:  segment_id_bytes(from_id),
+            via_connector_id: node_id_bytes(via_node_id),
+            to_segment_id:    segment_id_bytes(to_id),
+            flags:            0,
         });
     }
 

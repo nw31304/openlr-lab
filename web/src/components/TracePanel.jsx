@@ -145,7 +145,7 @@ function Section({ title, badge, badgeOk, defaultOpen = true, children }) {
 // ── Segment highlight button ──────────────────────────────────────────────────
 
 function SegBtn({ segId, setTraceHighlight, onSelect }) {
-  const sourceKey = getSegGeomCache().get(segId)?.properties?.source_id ?? null;
+  const sourceKey = getSegGeomCache().get(segId)?.properties?.stable_id ?? null;
   const label = sourceKey != null ? sourceKey : segId;
   return (
     <button
@@ -173,7 +173,7 @@ function buildCandPopup(segId, lrpIdx, traversal, ctype, winner, snapPt, project
   return {
     lrp_idx:      lrpIdx,
     segment_id:   segId,
-    source_id:    feat?.properties?.source_id ?? null,
+    stable_id:    feat?.properties?.stable_id ?? null,
     traversal,
     ctype,
     winner:       winner ?? false,

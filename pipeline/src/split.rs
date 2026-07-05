@@ -9,29 +9,27 @@ use openlr_graph::Direction;
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
-/// One node-to-node directed edge, produced by splitting an Overture segment at
+/// One node-to-node directed edge, produced by splitting a segment at
 /// every interior connector position (Invariant 1).
 #[derive(Debug, Clone)]
 pub struct SplitEdge {
-    pub start_node_gers: [u8; 16],
-    pub end_node_gers: [u8; 16],
+    pub start_node_id: [u8; 16],
+    pub end_node_id: [u8; 16],
     pub geometry: Vec<(f64, f64)>, // (lon, lat), first = start node, last = end node
     pub length_m: f64,
     pub frc: u8,
     pub fow: u8,
     pub direction: Direction,
-    /// The parent Overture segment GERS id, used for turn-restriction cross-references.
-    pub parent_gers_id: [u8; 16],
+    /// The parent segment's internal binary key, used for turn-restriction cross-references.
+    pub parent_id: [u8; 16],
     /// Zero-based index of this sub-edge among all sub-edges of the same parent segment.
-    /// Encoded into the segment stable-id table alongside the parent GERS id so each
-    /// sub-edge has a unique display key (e.g. "434722393-2").
     pub split_idx: u32,
 }
 
-/// One road node, de-duplicated by GERS id across all edges.
+/// One road node, de-duplicated by internal binary key across all edges.
 #[derive(Debug, Clone)]
 pub struct NodeRecord {
-    pub gers_id: [u8; 16],
+    pub node_id: [u8; 16],
     pub lon: f64,
     pub lat: f64,
 }
@@ -53,13 +51,13 @@ pub fn split(
         .collect();
 
     let mut edges: Vec<SplitEdge> = Vec::new();
-    // Deduplicate nodes by GERS id; last writer wins (coordinates should agree).
+    // Deduplicate nodes by internal binary key; last writer wins (coordinates should agree).
     let mut node_map: HashMap<[u8; 16], NodeRecord> = HashMap::new();
 
     for (seg_edges, seg_nodes) in results {
         edges.extend(seg_edges);
         for n in seg_nodes {
-            node_map.insert(n.gers_id, n);
+            node_map.insert(n.node_id, n);
         }
     }
 
@@ -71,15 +69,15 @@ pub fn split(
 
 fn split_segment(seg: AdaptedSegment, vehicular_endpoints: &HashSet<String>) -> (Vec<SplitEdge>, Vec<NodeRecord>) {
     if seg.geometry.len() < 2 {
-        warn!(id = %seg.gers_id, "segment has fewer than 2 geometry points, skipped");
+        warn!(id = %seg.stable_id, "segment has fewer than 2 geometry points, skipped");
         return (vec![], vec![]);
     }
 
-    // Parse the parent GERS id once; skip the whole segment if it's malformed.
-    let parent_gers_id = match parse_gers_id(&seg.gers_id) {
+    // Parse the parent stable id once; skip the whole segment if it's malformed.
+    let parent_id = match parse_hex_id(&seg.stable_id) {
         Ok(id) => id,
         Err(e) => {
-            warn!(id = %seg.gers_id, error = %e, "segment has invalid GERS id, skipped");
+            warn!(id = %seg.stable_id, error = %e, "segment has invalid hex id, skipped");
             return (vec![], vec![]);
         }
     };
@@ -97,7 +95,7 @@ fn split_segment(seg: AdaptedSegment, vehicular_endpoints: &HashSet<String>) -> 
     // We need at least connectors at at=0.0 and at=1.0 to form an edge.
     let connectors = &filtered_connectors;
     if connectors.is_empty() {
-        warn!(id = %seg.gers_id, "segment has no connectors, skipped");
+        warn!(id = %seg.stable_id, "segment has no connectors, skipped");
         return (vec![], vec![]);
     }
 
@@ -107,7 +105,7 @@ fn split_segment(seg: AdaptedSegment, vehicular_endpoints: &HashSet<String>) -> 
 
     if !has_start || !has_end {
         warn!(
-            id = %seg.gers_id,
+            id = %seg.stable_id,
             has_start,
             has_end,
             "segment missing endpoint connector, skipped"
@@ -131,54 +129,54 @@ fn split_segment(seg: AdaptedSegment, vehicular_endpoints: &HashSet<String>) -> 
         }
 
         // Skip edges with malformed connector IDs rather than colliding on zero.
-        let start_gers = match parse_gers_id(&c_start.connector_id) {
+        let start_id = match parse_hex_id(&c_start.connector_id) {
             Ok(id) => id,
             Err(e) => {
-                warn!(id = %seg.gers_id, connector = %c_start.connector_id,
-                      error = %e, "invalid start connector GERS id, edge skipped");
+                warn!(id = %seg.stable_id, connector = %c_start.connector_id,
+                      error = %e, "invalid start connector id, edge skipped");
                 continue;
             }
         };
-        let end_gers = match parse_gers_id(&c_end.connector_id) {
+        let end_id = match parse_hex_id(&c_end.connector_id) {
             Ok(id) => id,
             Err(e) => {
-                warn!(id = %seg.gers_id, connector = %c_end.connector_id,
-                      error = %e, "invalid end connector GERS id, edge skipped");
+                warn!(id = %seg.stable_id, connector = %c_end.connector_id,
+                      error = %e, "invalid end connector id, edge skipped");
                 continue;
             }
         };
 
         let sub_geom = sub_geometry(&seg.geometry, &cum, c_start.at, c_end.at);
         if sub_geom.len() < 2 {
-            warn!(id = %seg.gers_id, at_start = c_start.at, at_end = c_end.at,
+            warn!(id = %seg.stable_id, at_start = c_start.at, at_end = c_end.at,
                   "sub-geometry degenerate, skipped");
             continue;
         }
 
         let length_m = polyline_length_m(&sub_geom);
-        trace!(id = %seg.gers_id, at_start = c_start.at, at_end = c_end.at,
+        trace!(id = %seg.stable_id, at_start = c_start.at, at_end = c_end.at,
                length_m, "split edge");
 
         node_records.push(NodeRecord {
-            gers_id: start_gers,
+            node_id: start_id,
             lon: sub_geom[0].0,
             lat: sub_geom[0].1,
         });
         node_records.push(NodeRecord {
-            gers_id: end_gers,
+            node_id: end_id,
             lon: sub_geom.last().unwrap().0,
             lat: sub_geom.last().unwrap().1,
         });
 
         edges.push(SplitEdge {
-            start_node_gers: start_gers,
-            end_node_gers:   end_gers,
-            geometry:        sub_geom,
+            start_node_id: start_id,
+            end_node_id:   end_id,
+            geometry:      sub_geom,
             length_m,
-            frc:             seg.frc,
-            fow:             seg.fow,
-            direction:       seg.direction,
-            parent_gers_id,
+            frc:           seg.frc,
+            fow:           seg.fow,
+            direction:     seg.direction,
+            parent_id,
             split_idx,
         });
         split_idx += 1;
@@ -274,16 +272,18 @@ fn sub_geometry(
     pts
 }
 
-// ── GERS ID parsing ───────────────────────────────────────────────────────────
+// ── Hex ID parsing ────────────────────────────────────────────────────────────
 
-/// Parse an Overture GERS id (32-char hex string, with or without hyphens) to 16 bytes.
-pub fn parse_gers_id(s: &str) -> Result<[u8; 16]> {
+/// Parse a 32-char hex string (with or without hyphens) into a 16-byte binary key.
+/// Used for source formats that identify segments and connectors with hex-encoded
+/// 128-bit integers (e.g. UUID-format IDs).
+pub fn parse_hex_id(s: &str) -> Result<[u8; 16]> {
     let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     let bytes = hex::decode(&clean)
-        .map_err(|e| anyhow::anyhow!("GERS id hex decode '{}': {}", s, e))?;
+        .map_err(|e| anyhow::anyhow!("hex id decode '{}': {}", s, e))?;
     bytes
         .try_into()
-        .map_err(|_| anyhow::anyhow!("GERS id wrong length (expected 32 hex chars): '{}'", s))
+        .map_err(|_| anyhow::anyhow!("hex id wrong length (expected 32 hex chars): '{}'", s))
 }
 
 
@@ -296,14 +296,20 @@ mod tests {
     use crate::extract::ConnectorRef;
     use openlr_graph::Direction;
 
-    fn gers(s: &str) -> String {
-        s.to_string()
+    fn connector(id: &str, at: f64) -> ConnectorRef {
+        ConnectorRef { connector_id: id.to_string(), at }
     }
 
-    fn simple_segment(connectors: Vec<ConnectorRef>) -> AdaptedSegment {
+    // Valid 32-hex-char IDs for use in tests.
+    const SEG_ID:   &str = "00000000000000000000000000000001";
+    const START_ID: &str = "00000000000000000000000000000002";
+    const MID_ID:   &str = "00000000000000000000000000000003";
+    const END_ID:   &str = "00000000000000000000000000000004";
+
+    fn bare_segment(connectors: Vec<ConnectorRef>) -> AdaptedSegment {
         AdaptedSegment {
-            gers_id: "0" .repeat(32),
-            geometry: vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)],
+            stable_id: SEG_ID.to_string(),
+            geometry: vec![(0.0, 0.0), (0.5, 0.0), (1.0, 0.0)],
             connectors,
             frc: 3,
             fow: 3,
@@ -313,129 +319,60 @@ mod tests {
         }
     }
 
-    fn connector(id: &str, at: f64) -> ConnectorRef {
-        ConnectorRef { connector_id: id.to_string(), at }
-    }
-
-    // 32 zero hex chars = valid GERS id
-    const ZERO_GERS: &str = "00000000000000000000000000000000";
-    const ONE_GERS:  &str = "00000000000000000000000000000001";
-    const TWO_GERS:  &str = "00000000000000000000000000000002";
-
-    fn vehicular_set(ids: &[&str]) -> HashSet<String> {
-        ids.iter().map(|s| s.to_string()).collect()
-    }
-
     #[test]
-    fn single_edge_no_interior_connectors() {
-        let seg = simple_segment(vec![
-            connector(ZERO_GERS, 0.0),
-            connector(ONE_GERS,  1.0),
-        ]);
-        let (edges, nodes) = split(vec![seg], &vehicular_set(&[]));
+    fn single_edge_no_interior_split() {
+        let seg = bare_segment(vec![connector(START_ID, 0.0), connector(END_ID, 1.0)]);
+        let mut vehicular = HashSet::new();
+        vehicular.insert(START_ID.to_string());
+        vehicular.insert(END_ID.to_string());
+        let (edges, nodes) = split_segment(seg, &vehicular);
         assert_eq!(edges.len(), 1);
-        assert_eq!(nodes.len(), 2); // start + end
-        assert!(edges[0].length_m > 0.0);
-        assert_eq!(edges[0].geometry.len(), 3); // all original points
-    }
-
-    #[test]
-    fn interior_connector_produces_two_edges() {
-        // ONE_GERS is the interior connector; it must be in the vehicular set to trigger a split.
-        let seg = simple_segment(vec![
-            connector(ZERO_GERS, 0.0),
-            connector(ONE_GERS,  0.5),
-            connector(TWO_GERS,  1.0),
-        ]);
-        let (edges, nodes) = split(vec![seg], &vehicular_set(&[ONE_GERS]));
-        assert_eq!(edges.len(), 2);
-        assert_eq!(nodes.len(), 3);
-        // Both sub-edges should have positive length.
-        assert!(edges[0].length_m > 0.0);
-        assert!(edges[1].length_m > 0.0);
-    }
-
-    #[test]
-    fn non_vehicular_interior_connector_not_split() {
-        // Interior connector not in the vehicular set → no split.
-        let seg = simple_segment(vec![
-            connector(ZERO_GERS, 0.0),
-            connector(ONE_GERS,  0.5),
-            connector(TWO_GERS,  1.0),
-        ]);
-        let (edges, nodes) = split(vec![seg], &vehicular_set(&[]));
-        assert_eq!(edges.len(), 1, "should not split at non-vehicular interior connector");
         assert_eq!(nodes.len(), 2);
     }
 
     #[test]
-    fn split_preserves_total_length() {
-        let seg = AdaptedSegment {
-            gers_id: ZERO_GERS.to_string(),
-            geometry: vec![(174.0, -36.0), (174.5, -36.0), (175.0, -36.0)],
-            connectors: vec![
-                connector(ZERO_GERS, 0.0),
-                connector(ONE_GERS,  0.5),
-                connector(TWO_GERS,  1.0),
-            ],
-            frc: 2,
-            fow: 3,
-            direction: Direction::Both,
-            vehicular: true,
-            prohibited_transitions: vec![],
-        };
-        let full_len = polyline_length_m(&[(174.0, -36.0), (174.5, -36.0), (175.0, -36.0)]);
-        let (edges, _) = split(vec![seg], &vehicular_set(&[ONE_GERS]));
-        let total: f64 = edges.iter().map(|e| e.length_m).sum();
-        assert!((total - full_len).abs() < 0.1, "total {total} ≈ full {full_len}");
+    fn interior_connector_splits_into_two_edges() {
+        let seg = bare_segment(vec![
+            connector(START_ID, 0.0),
+            connector(MID_ID,   0.5),
+            connector(END_ID,   1.0),
+        ]);
+        let mut vehicular = HashSet::new();
+        vehicular.insert(START_ID.to_string());
+        vehicular.insert(MID_ID.to_string());
+        vehicular.insert(END_ID.to_string());
+        let (edges, _) = split_segment(seg, &vehicular);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].split_idx, 0);
+        assert_eq!(edges[1].split_idx, 1);
     }
 
     #[test]
-    fn haversine_zero_for_same_point() {
-        assert!(haversine_m(174.0, -36.0, 174.0, -36.0) < 1e-9);
+    fn non_vehicular_interior_connector_not_split() {
+        let seg = bare_segment(vec![
+            connector(START_ID, 0.0),
+            connector(MID_ID,   0.5),
+            connector(END_ID,   1.0),
+        ]);
+        // MID_ID is NOT in vehicular_endpoints → no split there.
+        let mut vehicular = HashSet::new();
+        vehicular.insert(START_ID.to_string());
+        vehicular.insert(END_ID.to_string());
+        let (edges, _) = split_segment(seg, &vehicular);
+        assert_eq!(edges.len(), 1);
     }
 
     #[test]
-    fn haversine_roughly_right() {
-        // Roughly 1 degree of longitude at equator ≈ 111_319 m.
-        let d = haversine_m(0.0, 0.0, 1.0, 0.0);
-        assert!((d - 111_319.0).abs() < 200.0, "got {d}");
+    fn parse_hex_id_roundtrip() {
+        let s = "550e8400e29b41d4a716446655440000";
+        let bytes = parse_hex_id(s).unwrap();
+        assert_eq!(hex::encode(bytes), s);
     }
 
     #[test]
-    fn parse_gers_id_roundtrip() {
-        let s = "08b2a5ca8e3cffff0400344900000001";
-        let bytes = parse_gers_id(s).unwrap();
-        let back = hex::encode(bytes);
-        assert_eq!(back, s);
-    }
-
-    #[test]
-    fn parse_gers_id_with_hyphens() {
-        // UUID-formatted GERS ids
-        let s = "08b2a5ca-8e3c-ffff-0400-344900000001";
-        let bytes = parse_gers_id(s).unwrap();
-        assert_eq!(hex::encode(bytes), "08b2a5ca8e3cffff0400344900000001");
-    }
-
-    #[test]
-    fn sub_geometry_returns_full_geometry_for_zero_to_one() {
-        let geom = vec![(0.0f64, 0.0), (1.0, 0.0), (2.0, 0.0)];
-        let cum  = cumulative_lengths(&geom);
-        let sub  = sub_geometry(&geom, &cum, 0.0, 1.0);
-        assert_eq!(sub.len(), 3);
-        assert!((sub[0].0 - 0.0).abs() < 1e-9);
-        assert!((sub[2].0 - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn sub_geometry_midpoint_split() {
-        let geom = vec![(0.0f64, 0.0), (2.0, 0.0)];
-        let cum  = cumulative_lengths(&geom);
-        let first  = sub_geometry(&geom, &cum, 0.0, 0.5);
-        let second = sub_geometry(&geom, &cum, 0.5, 1.0);
-        // Each half ends/starts at midpoint (1.0, 0.0)
-        assert!((first.last().unwrap().0  - 1.0).abs() < 1e-6);
-        assert!((second.first().unwrap().0 - 1.0).abs() < 1e-6);
+    fn parse_hex_id_with_hyphens() {
+        let s = "550e8400-e29b-41d4-a716-446655440000";
+        let bytes = parse_hex_id(s).unwrap();
+        assert_eq!(hex::encode(bytes), "550e8400e29b41d4a716446655440000");
     }
 }

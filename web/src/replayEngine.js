@@ -439,7 +439,7 @@ export function stateToGeoJSON(state, geomLookup) {
           fow_name:  feat.properties.fow_name ?? null,
           direction: feat.properties.direction ?? null,
           length_m:  feat.properties.length_m  ?? null,
-          source_id: feat.properties.source_id ?? null,
+          stable_id: feat.properties.stable_id ?? null,
         },
       }];
     }),

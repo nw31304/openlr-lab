@@ -431,10 +431,10 @@ export const useStore = create(persist(
           break;
         }
       }
-      // Enrich segments with source_id from tile geometry cache
+      // Enrich segments with stable_id from tile geometry cache
       for (const seg of result.segments ?? []) {
         const feat = _segGeomCache.get(seg.segment_id);
-        if (feat) seg.source_id = feat.properties.source_id ?? null;
+        if (feat) seg.stable_id = feat.properties.stable_id ?? null;
       }
 
       // Splice replay: candidate events from original trace, routing events from forced trace.
@@ -610,12 +610,12 @@ export const useStore = create(persist(
       }
       console.log(`[timing] segGeomCache build (${rawMappings.length} segs): ${(performance.now()-tCache0).toFixed(1)} ms`);
       console.log(`[segGeomCache] ${_segGeomCache.size}/${rawMappings.length} segments have geometry`);
-      // Enrich decoded segments with source_id from the tile geometry cache.
+      // Enrich decoded segments with stable_id from the tile geometry cache.
       for (const seg of result.segments ?? []) {
         const feat = _segGeomCache.get(seg.segment_id);
-        if (feat) seg.source_id = feat.properties.source_id ?? null;
+        if (feat) seg.stable_id = feat.properties.stable_id ?? null;
       }
-      console.log('[PATH] segments:', result.segments?.map(s => s.source_id));
+      console.log('[PATH] segments:', result.segments?.map(s => s.stable_id));
       console.log('[LRPs]', result.lrps?.map((l, i) =>
         `LRP${i}: lon=${l.lon.toFixed(5)} lat=${l.lat.toFixed(5)}` +
         ` bear=[${l.bearing_lb.toFixed(2)},${l.bearing_ub.toFixed(2)}]` +

@@ -2640,7 +2640,7 @@ export default function MapView({ tilesBase, ready }) {
           style={segPos ? { position: 'absolute', left: segPos.left, top: segPos.top, right: 'auto', bottom: 'auto' } : segStyle}>
           <header className="seg-info-header" onMouseDown={segMouseDown}>
             <span>
-              Segment{infoProps.source_id != null ? ` ${infoProps.source_id}` : ''}
+              Segment{infoProps.stable_id != null ? ` ${infoProps.stable_id}` : ''}
             </span>
             <button
               className="seg-info-close"
@@ -2665,7 +2665,7 @@ export default function MapView({ tilesBase, ready }) {
                   ['Tile Index',   infoProps.local_index],
                   ['Start Node',   infoProps.start_node  ?? '—'],
                   ['End Node',     infoProps.end_node    ?? '—'],
-                  ['Segment Key',  infoProps.source_id   ?? '—'],
+                  ['Segment Key',  infoProps.stable_id   ?? '—'],
                   ['Internal ID',  infoProps.segment_id  != null ? infoProps.segment_id : '— (decode first)'],
                 ].map(([k, v]) => (
                   <tr key={k}>
@@ -2998,7 +2998,7 @@ function CandidatePopupBody({ p }) {
   const accepted     = p.ctype === 'accepted';
   const resultLabel  = RESULT_LABEL[p.ctype] ?? p.ctype;
   const verdictLine  = !accepted ? formatVerdict(p.verdict_json) : null;
-  const segKey       = p.source_id ?? p.segment_id;
+  const segKey       = p.stable_id ?? p.segment_id;
 
   return (
     <table className="cand-table">

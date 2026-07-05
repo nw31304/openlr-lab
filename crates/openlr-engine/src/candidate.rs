@@ -428,8 +428,8 @@ mod tests {
 
     fn simple_graph() -> Graph {
         let mut g = Graph::new();
-        g.add_node(NetworkNode { id: NodeId(0), lon: 0.0,   lat: 0.0,   stable_id: [0;16], is_boundary: false });
-        g.add_node(NetworkNode { id: NodeId(1), lon: 0.001, lat: 0.0,   stable_id: [0;16], is_boundary: false });
+        g.add_node(NetworkNode { id: NodeId(0), lon: 0.0,   lat: 0.0,   stable_id: String::new(), is_boundary: false });
+        g.add_node(NetworkNode { id: NodeId(1), lon: 0.001, lat: 0.0,   stable_id: String::new(), is_boundary: false });
         g.add_segment(NetworkSegment {
             id: SegmentId(1),
             start_node: NodeId(0),
@@ -439,7 +439,7 @@ mod tests {
             frc: 3,
             fow: 3,
             direction: Direction::Both,
-            stable_id: [0u8; 16],
+            stable_id: String::new(),
         });
         g
     }
