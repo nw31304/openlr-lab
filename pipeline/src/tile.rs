@@ -374,15 +374,21 @@ fn build_directory(tile_entries: &[(u64, u64, u32)]) -> Result<DirectoryParts> {
 }
 
 
-pub(crate) fn write_pmtiles_file(tiles: &[(u64, Vec<u8>)], output_path: &Path, tile_zoom: u8) -> Result<()> {
+pub(crate) fn write_pmtiles_file(tiles: &[(u64, Vec<u8>)], output_path: &Path, tile_zoom: u8, compress: bool) -> Result<()> {
     // Build tile data section and tile entry list.
     let mut tile_data: Vec<u8> = Vec::new();
     let mut tile_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(tiles.len());
 
     for (tile_id, payload) in tiles {
         let offset = tile_data.len() as u64;
-        tile_entries.push((*tile_id, offset, payload.len() as u32));
-        tile_data.extend_from_slice(payload);
+        if compress {
+            let gz = gzip_compress(payload).context("compress tile")?;
+            tile_entries.push((*tile_id, offset, gz.len() as u32));
+            tile_data.extend_from_slice(&gz);
+        } else {
+            tile_entries.push((*tile_id, offset, payload.len() as u32));
+            tile_data.extend_from_slice(payload);
+        }
     }
 
     let dir = build_directory(&tile_entries)?;
@@ -417,18 +423,24 @@ pub(crate) fn write_pmtiles_file(tiles: &[(u64, Vec<u8>)], output_path: &Path, t
     hdr[88..96].copy_from_slice(&dir.n_tiles.to_le_bytes()); // tile_contents_count
     hdr[96] = 1;         // clustered
     hdr[97] = 2;         // internal_compression = gzip
-    hdr[98] = 1;         // tile_compression = none
+    hdr[98] = if compress { 2 } else { 1 }; // tile_compression: 2=gzip, 1=none
     hdr[99] = 0;         // tile_type = unknown/custom
     hdr[100] = tile_zoom; // min_zoom
     hdr[101] = tile_zoom; // max_zoom
 
-    let mut f = std::fs::File::create(output_path)
-        .with_context(|| format!("create {}", output_path.display()))?;
-    f.write_all(&hdr).context("write header")?;
-    f.write_all(&dir.root_compressed).context("write root dir")?;
-    f.write_all(metadata).context("write metadata")?;
-    f.write_all(&dir.leaf_dirs_data).context("write leaf dirs")?;
-    f.write_all(&tile_data).context("write tile data")?;
+    // Write to a temp file in the same directory, then atomically rename.
+    let out_dir = output_path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".olrl-archive-tmp-")
+        .tempfile_in(out_dir)
+        .context("create archive temp file")?;
+    tmp.write_all(&hdr).context("write header")?;
+    tmp.write_all(&dir.root_compressed).context("write root dir")?;
+    tmp.write_all(metadata).context("write metadata")?;
+    tmp.write_all(&dir.leaf_dirs_data).context("write leaf dirs")?;
+    tmp.write_all(&tile_data).context("write tile data")?;
+    tmp.persist(output_path)
+        .map_err(|e| anyhow::anyhow!("persist archive to {}: {}", output_path.display(), e))?;
 
     Ok(())
 }
@@ -506,6 +518,7 @@ pub fn write_tiles(
     release: &str,
     extent_slug: &str,
     low_memory: bool,
+    compress: bool,
 ) -> Result<()> {
     // Build node coordinate lookup: gers_id → (lon_e7, lat_e7).
     let node_lookup: HashMap<[u8; 16], (i32, i32)> = nodes
@@ -694,7 +707,7 @@ pub fn write_tiles(
 
         info!("low-memory: streaming tiles from DuckDB → PMTiles");
 
-        let mut writer = crate::merge::StreamingWriter::new()
+        let mut writer = crate::merge::StreamingWriter::new_in(output_dir, compress)
             .context("create StreamingWriter")?;
         {
             let mut stmt = conn
@@ -726,7 +739,7 @@ pub fn write_tiles(
             })
             .collect();
         tile_vec.sort_by_key(|(id, _)| *id);
-        write_pmtiles_file(&tile_vec, &archive_path, tile_zoom)?;
+        write_pmtiles_file(&tile_vec, &archive_path, tile_zoom, compress)?;
     }
     info!(path = %archive_path.display(), "PMTiles archive written");
 
@@ -897,7 +910,7 @@ mod tests {
     fn pmtiles_file_header_magic() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let tiles = vec![(0u64, vec![0u8; 10])];
-        write_pmtiles_file(&tiles, tmp.path(), 12).unwrap();
+        write_pmtiles_file(&tiles, tmp.path(), 12, false).unwrap();
 
         let bytes = std::fs::read(tmp.path()).unwrap();
         assert!(bytes.len() >= 127, "file too short");

@@ -5,6 +5,7 @@ import { PMTiles } from 'pmtiles';
 import { useStore, getSegmentId, getSegGeomCache, getSegIdToTile, getTileGeomCache } from '../store.js';
 import { useDraggable } from '../hooks.js';
 import { emptyState, applyStep, computeVisualState, stateToGeoJSON } from '../replayEngine.js';
+import { haversineM } from '../utils.js';
 
 
 // Inline SVG tip for speech bubbles — above: tip points down, below: tip points up.
@@ -258,15 +259,6 @@ function compassBearing(lon1, lat1, lon2, lat2) {
   return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 }
 
-function haversineM(lon1, lat1, lon2, lat2) {
-  const R = 6371000;
-  const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
-  const Δφ = (lat2 - lat1) * Math.PI / 180;
-  const Δλ = (lon2 - lon1) * Math.PI / 180;
-  const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
 function fmtDist(m) {
   if (m < 1000) return `${Math.round(m)} m`;
   return `${(m / 1000).toFixed(2)} km`;
@@ -293,71 +285,6 @@ function parseLatLon(str) {
   return { lat, lon };
 }
 
-function applyOffsets(coords, posM, negM) {
-  let pts = [...coords];
-  if (posM > 0) {
-    let remaining = posM;
-    while (pts.length > 2) {
-      const d = haversineM(pts[0][0], pts[0][1], pts[1][0], pts[1][1]);
-      if (remaining <= d) {
-        const t = remaining / d;
-        pts[0] = [pts[0][0] + t * (pts[1][0] - pts[0][0]), pts[0][1] + t * (pts[1][1] - pts[0][1])];
-        break;
-      }
-      remaining -= d;
-      pts.shift();
-    }
-  }
-  if (negM > 0) {
-    let remaining = negM;
-    while (pts.length > 2) {
-      const last = pts.length - 1;
-      const d = haversineM(pts[last-1][0], pts[last-1][1], pts[last][0], pts[last][1]);
-      if (remaining <= d) {
-        const t = remaining / d;
-        pts[last] = [pts[last][0] + t * (pts[last-1][0] - pts[last][0]), pts[last][1] + t * (pts[last-1][1] - pts[last][1])];
-        break;
-      }
-      remaining -= d;
-      pts.pop();
-    }
-  }
-  return pts;
-}
-
-function computeTraversalDirections(segments) {
-  const cache = getSegGeomCache();
-  const n = segments.length;
-  if (n === 0) return [];
-  const dirs = segments.map(s =>
-    s.direction === 'Forward' ? 'Forward' : s.direction === 'Backward' ? 'Reverse' : null
-  );
-  const feats = segments.map(s => cache.get(s.segment_id));
-  if (dirs[0] === null) {
-    const f0 = feats[0], f1 = n > 1 ? feats[1] : null;
-    if (f0 && f1) {
-      const c0 = f0.geometry.coordinates, c1 = f1.geometry.coordinates;
-      const dFF = haversineM(c0[c0.length-1][0], c0[c0.length-1][1], c1[0][0], c1[0][1]);
-      const dFR = haversineM(c0[c0.length-1][0], c0[c0.length-1][1], c1[c1.length-1][0], c1[c1.length-1][1]);
-      const dRF = haversineM(c0[0][0], c0[0][1], c1[0][0], c1[0][1]);
-      const dRR = haversineM(c0[0][0], c0[0][1], c1[c1.length-1][0], c1[c1.length-1][1]);
-      dirs[0] = Math.min(dFF, dFR) <= Math.min(dRF, dRR) ? 'Forward' : 'Reverse';
-    } else {
-      dirs[0] = 'Forward';
-    }
-  }
-  for (let i = 1; i < n; i++) {
-    if (dirs[i] !== null) continue;
-    const fi = feats[i], fi1 = feats[i - 1];
-    if (!fi || !fi1) { dirs[i] = 'Forward'; continue; }
-    const ci = fi.geometry.coordinates, ci1 = fi1.geometry.coordinates;
-    const prevEnd = dirs[i-1] === 'Forward' ? ci1[ci1.length-1] : ci1[0];
-    const dFwd = haversineM(prevEnd[0], prevEnd[1], ci[0][0], ci[0][1]);
-    const dRev = haversineM(prevEnd[0], prevEnd[1], ci[ci.length-1][0], ci[ci.length-1][1]);
-    dirs[i] = dFwd <= dRev ? 'Forward' : 'Reverse';
-  }
-  return dirs;
-}
 
 // Clip a polyline [lon,lat][] to start at the nearest point to (snapLon, snapLat).
 // Returns the tail portion of the polyline from that snap point onward.
@@ -524,7 +451,6 @@ export default function MapView({ tilesBase, ready }) {
   const [bearingPts, setBearingPts] = useState([]);
   const bearingPtsRef = useRef([]);
   const [permalinkCopied, setPermalinkCopied] = useState(false);
-  const [exportFlash, setExportFlash] = useState(false);
   const [toolbarOpen, setToolbarOpen] = useState(false);
 
   const { pos: lrpPos,  onMouseDown: lrpMouseDown,  resetPos: lrpResetPos  } = useDraggable(lrpPanelRef);
@@ -2566,82 +2492,6 @@ export default function MapView({ tilesBase, ready }) {
     };
   }, [bearingActive]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── GeoJSON export ────────────────────────────────────────────────────────────
-
-  function doExportGeoJSON() {
-    if (!decodeResult?.ok) return;
-    const cache = getSegGeomCache();
-    const segments = decodeResult.segments ?? [];
-    const traversalDirs = computeTraversalDirections(segments);
-
-    let allCoords = [];
-    for (let i = 0; i < segments.length; i++) {
-      const feat = cache.get(segments[i].segment_id);
-      if (!feat) continue;
-      let coords = feat.geometry.coordinates;
-      if (traversalDirs[i] === 'Reverse') coords = [...coords].reverse();
-      if (allCoords.length === 0) allCoords.push(...coords);
-      else allCoords.push(...coords.slice(1));
-    }
-
-    const posM = ((decodeResult.pos_offset_lb ?? 0) + (decodeResult.pos_offset_ub ?? 0)) / 2;
-    const negM = ((decodeResult.neg_offset_lb ?? 0) + (decodeResult.neg_offset_ub ?? 0)) / 2;
-    const trimmed = applyOffsets(allCoords, posM, negM);
-
-    let wkt = null;
-    if (decodeResult.location_type === 'PointAlongLine' && decodeResult.point_lon != null) {
-      wkt = `POINT(${decodeResult.point_lon.toFixed(7)} ${decodeResult.point_lat.toFixed(7)})`;
-    } else if (trimmed.length >= 2) {
-      wkt = `LINESTRING(${trimmed.map(([lo, la]) => `${lo.toFixed(7)} ${la.toFixed(7)}`).join(', ')})`;
-    }
-
-    const features = segments.map((seg, i) => {
-      const feat = cache.get(seg.segment_id);
-      let coords = feat?.geometry?.coordinates ?? null;
-      if (coords && traversalDirs[i] === 'Reverse') coords = [...coords].reverse();
-      return {
-        type: 'Feature',
-        properties: {
-          frc:       seg.frc,
-          fow:       seg.fow,
-          direction: traversalDirs[i],
-          length_m:  seg.length_m,
-        },
-        geometry: coords ? { type: 'LineString', coordinates: coords } : null,
-      };
-    });
-
-    const hasPos = (decodeResult.pos_offset_ub ?? 0) > 0;
-    const hasNeg = (decodeResult.neg_offset_ub ?? 0) > 0;
-    const fc = {
-      type: 'FeatureCollection',
-      metadata: {
-        openlr:           openlrString,
-        location_type:    decodeResult.location_type,
-        pos_offset_range: hasPos ? [decodeResult.pos_offset_lb, decodeResult.pos_offset_ub] : null,
-        neg_offset_range: hasNeg ? [decodeResult.neg_offset_lb, decodeResult.neg_offset_ub] : null,
-        ...(decodeResult.location_type === 'PointAlongLine' && decodeResult.point_lon != null
-          ? { point_lat: decodeResult.point_lat, point_lon: decodeResult.point_lon }
-          : {}),
-        wkt,
-      },
-      features,
-    };
-
-    const blob = new Blob([JSON.stringify(fc, null, 2)], { type: 'application/geo+json' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = 'openlr-path.geojson';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-
-    setExportFlash(true);
-    setTimeout(() => setExportFlash(false), 1200);
-  }
-
   function doPermalink() {
     const url = `${window.location.origin}${window.location.pathname}#q=${encodeURIComponent(openlrString)}`;
     navigator.clipboard.writeText(url).catch(() => {});
@@ -3017,12 +2867,6 @@ export default function MapView({ tilesBase, ready }) {
           onClick={toggleBearing}
           title={bearingActive ? 'Cancel bearing tool (Esc)' : 'Measure bearing and distance between two points'}
         >🧭</button>
-        <button
-          className={`map-tool-btn${exportFlash ? ' flash' : ''}${!decodeResult?.ok ? ' disabled' : ''}`}
-          onClick={doExportGeoJSON}
-          disabled={!decodeResult?.ok}
-          title={decodeResult?.ok ? 'Export decoded path as GeoJSON' : 'Decode a location first'}
-        >⬇</button>
         <button
           className={`map-tool-btn${permalinkCopied ? ' flash' : ''}`}
           onClick={doPermalink}

@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
                     &args.output,
                     args.tile_zoom,
                     args.low_memory,
+                    args.compress_tiles,
                     args.duckdb_memory_mb,
                     args.duckdb_temp_dir.as_deref(),
                     args.progress,
@@ -111,6 +112,7 @@ async fn main() -> Result<()> {
                             &args.output,
                             args.tile_zoom,
                             args.low_memory,
+                            args.compress_tiles,
                             args.duckdb_memory_mb,
                             args.duckdb_temp_dir.as_deref(),
                             args.progress,
@@ -149,6 +151,7 @@ async fn main() -> Result<()> {
                             args.ram_gb,
                             args.bytes_per_segment,
                             args.low_memory,
+                            args.compress_tiles,
                         )
                         .await?;
                     }

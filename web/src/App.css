@@ -545,6 +545,29 @@ html, body, #root, .app {
   color: #ff5566;
 }
 
+.result-export-btn {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 212, 255, 0.4);
+  background: rgba(0, 100, 130, 0.3);
+  color: #00d4ff;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.result-export-btn:hover {
+  background: rgba(0, 100, 130, 0.6);
+  border-color: #00d4ff;
+}
+
+.result-export-btn.flash {
+  border-color: #00ff99;
+  background: rgba(0, 120, 70, 0.5);
+  color: #00ff99;
+}
+
 .result-body {
   flex: 1 1 0;
   padding: 10px 14px;

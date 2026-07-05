@@ -43,6 +43,7 @@ pub async fn run_osm(
     output:           &Path,
     tile_zoom:        u8,
     low_memory:       bool,
+    compress:         bool,
     duckdb_memory_mb: Option<u64>,
     duckdb_temp_dir:  Option<&Path>,
     show_progress:    bool,
@@ -85,6 +86,7 @@ pub async fn run_osm(
                 duckdb_memory_mb,
                 tmp_dir.as_deref(),
                 show_progress,
+                compress,
             )
         })
         .await
@@ -164,7 +166,7 @@ pub async fn run_osm(
             crate::tile::write_tiles(
                 q_edges, q_nodes, restrictions,
                 tile_zoom, &output_dir, &release_label, &extent_slug,
-                low_memory,
+                low_memory, compress,
             )
         })
         .await
@@ -193,6 +195,7 @@ pub async fn run_generic(
     output:            &Path,
     tile_zoom:         u8,
     low_memory:        bool,
+    compress:          bool,
     duckdb_memory_mb:  Option<u64>,
     duckdb_temp_dir:   Option<&Path>,
     show_progress:     bool,
@@ -228,6 +231,7 @@ pub async fn run_generic(
                 duckdb_memory_mb,
                 tmp_dir.as_deref(),
                 show_progress,
+                compress,
             )
         })
         .await
@@ -321,7 +325,7 @@ pub async fn run_generic(
             crate::tile::write_tiles(
                 q_edges, q_nodes, restrictions,
                 tile_zoom, &output_dir, "generic", &extent_slug2,
-                low_memory,
+                low_memory, compress,
             )
         })
         .await
@@ -370,6 +374,7 @@ pub async fn run(
     ram_gb_override:   Option<f64>,
     bytes_per_segment: u64,
     low_memory:        bool,
+    compress:          bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output)?;
 
@@ -394,7 +399,7 @@ pub async fn run(
         // ── Single-shot ────────────────────────────────────────────────────────
         run_partition(
             release, bbox, schema, output, client,
-            fetch_concurrency, tile_zoom, &extent_slug, low_memory,
+            fetch_concurrency, tile_zoom, &extent_slug, low_memory, compress,
         )
         .await
     } else {
@@ -421,7 +426,7 @@ pub async fn run(
 
             run_partition(
                 release, Some(*part_bbox), schema, &part_out, client,
-                fetch_concurrency, tile_zoom, &part_slug, low_memory,
+                fetch_concurrency, tile_zoom, &part_slug, low_memory, compress,
             )
             .await?;
 
@@ -467,6 +472,7 @@ async fn run_partition(
     tile_zoom:         u8,
     extent_slug:       &str,
     low_memory:        bool,
+    compress:          bool,
 ) -> Result<()> {
     let t0 = Instant::now();
 
@@ -579,7 +585,7 @@ async fn run_partition(
             crate::tile::write_tiles(
                 q_edges, q_nodes, restrictions,
                 tile_zoom, &output_dir, &release, &extent_slug,
-                low_memory,
+                low_memory, compress,
             )
         })
         .await

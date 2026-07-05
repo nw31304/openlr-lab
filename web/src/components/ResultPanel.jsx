@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { useStore } from '../store.js';
+import { useStore, getSegGeomCache } from '../store.js';
 import { diagnoseFailure, diagnoseSuccess } from '../diagnosis.js';
 import { renderLlmText } from '../renderLlmText.jsx';
+import { applyOffsets, computeTraversalDirections } from '../utils.js';
 
 // ── Reference panel helpers ───────────────────────────────────────────────────
 
@@ -168,9 +169,10 @@ export default function ResultPanel() {
   const { decodeResult, highlightedSegment, setHighlightedSegment,
           requestInfoSegment, showTrace, toggleTrace, debugDecode, params,
           llmConfig, llmChatOpen, toggleLlmChat, toggleLlmSettings,
-          setTraceLrpFocus } = useStore();
+          setTraceLrpFocus, openlrString } = useStore();
 
   const [refHeight, setRefHeight] = useState(280);
+  const [exportFlash, setExportFlash] = useState(false);
   const dragging  = useRef(false);
   const dragY0    = useRef(0);
   const dragH0    = useRef(0);
@@ -188,6 +190,75 @@ export default function ResultPanel() {
       document.removeEventListener('mouseup', onUp);
     };
   }, []);
+
+  function doExportGeoJSON() {
+    if (!decodeResult?.ok) return;
+    const cache = getSegGeomCache();
+    const segments = decodeResult.segments ?? [];
+    const traversalDirs = computeTraversalDirections(segments, cache);
+
+    let allCoords = [];
+    for (let i = 0; i < segments.length; i++) {
+      const feat = cache.get(segments[i].segment_id);
+      if (!feat) continue;
+      let coords = feat.geometry.coordinates;
+      if (traversalDirs[i] === 'Reverse') coords = [...coords].reverse();
+      if (allCoords.length === 0) allCoords.push(...coords);
+      else allCoords.push(...coords.slice(1));
+    }
+
+    const posM = ((decodeResult.pos_offset_lb ?? 0) + (decodeResult.pos_offset_ub ?? 0)) / 2;
+    const negM = ((decodeResult.neg_offset_lb ?? 0) + (decodeResult.neg_offset_ub ?? 0)) / 2;
+    const trimmed = applyOffsets(allCoords, posM, negM);
+
+    let wkt = null;
+    if (decodeResult.location_type === 'PointAlongLine' && decodeResult.point_lon != null) {
+      wkt = `POINT(${decodeResult.point_lon.toFixed(7)} ${decodeResult.point_lat.toFixed(7)})`;
+    } else if (trimmed.length >= 2) {
+      wkt = `LINESTRING(${trimmed.map(([lo, la]) => `${lo.toFixed(7)} ${la.toFixed(7)}`).join(', ')})`;
+    }
+
+    const features = segments.map((seg, i) => {
+      const feat = cache.get(seg.segment_id);
+      let coords = feat?.geometry?.coordinates ?? null;
+      if (coords && traversalDirs[i] === 'Reverse') coords = [...coords].reverse();
+      return {
+        type: 'Feature',
+        properties: { frc: seg.frc, fow: seg.fow, direction: traversalDirs[i], length_m: seg.length_m },
+        geometry: coords ? { type: 'LineString', coordinates: coords } : null,
+      };
+    });
+
+    const hasPos = (decodeResult.pos_offset_ub ?? 0) > 0;
+    const hasNeg = (decodeResult.neg_offset_ub ?? 0) > 0;
+    const fc = {
+      type: 'FeatureCollection',
+      metadata: {
+        openlr:           openlrString,
+        location_type:    decodeResult.location_type,
+        pos_offset_range: hasPos ? [decodeResult.pos_offset_lb, decodeResult.pos_offset_ub] : null,
+        neg_offset_range: hasNeg ? [decodeResult.neg_offset_lb, decodeResult.neg_offset_ub] : null,
+        ...(decodeResult.location_type === 'PointAlongLine' && decodeResult.point_lon != null
+          ? { point_lat: decodeResult.point_lat, point_lon: decodeResult.point_lon }
+          : {}),
+        wkt,
+      },
+      features,
+    };
+
+    const blob = new Blob([JSON.stringify(fc, null, 2)], { type: 'application/geo+json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = 'openlr-path.geojson';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    setExportFlash(true);
+    setTimeout(() => setExportFlash(false), 1200);
+  }
 
   if (!decodeResult) return (
     <div className="result-panel-empty">Decode a reference to see results.</div>
@@ -234,6 +305,13 @@ export default function ResultPanel() {
           <span>{decodeResult.ok
             ? (decodeResult.location_type === 'PointAlongLine' ? '✓ Decoded (Point)' : '✓ Decoded')
             : '✗ Failed'}</span>
+          {decodeResult.ok && (
+            <button
+              className={`result-export-btn${exportFlash ? ' flash' : ''}`}
+              onClick={doExportGeoJSON}
+              title="Export decoded path as GeoJSON"
+            >Export GeoJSON</button>
+          )}
         </div>
         <div className="result-body">
           {decodeResult.ok ? (

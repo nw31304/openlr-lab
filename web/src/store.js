@@ -9,6 +9,14 @@ import { TOOL_DEFINITIONS, executeTool } from './llm/tools.js';
 let _pmtiles = null;
 let _decoder = null;
 let _zoom = 12;
+
+// The pmtiles JS library auto-decompresses tile data before returning it from
+// getZxy(), so res.data is always raw (uncompressed) bytes regardless of the
+// archive's tile_compression field.
+function tileBytes(res) {
+  if (!res?.data) return null;
+  return new Uint8Array(res.data);
+}
 /** segment_id → { tile_key, local_index } — rebuilt after every decode */
 let _segIdToTile = new Map();
 /** tile_key → GeoJSON features[] — built from tile bytes during decode */
@@ -416,11 +424,8 @@ export const useStore = create(persist(
         attemptedTiles.add(tileKey);
         try {
           const res = await _pmtiles.getZxy(z, x, y);
-          if (res?.data) {
-            _decoder.load_tile(z, x, y, new Uint8Array(res.data));
-          } else {
-            _decoder.load_tile(z, x, y, new Uint8Array(0));
-          }
+          const bytes = tileBytes(res);
+          _decoder.load_tile(z, x, y, bytes ?? new Uint8Array(0));
         } catch (e) {
           console.warn(`[forced-decode] tile ${tileKey} load failed:`, e?.message ?? e);
           break;
@@ -505,18 +510,18 @@ export const useStore = create(persist(
       await Promise.all(startResult.tiles.map(async ([z, x, y]) => {
         try {
           const res = await _pmtiles.getZxy(z, x, y);
-          if (res?.data) {
+          const bytes = tileBytes(res);
+          if (bytes) {
             const tWasm0 = performance.now();
-            _decoder.load_tile(z, x, y, new Uint8Array(res.data));
+            _decoder.load_tile(z, x, y, bytes);
             wasmLoadMs += performance.now() - tWasm0;
             loadedTiles++;
             const tileKey = `${z}/${x}/${y}`;
             const wasmCount = _decoder.tile_segment_count(z, x, y);
             const tJs0 = performance.now();
-            // Cache tile geometry so the trace panel can pan/highlight decoded segments
-            _tileGeomCache.set(tileKey, decodeTile(res.data, z, x, y).features);
+            _tileGeomCache.set(tileKey, decodeTile(bytes.buffer, z, x, y).features);
             jsDecodeMs += performance.now() - tJs0;
-            console.log(`[tile] loaded ${tileKey} (${res.data.byteLength} bytes, ${wasmCount} segs in WASM)`);
+            console.log(`[tile] loaded ${tileKey} (${res.data.byteLength} raw → ${bytes.byteLength} bytes, ${wasmCount} segs in WASM)`);
           } else {
             console.warn(`[tile] no data for ${z}/${x}/${y} (tile not in archive)`);
           }
@@ -563,12 +568,12 @@ export const useStore = create(persist(
 
         try {
           const res = await _pmtiles.getZxy(z, x, y);
-          if (res?.data) {
-            _decoder.load_tile(z, x, y, new Uint8Array(res.data));
-            _tileGeomCache.set(tileKey, decodeTile(res.data, z, x, y).features);
-            console.log(`[tile] dynamic loaded ${tileKey} (${res.data.byteLength} bytes)`);
+          const bytes = tileBytes(res);
+          if (bytes) {
+            _decoder.load_tile(z, x, y, bytes);
+            _tileGeomCache.set(tileKey, decodeTile(bytes.buffer, z, x, y).features);
+            console.log(`[tile] dynamic loaded ${tileKey} (${res.data.byteLength} raw → ${bytes.byteLength} bytes)`);
           } else {
-            // Tile not in archive — mark as loaded (empty) so A* stops requesting it.
             _decoder.load_tile(z, x, y, new Uint8Array(0));
             console.warn(`[tile] dynamic ${tileKey}: not in archive, marked empty`);
           }

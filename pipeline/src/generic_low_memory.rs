@@ -406,6 +406,7 @@ pub(crate) fn run_pipeline(
     duckdb_memory_mb:  Option<u64>,
     duckdb_temp_dir:   Option<&Path>,
     show_progress:     bool,
+    compress:          bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
     let default_tmp = output_dir.join(format!(".duckdb_tmp_{}", std::process::id()));
@@ -424,7 +425,7 @@ pub(crate) fn run_pipeline(
     }
 
     // Phase 3: tile + write PMTiles.
-    tile_from_duckdb(&conn, tile_zoom, output_dir, extent_slug, "generic", show_progress)?;
+    tile_from_duckdb(&conn, tile_zoom, output_dir, extent_slug, "generic", show_progress, compress)?;
 
     drop(conn);
     Ok(())

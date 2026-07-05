@@ -977,6 +977,7 @@ pub(crate) fn tile_from_duckdb(
     extent_slug: &str,
     release_label: &str,
     show_progress: bool,
+    compress: bool,
 ) -> Result<()> {
     // ── Load all nodes into RAM ───────────────────────────────────────────────
     // For Europe this is ~20 M nodes × (16+8+4+4) bytes ≈ 640 MB.  Acceptable.
@@ -1093,7 +1094,7 @@ pub(crate) fn tile_from_duckdb(
     let archive_filename = format!("openlrlens-{extent_slug}-{safe_release}.pmtiles");
     let archive_path = output_dir.join(&archive_filename);
 
-    let mut writer = StreamingWriter::new().context("create StreamingWriter")?;
+    let mut writer = StreamingWriter::new_in(output_dir, compress).context("create StreamingWriter")?;
     let pb = make_bar(show_progress, total_tiles as u64, "Tiling              ");
     let mut done_tiles = 0usize;
 
@@ -1264,6 +1265,7 @@ pub fn run_pipeline(
     duckdb_memory_mb: Option<u64>,
     duckdb_temp_dir:  Option<&Path>,
     show_progress:    bool,
+    compress:         bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
     // Default spill directory is a subdirectory of the output dir so it lands
@@ -1318,7 +1320,7 @@ pub fn run_pipeline(
 
     // Phase 4: tile and write PMTiles.
     info!("low-memory: tiling");
-    tile_from_duckdb(&conn, tile_zoom, output_dir, extent_slug, release_label, show_progress)?;
+    tile_from_duckdb(&conn, tile_zoom, output_dir, extent_slug, release_label, show_progress, compress)?;
 
     // Drop the connection before the guard removes the spill directory (DuckDB
     // closes its temp files on drop; removing them while open would fail on Windows).

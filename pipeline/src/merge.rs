@@ -148,6 +148,8 @@ struct PmtilesReader {
     /// All actual tile entries (tile_id, data_offset, data_length), sorted ascending.
     entries:          Vec<(u64, u64, u32)>,
     pos:              usize,
+    /// Byte 98 from the PMTiles header: 1=none, 2=gzip.
+    pub tile_compression: u8,
 }
 
 impl PmtilesReader {
@@ -162,6 +164,7 @@ impl PmtilesReader {
             "not a PMTiles file: {}", path.display());
         anyhow::ensure!(hdr[7] == 3,
             "unsupported PMTiles version {} in {}", hdr[7], path.display());
+        let tile_compression = hdr[98];
 
         let root_off  = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
         let root_len  = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
@@ -188,10 +191,10 @@ impl PmtilesReader {
             }
         }
 
-        Ok(Self { file, tile_data_offset: tile_off, entries, pos: 0 })
+        Ok(Self { file, tile_data_offset: tile_off, entries, pos: 0, tile_compression })
     }
 
-    /// Return the next `(tile_id, compressed_bytes)` or `None` if exhausted.
+    /// Return the next `(tile_id, raw_bytes)` or `None` if exhausted.
     fn next_tile(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
         if self.pos >= self.entries.len() {
             return Ok(None);
@@ -222,18 +225,29 @@ pub(crate) struct StreamingWriter {
     tile_data_tmp:  NamedTempFile,
     entries:        Vec<(u64, u64, u32)>,   // (tile_id, offset, length)
     current_offset: u64,
+    compress:       bool,
 }
 
 impl StreamingWriter {
-    pub(crate) fn new() -> Result<Self> {
-        let tile_data_tmp = NamedTempFile::new().context("create tile data temp file")?;
-        Ok(Self { tile_data_tmp, entries: Vec::new(), current_offset: 0 })
+    /// Create a StreamingWriter whose temp file lives in `output_dir` so the
+    /// final copy in `finish()` stays on the same filesystem as the output.
+    pub(crate) fn new_in(output_dir: &Path, compress: bool) -> Result<Self> {
+        let tile_data_tmp = tempfile::Builder::new()
+            .prefix(".olrl-tile-tmp-")
+            .tempfile_in(output_dir)
+            .context("create tile data temp file")?;
+        Ok(Self { tile_data_tmp, entries: Vec::new(), current_offset: 0, compress })
     }
 
     pub(crate) fn add_tile(&mut self, tile_id: u64, data: &[u8]) -> Result<()> {
-        self.tile_data_tmp.write_all(data).context("write tile data")?;
-        self.entries.push((tile_id, self.current_offset, data.len() as u32));
-        self.current_offset += data.len() as u64;
+        let payload: std::borrow::Cow<[u8]> = if self.compress {
+            gzip_compress(data).context("compress tile")?.into()
+        } else {
+            data.into()
+        };
+        self.tile_data_tmp.write_all(&payload).context("write tile data")?;
+        self.entries.push((tile_id, self.current_offset, payload.len() as u32));
+        self.current_offset += payload.len() as u64;
         Ok(())
     }
 
@@ -267,26 +281,41 @@ impl StreamingWriter {
         hdr[88..96].copy_from_slice(&n_tiles.to_le_bytes());
         hdr[96] = 1; // clustered
         hdr[97] = 2; // internal_compression = gzip
-        hdr[98] = 1; // tile_compression = none (payloads are not re-compressed)
+        hdr[98] = if self.compress { 2 } else { 1 }; // tile_compression: 2=gzip, 1=none
         hdr[99] = 0; // tile_type = unknown/custom
         hdr[100] = tile_zoom; // min_zoom
         hdr[101] = tile_zoom; // max_zoom
 
-        let mut out = File::create(output_path)
-            .with_context(|| format!("create {}", output_path.display()))?;
-        out.write_all(&hdr).context("write header")?;
-        out.write_all(&root_compressed).context("write root dir")?;
-        out.write_all(metadata).context("write metadata")?;
-        out.write_all(&leaf_data).context("write leaf dirs")?;
+        // Write the complete archive to a second temp file in the same directory,
+        // then atomically rename it to output_path.  This ensures the previous
+        // archive is never truncated until the new one is fully written.
+        info!(
+            tiles   = n_tiles,
+            size_mb = tile_data_length / 1_048_576,
+            "writing tile data to archive"
+        );
+        let out_dir = output_path.parent().unwrap_or(Path::new("."));
+        let mut archive_tmp = tempfile::Builder::new()
+            .prefix(".olrl-archive-tmp-")
+            .tempfile_in(out_dir)
+            .context("create archive temp file")?;
 
-        // Stream tile data from temp file.
+        archive_tmp.write_all(&hdr).context("write header")?;
+        archive_tmp.write_all(&root_compressed).context("write root dir")?;
+        archive_tmp.write_all(metadata).context("write metadata")?;
+        archive_tmp.write_all(&leaf_data).context("write leaf dirs")?;
+
         self.tile_data_tmp.seek(SeekFrom::Start(0))?;
-        let mut buf = vec![0u8; 256 * 1024]; // 256 KB copy buffer
+        let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MB copy buffer
         loop {
             let n = self.tile_data_tmp.read(&mut buf).context("read tile temp")?;
             if n == 0 { break; }
-            out.write_all(&buf[..n]).context("write tile data")?;
+            archive_tmp.write_all(&buf[..n]).context("write tile data")?;
         }
+
+        // Atomic rename — replaces output_path only after the archive is complete.
+        archive_tmp.persist(output_path)
+            .map_err(|e| anyhow::anyhow!("persist archive to {}: {}", output_path.display(), e))?;
 
         Ok(())
     }
@@ -331,7 +360,11 @@ pub fn merge_pmtiles(inputs: &[PathBuf], output: &Path, tile_zoom: u8) -> Result
         }
     }
 
-    let mut writer = StreamingWriter::new()?;
+    // Propagate tile_compression from the first input archive.  All inputs are
+    // expected to share the same setting (they were built with the same flags).
+    let tile_compression = readers[0].tile_compression;
+    let out_dir = output.parent().unwrap_or(Path::new("."));
+    let mut writer = StreamingWriter::new_in(out_dir, tile_compression == 2)?;
     let mut n_merged = 0u64;
 
     while let Some(Reverse((tile_id, idx))) = heap.pop() {
@@ -397,9 +430,9 @@ mod tests {
         let out  = tempfile::NamedTempFile::new().unwrap();
 
         // Archive 1: tiles 0 and 2
-        write_pmtiles_file(&[(0, vec![0xAAu8; 10]), (2, vec![0xBBu8; 20])], tmp1.path(), 12).unwrap();
+        write_pmtiles_file(&[(0, vec![0xAAu8; 10]), (2, vec![0xBBu8; 20])], tmp1.path(), 12, false).unwrap();
         // Archive 2: tiles 1 and 3
-        write_pmtiles_file(&[(1, vec![0xCCu8; 15]), (3, vec![0xDDu8; 25])], tmp2.path(), 12).unwrap();
+        write_pmtiles_file(&[(1, vec![0xCCu8; 15]), (3, vec![0xDDu8; 25])], tmp2.path(), 12, false).unwrap();
 
         merge_pmtiles(&[tmp1.path().to_owned(), tmp2.path().to_owned()], out.path(), 12).unwrap();
 
