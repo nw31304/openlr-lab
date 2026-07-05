@@ -71,7 +71,7 @@ npm install
 npm run dev
 ```
 
-The app expects a tile server at `http://localhost:5176` by default. You can override this in the **Tile source** menu.
+`npm run dev` starts both the Vite dev server (default `localhost:5173`) and a built-in tile server at `http://localhost:5176` (see the `tile-server` plugin in `vite.config.js`, which serves range requests out of `../out`) — no separate process needed. Override the tile source in the **Tile source** menu if you're pointing at a different archive or host.
 
 ### 3. Build a tile archive (optional — if you have road network data)
 
@@ -99,7 +99,7 @@ cargo run --release --bin openlrlens-build -- \
   merge --output out/world/world.pmtiles out/nz-osm out/eur-osm
 ```
 
-Serve the resulting `.pmtiles` file with any PMTiles-compatible tile server (e.g. [`pmtiles serve`](https://github.com/protomaps/go-pmtiles)) and point the app at it.
+For local dev, drop the resulting `.pmtiles` file into `out/` and the built-in Vite tile server (step 2) picks it up automatically. For a deployed build, serve it from any PMTiles-compatible host (e.g. [`pmtiles serve`](https://github.com/protomaps/go-pmtiles), or R2/CDN with range-request support) and point the app at it.
 
 ## Tile format
 
