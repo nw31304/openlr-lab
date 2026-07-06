@@ -9,6 +9,7 @@ mod merge;
 mod osm_adapt;
 mod osm_extract;
 mod generic_low_memory;
+mod lowmem_tile;
 mod osm_low_memory;
 mod osm_schema;
 mod parquet_meta;

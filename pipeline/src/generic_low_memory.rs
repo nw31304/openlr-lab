@@ -4,7 +4,7 @@
 /// Unlike the OSM path there is no two-pass scan: every GeoJSONL line contains
 /// its own geometry, attributes, and node IDs, so extract + quantize are a
 /// single pass.  Restrictions from the optional CSV are loaded afterward.
-/// Tiling reuses `osm_low_memory::tile_from_duckdb` unchanged.
+/// Tiling reuses the shared `lowmem_tile::tile_from_duckdb`, unchanged.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -17,12 +17,12 @@ use flate2::read::GzDecoder;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::osm_low_memory::{
+use crate::lowmem_tile::{
     geom_to_blob, make_bar, make_spinner, remove_collinear_lm, tile_from_duckdb,
 };
 use crate::partition::available_ram_bytes;
 use crate::split::haversine_m;
-use crate::tile::lon_lat_to_tile_xy;
+use crate::tile::{lon_lat_to_tile_xy, node_stable_id_str, seg_stable_id_str};
 
 // ── ID encoding (mirrors generic_extract.rs, private here) ───────────────────
 
@@ -57,12 +57,12 @@ fn setup_duckdb(memory_mb_override: Option<u64>, temp_dir: &Path) -> Result<Conn
          SET memory_limit='{limit_mb}MB'; \
          SET preserve_insertion_order=false; \
          CREATE TABLE q_edges ( \
-             edge_idx INTEGER, \
+             edge_idx INTEGER, split_idx INTEGER, \
              start_id BLOB, end_id BLOB, parent_id BLOB, \
              geom_blob BLOB, length_cm INTEGER, \
              frc INTEGER, fow INTEGER, direction INTEGER, \
-             tile_x INTEGER, tile_y INTEGER, tile_id BIGINT); \
-         CREATE TABLE q_nodes (node_id BLOB, lon_e7 INTEGER, lat_e7 INTEGER, tile_x INTEGER, tile_y INTEGER); \
+             tile_x INTEGER, tile_y INTEGER, tile_id BIGINT, stable_id VARCHAR); \
+         CREATE TABLE q_nodes (node_id BLOB, lon_e7 INTEGER, lat_e7 INTEGER, tile_x INTEGER, tile_y INTEGER, stable_id VARCHAR); \
          CREATE TABLE restriction_triples (from_id BLOB, via_id BLOB, to_id BLOB, flags INTEGER);",
         threads = rayon::current_num_threads().min(8),
     ))
@@ -206,16 +206,18 @@ fn process_geojsonl_file(
                     let (tx, ty) = lon_lat_to_tile_xy(
                         slon_e7 as f64 / 1e7, slat_e7 as f64 / 1e7, tile_zoom,
                     );
+                    let stable_id = node_stable_id_str(&e.start_id);
                     node_app.append_row(params![
-                        &e.start_id[..], slon_e7, slat_e7, tx as i64, ty as i64
+                        &e.start_id[..], slon_e7, slat_e7, tx as i64, ty as i64, stable_id.as_str(),
                     ]).context("append q_node")?;
                 }
                 if seen_nodes.insert(e.end_id) {
                     let (tx, ty) = lon_lat_to_tile_xy(
                         elon_e7 as f64 / 1e7, elat_e7 as f64 / 1e7, tile_zoom,
                     );
+                    let stable_id = node_stable_id_str(&e.end_id);
                     node_app.append_row(params![
-                        &e.end_id[..], elon_e7, elat_e7, tx as i64, ty as i64
+                        &e.end_id[..], elon_e7, elat_e7, tx as i64, ty as i64, stable_id.as_str(),
                     ]).context("append q_node")?;
                 }
 
@@ -226,22 +228,27 @@ fn process_geojsonl_file(
                     elon_e7 as f64 / 1e7, elat_e7 as f64 / 1e7, tile_zoom,
                 );
                 let geom_blob = geom_to_blob(&e.geom);
+                // GeoJSONL input is already node-to-node (Invariant 1 satisfied by the
+                // producer), so every line is its own final edge: split_idx is always 0.
+                let edge_stable_id = seg_stable_id_str(&e.parent_id, 0);
                 edge_app.append_row(params![
-                    *edge_idx as i64,
+                    *edge_idx as i64, 0i64,
                     &e.start_id[..], &e.end_id[..], &e.parent_id[..],
                     geom_blob.as_slice(), e.length_cm as i64,
                     e.frc as i64, e.fow as i64, e.direction as i64,
                     stx as i64, sty as i64,
                     crate::tile::xyz_to_tile_id(tile_zoom, stx, sty) as i64,
+                    edge_stable_id.as_str(),
                 ]).context("append q_edge start-tile")?;
                 if (etx, ety) != (stx, sty) {
                     edge_app.append_row(params![
-                        *edge_idx as i64,
+                        *edge_idx as i64, 0i64,
                         &e.start_id[..], &e.end_id[..], &e.parent_id[..],
                         geom_blob.as_slice(), e.length_cm as i64,
                         e.frc as i64, e.fow as i64, e.direction as i64,
                         etx as i64, ety as i64,
                         crate::tile::xyz_to_tile_id(tile_zoom, etx, ety) as i64,
+                        edge_stable_id.as_str(),
                     ]).context("append q_edge end-tile")?;
                 }
                 *edge_idx += 1;
@@ -429,4 +436,129 @@ pub(crate) fn run_pipeline(
 
     drop(conn);
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for a real bug: q_edges was created without a split_idx
+    /// column even though tile_from_duckdb (shared with osm_low_memory) selects
+    /// one unconditionally, so this whole path crashed with a DuckDB Binder
+    /// Error at the tiling stage for every --roads --low-memory build.
+    #[test]
+    fn run_pipeline_end_to_end_does_not_crash_on_missing_split_idx() {
+        let dir = tempfile::tempdir().unwrap();
+        let roads_path = dir.path().join("roads.geojsonl");
+        std::fs::write(
+            &roads_path,
+            concat!(
+                r#"{"id":1,"frc":3,"fow":3,"flowdir":1,"from_int":100,"to_int":101,"geometry":{"type":"LineString","coordinates":[[4.90,51.40],[4.91,51.41]]}}"#, "\n",
+                r#"{"id":2,"frc":4,"fow":3,"flowdir":1,"from_int":101,"to_int":102,"geometry":{"type":"LineString","coordinates":[[4.91,51.41],[4.92,51.42]]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let output_dir = dir.path().join("out");
+        run_pipeline(
+            &roads_path,
+            None,
+            &output_dir,
+            "test",
+            12,
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("low-memory generic pipeline must not crash on valid input");
+
+        let archive = output_dir.join("openlrlens-test-generic.pmtiles");
+        let meta = std::fs::metadata(&archive).expect("PMTiles archive must be written");
+        assert!(meta.len() > 127, "archive must contain at least a header and tile data");
+
+        let bytes = std::fs::read(&archive).unwrap();
+        assert_eq!(&bytes[0..7], b"PMTiles", "output must be a valid PMTiles archive");
+
+        assert!(output_dir.join("manifest.json").exists(), "manifest.json must be written");
+    }
+
+    // ── ID encoding ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn segment_and_node_id_bytes_are_disjoint() {
+        // segment_id_bytes puts the integer in bytes 0..8; node_id_bytes in 8..16 —
+        // same convention as osm_adapt::encode_way_id/encode_node_id, and for the
+        // same reason: a segment key and a node key with the same numeric value must
+        // never collide.
+        let same_numeric = 42i64;
+        assert_ne!(segment_id_bytes(same_numeric), node_id_bytes(same_numeric));
+        assert_eq!(&segment_id_bytes(same_numeric)[8..16], &[0u8; 8]);
+        assert_eq!(&node_id_bytes(same_numeric)[0..8], &[0u8; 8]);
+    }
+
+    #[test]
+    fn map_flowdir_matches_documented_convention() {
+        assert_eq!(map_flowdir(1), 1); // both
+        assert_eq!(map_flowdir(2), 2); // backward
+        assert_eq!(map_flowdir(3), 3); // forward
+        assert_eq!(map_flowdir(0), 1); // unknown -> both
+        assert_eq!(map_flowdir(99), 1); // unknown -> both
+    }
+
+    // ── GeoJSONL line parsing ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_line_accepts_flat_format() {
+        let mut seg_to_to_int = std::collections::HashMap::new();
+        let line = r#"{"id":1,"frc":3,"fow":3,"flowdir":1,"from_int":100,"to_int":101,"geometry":{"type":"LineString","coordinates":[[4.90,51.40],[4.91,51.41]]}}"#;
+        let edge = parse_line(line, &mut seg_to_to_int).unwrap().expect("valid line must parse");
+        assert_eq!(edge.frc, 3);
+        assert_eq!(edge.fow, 3);
+        assert_eq!(edge.direction, 1);
+        assert_eq!(edge.start_id, node_id_bytes(100));
+        assert_eq!(edge.end_id, node_id_bytes(101));
+        assert_eq!(edge.parent_id, segment_id_bytes(1));
+        assert_eq!(seg_to_to_int.get(&1), Some(&101));
+    }
+
+    #[test]
+    fn parse_line_accepts_geojson_feature_format() {
+        let mut seg_to_to_int = std::collections::HashMap::new();
+        let line = r#"{"type":"Feature","properties":{"id":2,"frc":4,"fow":2,"flowdir":2,"from_int":5,"to_int":6},"geometry":{"type":"LineString","coordinates":[[0,0],[1,1]]}}"#;
+        let edge = parse_line(line, &mut seg_to_to_int).unwrap().expect("valid Feature must parse");
+        assert_eq!(edge.frc, 4);
+        assert_eq!(edge.direction, 2); // backward
+    }
+
+    #[test]
+    fn parse_line_clamps_out_of_range_frc_fow() {
+        let mut seg_to_to_int = std::collections::HashMap::new();
+        let line = r#"{"id":1,"frc":99,"fow":-5,"flowdir":1,"from_int":1,"to_int":2,"geometry":{"type":"LineString","coordinates":[[0,0],[1,1]]}}"#;
+        let edge = parse_line(line, &mut seg_to_to_int).unwrap().unwrap();
+        assert_eq!(edge.frc, 7, "frc must clamp to the max valid value, not silently overflow u8");
+        assert_eq!(edge.fow, 0, "fow must clamp to the min valid value");
+    }
+
+    #[test]
+    fn parse_line_rejects_degenerate_geometry() {
+        let mut seg_to_to_int = std::collections::HashMap::new();
+        let line = r#"{"id":1,"frc":3,"fow":3,"flowdir":1,"from_int":1,"to_int":2,"geometry":{"type":"LineString","coordinates":[[0,0]]}}"#;
+        assert!(parse_line(line, &mut seg_to_to_int).unwrap().is_none(), "a single-point geometry must be skipped, not error");
+    }
+
+    #[test]
+    fn parse_line_errors_on_missing_required_field() {
+        let mut seg_to_to_int = std::collections::HashMap::new();
+        let line = r#"{"id":1,"frc":3,"fow":3,"flowdir":1,"from_int":1,"geometry":{"type":"LineString","coordinates":[[0,0],[1,1]]}}"#;
+        assert!(parse_line(line, &mut seg_to_to_int).is_err(), "a missing required field (to_int) must be a hard error, not silently defaulted");
+    }
+
+    #[test]
+    fn parse_line_errors_on_invalid_json() {
+        let mut seg_to_to_int = std::collections::HashMap::new();
+        assert!(parse_line("not json at all", &mut seg_to_to_int).is_err());
+    }
 }

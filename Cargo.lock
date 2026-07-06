@@ -1482,6 +1482,7 @@ dependencies = [
  "hex",
  "indicatif",
  "openlr-graph",
+ "openlr-provider",
  "osmpbf",
  "quick-xml",
  "rayon",

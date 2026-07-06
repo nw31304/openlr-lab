@@ -29,3 +29,8 @@ flate2           = "1"
 sysinfo          = { version = "0.30", default-features = false }
 osmpbf           = "0.3"
 indicatif        = "0.17"
+
+[dev-dependencies]
+# Reused only by tests, to decode a built PMTiles archive back into a Graph for
+# semantic (order-independent) comparison — see build.rs's osm_parity_tests.
+openlr-provider  = { path = "../crates/openlr-provider" }

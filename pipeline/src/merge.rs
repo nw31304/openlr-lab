@@ -142,7 +142,7 @@ fn build_directory(tile_entries: &[(u64, u64, u32)]) -> Result<(Vec<u8>, Vec<u8>
 
 // ── PMTiles reader (sequential tile scan) ────────────────────────────────────
 
-struct PmtilesReader {
+pub(crate) struct PmtilesReader {
     file:             File,
     tile_data_offset: u64,
     /// All actual tile entries (tile_id, data_offset, data_length), sorted ascending.
@@ -153,7 +153,7 @@ struct PmtilesReader {
 }
 
 impl PmtilesReader {
-    fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         let mut file = File::open(path)
             .with_context(|| format!("open {}", path.display()))?;
 
@@ -195,7 +195,7 @@ impl PmtilesReader {
     }
 
     /// Return the next `(tile_id, raw_bytes)` or `None` if exhausted.
-    fn next_tile(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
+    pub(crate) fn next_tile(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
         if self.pos >= self.entries.len() {
             return Ok(None);
         }
