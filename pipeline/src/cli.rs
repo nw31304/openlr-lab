@@ -77,7 +77,7 @@ pub struct BuildArgs {
     pub pbf: Option<String>,
 
     /// Path to an existing DuckDB file already populated per
-    /// pipeline/schema/canonical_schema.sql (canonical_edges/canonical_nodes/
+    /// pipeline/schema/canonical_schema.sql (canonical_edges/
     /// canonical_restrictions) — the entry point for any format-specific
     /// producer (SQL transform or any language with DuckDB bindings) that
     /// doesn't have a native importer in this pipeline. Always runs the

@@ -2,7 +2,7 @@
 --
 -- This is the interchange contract between a format-specific producer (a SQL
 -- transform, or a program in any language with DuckDB bindings) and the
--- openlr-lens pipeline binary. A producer populates these three tables in a
+-- openlr-lens pipeline binary. A producer populates these two tables in a
 -- DuckDB database file; the pipeline's "ingest from existing DuckDB" mode
 -- reads them directly and runs the same split/quantize/tile logic used by
 -- every other source (OSM, Overture, generic GeoJSONL).
@@ -15,7 +15,11 @@
 --     pipeline's own native importers instead of this path.)
 --   * Only vehicular, routable segments are present — non-vehicular segments
 --     (footpaths, cycleways, etc.) must already be filtered out.
---   * All three tables must exist, even if canonical_restrictions is empty.
+--   * Both tables must exist, even if canonical_restrictions is empty.
+--   * Every edge sharing a given node id agrees on that node's coordinate
+--     (its own geometry's first/last vertex) — the pipeline takes whichever
+--     edge it encounters first as that node's coordinate and does not
+--     cross-check the rest.
 --
 -- IDs are opaque UTF-8 strings, never surrogate/sequential integers (see
 -- CLAUDE.md Invariant 2: stable IDs must be deterministic and derived from
@@ -26,22 +30,26 @@
 -- prefix, so every id MUST be at most 255 bytes (UTF-8 byte length, not
 -- character count) — enforced below.
 
-CREATE TABLE IF NOT EXISTS canonical_nodes (
-    -- Persistent, source-defined identifier. Becomes the tile's stable_id
-    -- for this node. Never a hash, never a row number.
-    id  TEXT NOT NULL PRIMARY KEY CHECK (octet_length(encode(id)) BETWEEN 1 AND 255),
-    lon DOUBLE NOT NULL,  -- WGS84 degrees
-    lat DOUBLE NOT NULL   -- WGS84 degrees
-);
+-- There is deliberately no canonical_nodes table. A node's coordinate is
+-- already implied by whichever edge's geometry touches it (see the geometry
+-- column below), so a separate node table would just be a second place for a
+-- producer to state the same coordinate and risk it disagreeing with the
+-- first. Node *identity* (start_node_id/end_node_id/via_id) is carried
+-- entirely as opaque strings on canonical_edges/canonical_restrictions and
+-- becomes the tile's stable_id for that node; the pipeline derives each
+-- node's coordinate from the first edge endpoint it encounters that
+-- references it.
 
 CREATE TABLE IF NOT EXISTS canonical_edges (
     -- Persistent, source-defined identifier for this final (already-split)
     -- edge. Becomes the tile's stable_id for this segment.
     id             TEXT NOT NULL PRIMARY KEY CHECK (octet_length(encode(id)) BETWEEN 1 AND 255),
 
-    -- Foreign keys into canonical_nodes.id — NOT surrogate integers.
-    start_node_id  TEXT NOT NULL REFERENCES canonical_nodes(id),
-    end_node_id    TEXT NOT NULL REFERENCES canonical_nodes(id),
+    -- Persistent, source-defined node identifiers — NOT surrogate integers.
+    -- Not validated against a node table (there isn't one); the pipeline
+    -- treats a node id as real once it has seen it as some edge's endpoint.
+    start_node_id  TEXT NOT NULL CHECK (octet_length(encode(start_node_id)) BETWEEN 1 AND 255),
+    end_node_id    TEXT NOT NULL CHECK (octet_length(encode(end_node_id)) BETWEEN 1 AND 255),
 
     -- WGS84 LineString as WKT text, e.g. "LINESTRING (lon lat, lon lat, ...)".
     -- At least 2 points. First point must equal the start node's coordinate,
@@ -69,12 +77,13 @@ CREATE TABLE IF NOT EXISTS canonical_edges (
 
 CREATE TABLE IF NOT EXISTS canonical_restrictions (
     -- A turn restriction: travel from `from_id` through node `via_id` onto
-    -- `to_id` is prohibited. Every id must resolve within this same dataset —
-    -- from_id/to_id into canonical_edges.id, via_id into canonical_nodes.id,
-    -- and via_id must equal an endpoint shared by both edges (from_id's
-    -- end_node_id / to_id's start_node_id in the common case).
+    -- `to_id` is prohibited. from_id/to_id must resolve into canonical_edges.id;
+    -- via_id must equal a node id shared by both edges (from_id's end_node_id /
+    -- to_id's start_node_id in the common case) — not checked at the schema
+    -- level (there is no node table to check against), but the pipeline drops
+    -- any restriction where via_id doesn't actually connect from_id to to_id.
     from_id       TEXT NOT NULL REFERENCES canonical_edges(id),
-    via_id        TEXT NOT NULL REFERENCES canonical_nodes(id),
+    via_id        TEXT NOT NULL CHECK (octet_length(encode(via_id)) BETWEEN 1 AND 255),
     to_id         TEXT NOT NULL REFERENCES canonical_edges(id),
 
     -- Optional direction constraints, using the same vocabulary as

@@ -2,12 +2,16 @@
 ///
 /// Unlike every other low-memory path, there is no extraction step at all here —
 /// an external producer (a SQL transform, or any language with DuckDB bindings)
-/// has already populated `canonical_edges` / `canonical_nodes` /
-/// `canonical_restrictions` in the given DuckDB file, per
-/// `pipeline/schema/canonical_schema.sql`. This module attaches that database
-/// read-only, transforms its rows into the shared `q_edges` / `q_nodes` /
-/// `restriction_triples` scratch schema, and hands off to the shared
-/// `lowmem_tile::tile_from_duckdb`.
+/// has already populated `canonical_edges` / `canonical_restrictions` in the
+/// given DuckDB file, per `pipeline/schema/canonical_schema.sql`. This module
+/// attaches that database read-only, transforms its rows into the shared
+/// `q_edges` / `q_nodes` / `restriction_triples` scratch schema, and hands off
+/// to the shared `lowmem_tile::tile_from_duckdb`.
+///
+/// There is no `canonical_nodes` table — a node's coordinate is derived from
+/// whichever edge endpoint touching it is encountered first while scanning
+/// `canonical_edges` (see `extract_edges`), rather than read from a second,
+/// independently-producer-populated source of the same coordinate.
 ///
 /// Producer ids are opaque UTF-8 strings up to 255 bytes (see the schema file),
 /// not necessarily integers or 32-hex-digit UUIDs the way OSM/Overture ids are.
@@ -19,7 +23,7 @@
 /// Two different producer ids hashing to the same digest is checked for and
 /// hard-errors rather than silently merging two segments/nodes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -163,54 +167,26 @@ fn setup_duckdb(canonical_db_path: &Path, memory_mb_override: Option<u64>, temp_
     Ok(conn)
 }
 
-// ── Phase 1: nodes ────────────────────────────────────────────────────────────
+// ── Phase 1: edges (and the nodes derived from their endpoints) ───────────────
 
-fn extract_nodes(conn: &Connection, tile_zoom: u8, show_progress: bool) -> Result<()> {
-    let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM src.canonical_nodes", [], |r| r.get(0))?;
-    let pb = make_bar(show_progress, node_count.max(0) as u64, "Canonical nodes         ");
-
-    let mut registry = KeyRegistry::default();
-    let mut node_app = conn.appender("q_nodes").context("appender q_nodes")?;
-    let mut stmt = conn
-        .prepare("SELECT id, lon, lat, unhex(md5(id)) FROM src.canonical_nodes")
-        .context("prepare canonical_nodes scan")?;
-    let mut rows = stmt.query([]).context("query canonical_nodes")?;
-
-    let mut n = 0usize;
-    while let Some(row) = rows.next()? {
-        let id: String = row.get(0)?;
-        let lon: f64 = row.get(1)?;
-        let lat: f64 = row.get(2)?;
-        let key_blob: Vec<u8> = row.get(3)?;
-        let key = blob_to_key(&key_blob);
-        registry.check(key, &id)?;
-
-        let lon_e7 = quantize_coord(lon);
-        let lat_e7 = quantize_coord(lat);
-        let (tx, ty) = lon_lat_to_tile_xy(lon, lat, tile_zoom);
-        node_app
-            .append_row(params![&key[..], lon_e7, lat_e7, tx as i64, ty as i64, id.as_str()])
-            .context("append q_node")?;
-        n += 1;
-        pb.inc(1);
-    }
-    node_app.flush().context("flush q_nodes")?;
-    pb.finish_and_clear();
-    info!(nodes = n, "canonical nodes extracted");
-    Ok(())
-}
-
-// ── Phase 2: edges ────────────────────────────────────────────────────────────
-
+/// Scans `canonical_edges` once, writing both `q_edges` and `q_nodes`. There is
+/// no `canonical_nodes` table to scan separately: the first time a node id is
+/// seen as some edge's `start_node_id`/`end_node_id`, that edge's geometry
+/// endpoint becomes its coordinate (see canonical_schema.sql's precondition
+/// that every edge touching a given node agrees on its coordinate).
 fn extract_edges(conn: &Connection, tile_zoom: u8, show_progress: bool) -> Result<()> {
     let edge_count: i64 = conn.query_row("SELECT COUNT(*) FROM src.canonical_edges", [], |r| r.get(0))?;
     let pb = make_bar(show_progress, edge_count.max(0) as u64, "Canonical edges         ");
 
-    let mut registry = KeyRegistry::default();
+    let mut edge_registry = KeyRegistry::default();
+    let mut node_registry = KeyRegistry::default();
+    let mut seen_nodes: HashSet<[u8; 16]> = HashSet::new();
     let mut edge_app = conn.appender("q_edges").context("appender q_edges")?;
+    let mut node_app = conn.appender("q_nodes").context("appender q_nodes")?;
     let mut stmt = conn
         .prepare(
             "SELECT id, geometry, frc::BIGINT, fow::BIGINT, direction, \
+                    start_node_id, end_node_id, \
                     unhex(md5(id)), unhex(md5(start_node_id)), unhex(md5(end_node_id)) \
              FROM src.canonical_edges",
         )
@@ -218,20 +194,25 @@ fn extract_edges(conn: &Connection, tile_zoom: u8, show_progress: bool) -> Resul
     let mut rows = stmt.query([]).context("query canonical_edges")?;
 
     let mut edge_idx: u32 = 0;
+    let mut n_nodes = 0usize;
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
         let geometry: String = row.get(1)?;
         let frc: u8 = row.get::<_, i64>(2)? as u8;
         let fow: u8 = row.get::<_, i64>(3)? as u8;
         let direction_str: String = row.get(4)?;
-        let parent_blob: Vec<u8> = row.get(5)?;
-        let start_blob:  Vec<u8> = row.get(6)?;
-        let end_blob:    Vec<u8> = row.get(7)?;
+        let start_node_id: String = row.get(5)?;
+        let end_node_id: String = row.get(6)?;
+        let parent_blob: Vec<u8> = row.get(7)?;
+        let start_blob:  Vec<u8> = row.get(8)?;
+        let end_blob:    Vec<u8> = row.get(9)?;
 
         let parent_id = blob_to_key(&parent_blob);
         let start_id  = blob_to_key(&start_blob);
         let end_id    = blob_to_key(&end_blob);
-        registry.check(parent_id, &id)?;
+        edge_registry.check(parent_id, &id)?;
+        node_registry.check(start_id, &start_node_id)?;
+        node_registry.check(end_id, &end_node_id)?;
 
         let direction = map_direction(&direction_str)?;
 
@@ -254,6 +235,25 @@ fn extract_edges(conn: &Connection, tile_zoom: u8, show_progress: bool) -> Resul
         let (elon, elat) = *float_geom.last().unwrap();
         let (stx, sty) = lon_lat_to_tile_xy(slon, slat, tile_zoom);
         let (etx, ety) = lon_lat_to_tile_xy(elon, elat, tile_zoom);
+
+        if seen_nodes.insert(start_id) {
+            node_app
+                .append_row(params![
+                    &start_id[..], quantize_coord(slon), quantize_coord(slat),
+                    stx as i64, sty as i64, start_node_id.as_str(),
+                ])
+                .context("append q_node")?;
+            n_nodes += 1;
+        }
+        if seen_nodes.insert(end_id) {
+            node_app
+                .append_row(params![
+                    &end_id[..], quantize_coord(elon), quantize_coord(elat),
+                    etx as i64, ety as i64, end_node_id.as_str(),
+                ])
+                .context("append q_node")?;
+            n_nodes += 1;
+        }
 
         // Canonical edges arrive already fully split (Invariant 1 is the
         // producer's responsibility, per canonical_schema.sql), so — exactly
@@ -287,8 +287,9 @@ fn extract_edges(conn: &Connection, tile_zoom: u8, show_progress: bool) -> Resul
         pb.inc(1);
     }
     edge_app.flush().context("flush q_edges")?;
+    node_app.flush().context("flush q_nodes")?;
     pb.finish_and_clear();
-    info!(edges = edge_idx, "canonical edges extracted");
+    info!(edges = edge_idx, nodes = n_nodes, "canonical edges and nodes extracted");
     Ok(())
 }
 
@@ -349,10 +350,7 @@ pub(crate) fn run_pipeline(
 
     let conn = setup_duckdb(canonical_db_path, duckdb_memory_mb, temp_dir)?;
 
-    info!("canonical: extracting nodes");
-    extract_nodes(&conn, tile_zoom, show_progress)?;
-
-    info!("canonical: extracting edges");
+    info!("canonical: extracting edges and nodes");
     extract_edges(&conn, tile_zoom, show_progress)?;
 
     info!("canonical: loading restrictions");

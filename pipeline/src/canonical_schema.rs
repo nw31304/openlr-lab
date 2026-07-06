@@ -16,7 +16,7 @@ use duckdb::Connection;
 /// schema shared between the published spec file and this binary.
 pub const SCHEMA_SQL: &str = include_str!("../schema/canonical_schema.sql");
 
-/// Create the three canonical tables in `conn` (`IF NOT EXISTS`, so this is
+/// Create the two canonical tables in `conn` (`IF NOT EXISTS`, so this is
 /// safe to call against a database a producer has already partially populated).
 pub fn create_canonical_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL).context("create canonical schema")
@@ -56,7 +56,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(table_count, 3);
+        assert_eq!(table_count, 2);
     }
 
     #[test]
@@ -70,34 +70,59 @@ mod tests {
 
     #[test]
     fn node_id_over_255_bytes_is_rejected() {
+        // Node ids only ever appear on canonical_edges (start_node_id/
+        // end_node_id) — there is no canonical_nodes table — so the byte-length
+        // CHECK has to live there instead.
         let conn = Connection::open_in_memory().unwrap();
         create_canonical_schema(&conn).unwrap();
         let too_long = "x".repeat(256);
         let err = conn.execute(
-            "INSERT INTO canonical_nodes VALUES (?, 0.0, 0.0)",
+            "INSERT INTO canonical_edges VALUES ('e1', ?, 'n2', 'LINESTRING (0 0, 1 1)', 3, 3, 'both')",
             duckdb::params![too_long],
         );
-        assert!(err.is_err(), "256-byte id must be rejected (tile format's stable_id_len is a u8)");
+        assert!(err.is_err(), "256-byte node id must be rejected (tile format's stable_id_len is a u8)");
 
         let exactly_255 = "x".repeat(255);
         conn.execute(
-            "INSERT INTO canonical_nodes VALUES (?, 0.0, 0.0)",
+            "INSERT INTO canonical_edges VALUES ('e1', ?, 'n2', 'LINESTRING (0 0, 1 1)', 3, 3, 'both')",
             duckdb::params![exactly_255],
         )
-        .expect("255-byte id must be accepted");
+        .expect("255-byte node id must be accepted");
     }
 
     #[test]
-    fn foreign_key_violation_is_rejected() {
+    fn edges_do_not_require_a_pre_declared_node() {
+        // The whole point of dropping canonical_nodes: an edge can reference
+        // any node id string without it existing anywhere else first.
         let conn = Connection::open_in_memory().unwrap();
         create_canonical_schema(&conn).unwrap();
-        conn.execute("INSERT INTO canonical_nodes VALUES ('n1', 0.0, 0.0)", [])
-            .unwrap();
-        let err = conn.execute(
-            "INSERT INTO canonical_edges VALUES ('e1', 'n1', 'does-not-exist', 'LINESTRING (0 0, 1 1)', 3, 3, 'both')",
+        conn.execute(
+            "INSERT INTO canonical_edges VALUES ('e1', 'n1', 'n2', 'LINESTRING (0 0, 1 1)', 3, 3, 'both')",
             [],
+        )
+        .expect("edge must not require its endpoints to exist in a separate node table");
+    }
+
+    #[test]
+    fn restriction_via_id_over_255_bytes_is_rejected() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_canonical_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO canonical_edges VALUES ('e1', 'n1', 'n2', 'LINESTRING (0 0, 1 1)', 3, 3, 'both')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO canonical_edges VALUES ('e2', 'n2', 'n3', 'LINESTRING (1 1, 2 2)', 3, 3, 'both')",
+            [],
+        )
+        .unwrap();
+        let too_long = "x".repeat(256);
+        let err = conn.execute(
+            "INSERT INTO canonical_restrictions (from_id, via_id, to_id) VALUES ('e1', ?, 'e2')",
+            duckdb::params![too_long],
         );
-        assert!(err.is_err(), "edge referencing a nonexistent node must be rejected");
+        assert!(err.is_err(), "256-byte via_id must be rejected");
     }
 
     #[test]
