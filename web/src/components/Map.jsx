@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { PMTiles } from 'pmtiles';
-import { useStore, getSegmentId, getSegGeomCache, getSegIdToTile, getTileGeomCache } from '../store.js';
+import { useStore, getSegmentId, getNodeId, getSegGeomCache, getSegIdToTile, getTileGeomCache } from '../store.js';
 import { useDraggable } from '../hooks.js';
 import { emptyState, applyStep, computeVisualState, stateToGeoJSON } from '../replayEngine.js';
 import { haversineM } from '../utils.js';
@@ -1306,8 +1306,10 @@ export default function MapView({ tilesBase, ready }) {
     }
     if (!e.features?.length) return;
     const props = e.features[0].properties;
+    const [z, x, y] = props.tile.split('/').map(Number);
+    const nodeId = getNodeId(z, x, y, props.local_index);
     closeAllPopups();
-    setNodeInfo(props);
+    setNodeInfo({ ...props, node_id: nodeId >= 0 ? nodeId : null });
     setNodeAnchor({ x: e.point.x, y: e.point.y });
     e.originalEvent.stopPropagation();
   }
@@ -2801,10 +2803,12 @@ export default function MapView({ tilesBase, ready }) {
             <table>
               <tbody>
                 {[
-                  ['Lat',      Number(nodeInfo.lat).toFixed(6)],
-                  ['Lon',      Number(nodeInfo.lon).toFixed(6)],
-                  ['Stable ID', nodeInfo.stable_id],
-                  ['Tile',     nodeInfo.tile],
+                  ['Lat',         Number(nodeInfo.lat).toFixed(6)],
+                  ['Lon',         Number(nodeInfo.lon).toFixed(6)],
+                  ['Tile',        nodeInfo.tile],
+                  ['Tile Index',  nodeInfo.local_index],
+                  ['ID',          nodeInfo.stable_id ?? '—'],
+                  ['Internal ID', nodeInfo.node_id != null ? nodeInfo.node_id : '— (decode first)'],
                 ].map(([k, v]) => (
                   <tr key={k}><td className="seg-info-key">{k}</td><td><b>{v}</b></td></tr>
                 ))}

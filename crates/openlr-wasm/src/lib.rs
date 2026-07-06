@@ -583,6 +583,33 @@ impl Decoder {
         serde_json::to_string(&mappings).unwrap()
     }
 
+    /// Return the internal graph node ID for the node at `(z, x, y, local_index)`,
+    /// or -1 if that tile/index combination is not currently loaded.
+    /// Useful for correlating map-click nodes with trace log `node_id` values.
+    ///
+    /// Returns `f64` rather than `i64` so JS receives a plain Number (not BigInt).
+    /// All node IDs are u32-bounded, so no precision is lost.
+    pub fn node_id_at(&self, z: u8, x: u32, y: u32, local_index: u32) -> f64 {
+        self.loader.node_tile.get(&(z, x, y, local_index))
+            .map(|id| id.0 as f64)
+            .unwrap_or(-1.0)
+    }
+
+    /// Return all loaded node→tile mappings as a JSON string.
+    ///
+    /// Each entry is `[node_id, z, x, y, local_index]`. Mirrors `all_segment_tile_mappings`,
+    /// except a boundary node's global ID can appear more than once — once per tile that
+    /// touches it, each at its own local index — since nodes (unlike segments) are shared
+    /// across tiles rather than homed to exactly one.
+    ///
+    /// Used by the JS layer to build its node_id → tile reverse-lookup map.
+    pub fn all_node_tile_mappings(&self) -> String {
+        let mappings: Vec<[u32; 5]> = self.loader.node_tile.iter()
+            .map(|(&(z, x, y, li), id)| [id.0, z as u32, x, y, li])
+            .collect();
+        serde_json::to_string(&mappings).unwrap()
+    }
+
     /// Return how many segments were loaded from tile `(z, x, y)`, or 0 if not loaded.
     pub fn tile_segment_count(&self, z: u8, x: u32, y: u32) -> u32 {
         self.loader.seg_tile.values()

@@ -38,6 +38,13 @@ export function getSegmentId(z, x, y, localIndex) {
   return _decoder.segment_id_at(z, x, y, localIndex);
 }
 
+/** Look up the internal graph node ID by tile + local index.  Returns -1 when
+ *  the tile hasn't been loaded by the decoder yet (e.g. before the first decode). */
+export function getNodeId(z, x, y, localIndex) {
+  if (!_decoder) return -1;
+  return _decoder.node_id_at(z, x, y, localIndex);
+}
+
 function defaultFrcTable() {
   const p = [0.00, 0.10, 0.25, 0.45, 0.65, 0.80, 0.90, 1.00];
   return Array.from({ length: 8 }, (_, i) =>
