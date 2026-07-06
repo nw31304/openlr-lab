@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::path::Path;
 
@@ -60,15 +60,6 @@ pub fn xyz_to_tile_id(z: u8, x: u32, y: u32) -> u64 {
     let acc = ((1u64 << (2 * z as u32)) - 1) / 3;
     let n = 1u64 << z;
     acc + hilbert_d(n, x as u64, y as u64)
-}
-
-fn edge_tile_key(edge: &QuantizedEdge, z: u8) -> TileKey {
-    let g = &edge.geometry;
-    let (lon_e7, lat_e7) = g[g.len() / 2]; // midpoint vertex
-    let lon = lon_e7 as f64 * 1e-7;
-    let lat = lat_e7 as f64 * 1e-7;
-    let (x, y) = lon_lat_to_tile_xy(lon, lat, z);
-    TileKey { z, x, y }
 }
 
 // ── Per-tile binary payload ───────────────────────────────────────────────────
@@ -148,7 +139,8 @@ fn build_tile_payload(
     node_order: &[[u8; 16]],
     node_index: &HashMap<[u8; 16], u32>,
     node_lookup: &HashMap<[u8; 16], (i32, i32)>,
-    boundary_nodes: &HashSet<[u8; 16]>,
+    node_to_tile: &HashMap<[u8; 16], TileKey>,
+    this_tile: TileKey,
     intra: &[IntraTileRestriction],
     cross: &[CrossTileRestriction],
 ) -> Vec<u8> {
@@ -282,7 +274,10 @@ fn build_tile_payload(
             warn!(id = %hex::encode(node_id), "node not found in lookup, using (0,0)");
             (0, 0)
         });
-        let is_boundary = boundary_nodes.contains(node_id);
+        // A node is a boundary node *relative to this tile* if this isn't the tile its
+        // own coordinate lives in — i.e. it's present here only because an edge that
+        // touches it was duplicated into this tile (see the edge-binning comment above).
+        let is_boundary = node_to_tile.get(node_id) != Some(&this_tile);
         let (nid_off, nid_len) = node_id_pool[node_local_idx];
         payload.extend_from_slice(&lon_e7.to_le_bytes());
         payload.extend_from_slice(&lat_e7.to_le_bytes());
@@ -610,11 +605,36 @@ pub fn write_tiles(
         .map(|n| (n.node_id, (n.lon_e7, n.lat_e7)))
         .collect();
 
-    // Bin edges into tiles by midpoint.
+    // Via-node tile: node_id → TileKey, routed by the node's own coordinate. This is
+    // also each node's home tile for boundary-flag purposes (see build_tile_payload).
+    let node_to_tile: HashMap<[u8; 16], TileKey> = nodes
+        .iter()
+        .map(|n| {
+            let lon = n.lon_e7 as f64 * 1e-7;
+            let lat = n.lat_e7 as f64 * 1e-7;
+            let (x, y) = lon_lat_to_tile_xy(lon, lat, tile_zoom);
+            (n.node_id, TileKey { z: tile_zoom, x, y })
+        })
+        .collect();
+
+    // Bin edges by endpoint tile, not geometry midpoint: a segment whose start and end
+    // node are both in the same tile lives only in that tile; otherwise it's present in
+    // BOTH its start-node's tile and its end-node's tile. The runtime A* engine relies on
+    // this exact invariant (crates/openlr-engine/src/astar.rs's is_boundary/NeedsTile
+    // handling only ever re-fetches a node's own home tile before expanding from it) —
+    // a segment binned anywhere else (e.g. by geometry midpoint) could silently vanish
+    // from A*'s view at a tile boundary with no error. lowmem_tile.rs's DuckDB-backed
+    // writer already implements this correctly; this must match it exactly.
     let mut tile_bins: HashMap<TileKey, Vec<usize>> = HashMap::new();
     for (i, edge) in edges.iter().enumerate() {
-        let key = edge_tile_key(edge, tile_zoom);
-        tile_bins.entry(key).or_default().push(i);
+        let start_tile = node_to_tile.get(&edge.start_node_id).copied()
+            .unwrap_or(TileKey { z: tile_zoom, x: 0, y: 0 });
+        let end_tile = node_to_tile.get(&edge.end_node_id).copied()
+            .unwrap_or(start_tile);
+        tile_bins.entry(start_tile).or_default().push(i);
+        if end_tile != start_tile {
+            tile_bins.entry(end_tile).or_default().push(i);
+        }
     }
 
     info!(
@@ -625,48 +645,24 @@ pub fn write_tiles(
         tile_zoom
     );
 
-    // Determine boundary nodes: any node shared across tile boundaries.
-    let mut node_tile_set: HashMap<[u8; 16], u32> = HashMap::new();
-    for (tile_key, tile_indices) in &tile_bins {
-        let tile_ord = tile_key.x ^ (tile_key.y << 16); // cheap tile identity scalar
-        for &idx in tile_indices {
-            let e = &edges[idx];
-            for id in [e.start_node_id, e.end_node_id] {
-                let entry = node_tile_set.entry(id).or_insert(tile_ord);
-                if *entry != tile_ord {
-                    *entry = u32::MAX; // sentinel: appears in multiple tiles
-                }
-            }
-        }
-    }
-    let boundary_nodes: HashSet<[u8; 16]> = node_tile_set
-        .into_iter()
-        .filter(|(_, v)| *v == u32::MAX)
-        .map(|(k, _)| k)
-        .collect();
-
-    info!(boundary_nodes = boundary_nodes.len(), "boundary nodes identified");
-
     // Pre-compute per-tile node orderings (needed for restriction local-index resolution).
     let tile_nodes: HashMap<TileKey, (Vec<[u8; 16]>, HashMap<[u8; 16], u32>)> = tile_bins
         .iter()
         .map(|(key, indices)| (*key, compute_tile_node_order(indices, &edges)))
         .collect();
 
-    // Local edge index within each tile: global_edge_idx → local_seg_idx.
-    let global_to_local_seg: HashMap<usize, u32> = tile_bins
-        .values()
-        .flat_map(|indices| indices.iter().enumerate().map(|(local, &global)| (global, local as u32)))
-        .collect();
-
-    // Via-node tile: node_id → TileKey (routed by node coordinates).
-    let node_to_tile: HashMap<[u8; 16], TileKey> = nodes
+    // Local edge index within each tile: since an edge can now appear in two tiles with
+    // a DIFFERENT local index in each, this must be computed per tile — a single global
+    // map (as before) would silently collide whenever an edge spans two tiles.
+    let tile_local_seg: HashMap<TileKey, HashMap<usize, u32>> = tile_bins
         .iter()
-        .map(|n| {
-            let lon = n.lon_e7 as f64 * 1e-7;
-            let lat = n.lat_e7 as f64 * 1e-7;
-            let (x, y) = lon_lat_to_tile_xy(lon, lat, tile_zoom);
-            (n.node_id, TileKey { z: tile_zoom, x, y })
+        .map(|(key, indices)| {
+            let local: HashMap<usize, u32> = indices
+                .iter()
+                .enumerate()
+                .map(|(local, &global)| (global, local as u32))
+                .collect();
+            (*key, local)
         })
         .collect();
 
@@ -702,12 +698,13 @@ pub fn write_tiles(
             None     => { n_skipped += 1; continue; }
         };
 
-        let from_tile = edge_tile_key(&edges[from_global], tile_zoom);
-        let to_tile   = edge_tile_key(&edges[to_global],   tile_zoom);
+        // Intra-tile iff both the from-edge and to-edge are actually present (as rows,
+        // per the endpoint-duplication binning above) in the via-node's own tile.
+        let local_map = tile_local_seg.get(&via_tile);
+        let from_local = local_map.and_then(|m| m.get(&from_global)).copied();
+        let to_local   = local_map.and_then(|m| m.get(&to_global)).copied();
 
-        if from_tile == via_tile && to_tile == via_tile {
-            let from_local = global_to_local_seg[&from_global];
-            let to_local   = global_to_local_seg[&to_global];
+        if let (Some(from_local), Some(to_local)) = (from_local, to_local) {
             tile_intra.entry(via_tile).or_default().push(IntraTileRestriction {
                 from_seg: from_local,
                 via_node: via_node_local,
@@ -780,7 +777,7 @@ pub fn write_tiles(
                 let cross = tile_cross.get(key).map(Vec::as_slice).unwrap_or(&[]);
                 let payload = build_tile_payload(
                     indices, &edges, node_order, node_index,
-                    &node_lookup, &boundary_nodes, intra, cross,
+                    &node_lookup, &node_to_tile, *key, intra, cross,
                 );
                 stmt.execute(duckdb::params![tile_id, payload])
                     .context("INSERT tile")?;
@@ -815,7 +812,7 @@ pub fn write_tiles(
                 let cross = tile_cross.get(key).map(Vec::as_slice).unwrap_or(&[]);
                 let payload = build_tile_payload(
                     indices, &edges, node_order, node_index,
-                    &node_lookup, &boundary_nodes, intra, cross,
+                    &node_lookup, &node_to_tile, *key, intra, cross,
                 );
                 (tile_id, payload)
             })
@@ -836,6 +833,7 @@ pub fn write_tiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     // ── Tile ID ───────────────────────────────────────────────────────────────
 
@@ -939,10 +937,11 @@ mod tests {
             ([1u8; 16], (1_747_700_000, -366_000_000)),
             ([2u8; 16], (1_748_000_000, -366_000_000)),
         ]);
-        let boundary = HashSet::new();
+        let node_to_tile: HashMap<[u8; 16], TileKey> = HashMap::new();
         let (node_order, node_index) = compute_tile_node_order(&[0], &edges);
         let payload = build_tile_payload(
-            &[0], &edges, &node_order, &node_index, &node_lookup, &boundary, &[], &[],
+            &[0], &edges, &node_order, &node_index, &node_lookup,
+            &node_to_tile, TileKey { z: 12, x: 0, y: 0 }, &[], &[],
         );
 
         assert_eq!(&payload[0..4], &TILE_MAGIC);
@@ -975,10 +974,11 @@ mod tests {
             ([1u8; 16], (0i32, 0i32)),
             ([2u8; 16], (2i32, 0i32)),
         ]);
-        let boundary = HashSet::new();
+        let node_to_tile: HashMap<[u8; 16], TileKey> = HashMap::new();
         let (node_order, node_index) = compute_tile_node_order(&[0], &edges);
         let payload = build_tile_payload(
-            &[0], &edges, &node_order, &node_index, &node_lookup, &boundary, &[], &[],
+            &[0], &edges, &node_order, &node_index, &node_lookup,
+            &node_to_tile, TileKey { z: 12, x: 0, y: 0 }, &[], &[],
         );
         let seg_id_len   = seg_stable_id_str(&[0u8; 16], 0).len();
         let node1_id_len = node_stable_id_str(&[1u8; 16]).len();
