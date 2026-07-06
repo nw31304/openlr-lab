@@ -126,6 +126,10 @@ impl Graph {
         self.restrictions.len()
     }
 
+    pub fn restrictions(&self) -> &[TurnRestriction] {
+        &self.restrictions
+    }
+
     /// Segments within `radius_m` of `(lon, lat)`. Returns `(segment_id, distance_m)`.
     ///
     /// Uses the spatial grid to visit only cells near the query point, keeping the

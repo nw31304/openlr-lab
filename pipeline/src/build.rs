@@ -689,3 +689,180 @@ pub(crate) fn write_top_manifest(
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
+
+// ── Parity tests: in-memory vs low-memory OSM path ────────────────────────────
+//
+// osm_extract+osm_adapt+quantize+tile::write_tiles (in-memory) and
+// osm_low_memory::run_pipeline (DuckDB-backed) are two independent
+// implementations of the same pipeline stages, kept in sync by hand. These
+// tests prove they agree on *decoded semantic content*, not on raw archive
+// bytes — byte-identity turned out to be too strict a bar: the in-memory
+// path's rayon-parallel PBF scan (osm_extract.rs's par_map_reduce) has
+// run-to-run ordering non-determinism of its own, confirmed empirically (two
+// back-to-back runs of the identical code on the identical input produced
+// different SHA-256 archive hashes at full NZ scale). That non-determinism
+// only ever reshuffles arbitrary tile-local array indices; it never changes a
+// persisted stable_id, so it's benign for correctness but makes raw-byte
+// comparison meaningless. Comparing decoded segments/nodes/restrictions as
+// order-independent sets, keyed by stable_id, is the correct bar.
+
+#[cfg(test)]
+mod osm_parity_tests {
+    use super::*;
+    use crate::osm_schema::OsmSchemaMapping;
+    use openlr_provider::TileLoader;
+
+    fn fixture_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/wellington-tiny.osm.pbf")
+    }
+
+    /// Decode every tile of the archive in `dir` into a Graph. The (z, x, y)
+    /// fed to `load_tile_at` is a synthetic, arbitrary-but-unique counter, not
+    /// the tile's real Hilbert tile_id — cross-tile stitching and restriction
+    /// resolution both key on stable_id strings, not on (z, x, y), so this is
+    /// sufficient to reconstruct the full graph for content comparison.
+    fn load_graph(dir: &Path) -> openlr_graph::Graph {
+        let archive = crate::find_pmtiles_in_dir(dir).expect("build must produce a .pmtiles archive");
+        let mut reader = crate::merge::PmtilesReader::open(&archive).expect("open PMTiles archive");
+        let mut loader = TileLoader::new();
+        let mut i: u32 = 0;
+        while let Some((_, bytes)) = reader.next_tile().expect("read tile") {
+            loader.load_tile_at(12, i, 0, &bytes).expect("load tile into graph");
+            i += 1;
+        }
+        loader.graph
+    }
+
+    /// Sorted, order-independent snapshot of a graph's decodable content —
+    /// everything an OpenLR decode actually depends on, keyed by the stable ids
+    /// that are supposed to survive a rebuild (Invariant 2), not by whatever
+    /// arbitrary tile-local array index a segment/node happened to land at.
+    #[derive(Debug, PartialEq)]
+    struct GraphSnapshot {
+        segments: Vec<(String, String, String, u8, u8, String, i64, Vec<(i64, i64)>)>,
+        nodes: Vec<(String, i64, i64)>,
+        restrictions: Vec<(String, String, String)>,
+    }
+
+    fn snapshot(graph: &openlr_graph::Graph) -> GraphSnapshot {
+        let node_stable = |id: openlr_graph::NodeId| {
+            graph.nodes.get(&id).expect("segment references a node not in the graph").stable_id.clone()
+        };
+
+        let mut segments: Vec<_> = graph
+            .segments
+            .values()
+            .map(|s| {
+                (
+                    s.stable_id.clone(),
+                    node_stable(s.start_node),
+                    node_stable(s.end_node),
+                    s.frc,
+                    s.fow,
+                    format!("{:?}", s.direction),
+                    (s.length_m * 100.0).round() as i64, // cm precision, matching the tile's length_cm
+                    s.geometry
+                        .iter()
+                        .map(|&(lon, lat)| ((lon * 1e7).round() as i64, (lat * 1e7).round() as i64))
+                        .collect(),
+                )
+            })
+            .collect();
+        segments.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut nodes: Vec<_> = graph
+            .nodes
+            .values()
+            .map(|n| (n.stable_id.clone(), (n.lon * 1e7).round() as i64, (n.lat * 1e7).round() as i64))
+            .collect();
+        nodes.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut restrictions: Vec<_> = graph
+            .restrictions()
+            .iter()
+            .map(|r| {
+                (
+                    graph.segments[&r.from_seg].stable_id.clone(),
+                    node_stable(r.via_node),
+                    graph.segments[&r.to_seg].stable_id.clone(),
+                )
+            })
+            .collect();
+        restrictions.sort();
+
+        GraphSnapshot { segments, nodes, restrictions }
+    }
+
+    /// Real, small (37 KB) OSM extract (osmium, `simple` strategy, central
+    /// Wellington) with ways, intersections, and turn restrictions — committed
+    /// to fixtures/ specifically for this test. Runs both pipelines end to end
+    /// with an actual bbox filter applied (so each implementation's own
+    /// separate bbox-filtering code — osm_extract's inline filter vs
+    /// osm_low_memory::apply_bbox_filter — gets exercised too), then compares
+    /// decoded graph content.
+    #[tokio::test]
+    async fn in_memory_and_low_memory_agree_on_decoded_content() {
+        let pbf = fixture_path();
+        assert!(pbf.exists(), "fixture missing: {}", pbf.display());
+
+        let schema = OsmSchemaMapping::load_default();
+        let bbox = crate::extent::resolve("174.7765,-41.2915,174.7780,-41.2900").unwrap();
+        let extent = "174.7765,-41.2915,174.7780,-41.2900";
+
+        let out_inmem = tempfile::tempdir().unwrap();
+        let out_lowmem = tempfile::tempdir().unwrap();
+
+        run_osm(&pbf, extent, bbox, &schema, out_inmem.path(), 12, false, false, None, None, false)
+            .await
+            .expect("in-memory OSM build must succeed");
+        run_osm(&pbf, extent, bbox, &schema, out_lowmem.path(), 12, true, false, None, None, false)
+            .await
+            .expect("low-memory OSM build must succeed");
+
+        let snap_inmem = snapshot(&load_graph(out_inmem.path()));
+        let snap_lowmem = snapshot(&load_graph(out_lowmem.path()));
+
+        assert!(!snap_inmem.segments.is_empty(), "fixture must produce at least one segment");
+        assert_eq!(snap_inmem, snap_lowmem, "in-memory and low-memory OSM paths must decode to identical graph content");
+    }
+
+    /// Same check at full scale against a real regional extract, for extra
+    /// confidence on code paths the tiny fixture can't exercise (the chunked
+    /// intersection-node GROUP BY, cursor-based way streaming, memory-limit
+    /// lowering/restoring around the adapt stage). Not run by default — needs
+    /// a multi-hundred-MB file this repo doesn't commit; run explicitly with
+    /// `cargo test -- --ignored` after placing new-zealand-latest.osm.pbf (or
+    /// any Geofabrik regional extract) at the repo root.
+    #[tokio::test]
+    #[ignore = "needs a large local .osm.pbf fixture; see doc comment"]
+    async fn in_memory_and_low_memory_agree_at_full_regional_scale() {
+        let pbf = Path::new(env!("CARGO_MANIFEST_DIR")).join("../new-zealand-latest.osm.pbf");
+        assert!(
+            pbf.exists(),
+            "place a regional .osm.pbf at {} to run this test",
+            pbf.display()
+        );
+
+        let schema = OsmSchemaMapping::load_default();
+        let bbox = crate::extent::resolve("NZ").unwrap();
+
+        let out_inmem = tempfile::tempdir().unwrap();
+        let out_lowmem = tempfile::tempdir().unwrap();
+
+        run_osm(&pbf, "NZ", bbox, &schema, out_inmem.path(), 12, false, false, None, None, true)
+            .await
+            .expect("in-memory OSM build must succeed");
+        run_osm(&pbf, "NZ", bbox, &schema, out_lowmem.path(), 12, true, false, None, None, true)
+            .await
+            .expect("low-memory OSM build must succeed");
+
+        let snap_inmem = snapshot(&load_graph(out_inmem.path()));
+        let snap_lowmem = snapshot(&load_graph(out_lowmem.path()));
+
+        assert!(!snap_inmem.segments.is_empty(), "regional fixture must produce at least one segment");
+        assert_eq!(
+            snap_inmem, snap_lowmem,
+            "in-memory and low-memory OSM paths must decode to identical graph content at regional scale"
+        );
+    }
+}
