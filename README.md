@@ -10,8 +10,8 @@ Two decode formats are supported:
 ## Architecture
 
 ```
-BUILD TIME  (a few times per year)
-  Road network source data ──▶ pipeline/ ──▶ PMTiles archive ──▶ R2 / CDN
+BUILD TIME  (a few times per year, separate repo: openlr-pmtiles)
+  Road network source data ──▶ openlr-pmtiles-build ──▶ PMTiles archive ──▶ R2 / CDN
 
 RUNTIME  (browser, no server)
   PMTiles (range reads) ──▶ TileLoader ──▶ OpenLRDataProvider ──▶ in-memory graph
@@ -34,7 +34,15 @@ All map I/O stays in JavaScript. WASM receives pre-fetched tile bytes and operat
 | `openlr-engine` | Candidate selection, A\* (`state = (node, incoming_segment)`), scoring, diagnostics |
 | `openlr-provider` | `OpenLRDataProvider` trait + `PmtilesProvider` implementation |
 | `openlr-wasm` | `wasm-bindgen` glue exposing `decode` / `decode_forced` to JS |
-| `pipeline` | One-shot CLI to build a PMTiles archive from Overture, OSM, or generic GeoJSONL source data |
+
+The PMTiles builder (`openlr-pmtiles-build`, ingesting Overture, OSM, generic
+GeoJSONL, or a canonical DuckDB source) lives in a separate repo,
+[openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles) — this repo is a
+consumer of the archives it produces, not the producer. Only the tile
+**format** (magic, header layout, segment/node/restriction records — see
+`CLAUDE.md §4–5`) is a contract shared between the two repos; a format change
+must land in openlr-pmtiles first, then propagate here to `openlr-provider`'s
+decoder.
 
 ### Web frontend
 
@@ -71,35 +79,17 @@ npm install
 npm run dev
 ```
 
-`npm run dev` starts both the Vite dev server (default `localhost:5173`) and a built-in tile server at `http://localhost:5176` (see the `tile-server` plugin in `vite.config.js`, which serves range requests out of `../out`) — no separate process needed. Override the tile source in the **Tile source** menu if you're pointing at a different archive or host.
+`npm run dev` starts both the Vite dev server (default `localhost:5173`) and a built-in tile server at `http://localhost:5176` (see the `tile-server` plugin in `vite.config.js`). By default it serves range requests out of `../out`; set `OPENLR_TILES_DIR` to point it at wherever [openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles) built its archives instead (e.g. `OPENLR_TILES_DIR=../../openlr-pmtiles/out npm run dev`). Override the tile source in the **Tile source** menu if you're pointing at a different archive or host.
 
 ### 3. Build a tile archive (optional — if you have road network data)
 
-```sh
-# NZ from a local PBF (~5 s)
-cargo run --release --bin openlr-lens-build -- \
-  build --extent NZ --pbf new-zealand-latest.osm.pbf --output ./out/nz-osm
-
-# Large region from PBF with low-memory DuckDB backend
-cargo run \
-  --release \
-  --bin openlr-lens-build -- \
-  build \
-  --extent world \
-  --pbf out/europe-latest.osm.pbf \
-  --output ./out/eur-osm \
-  --low-memory \
-  --progress \
-  --compress-tiles \
-  --duckdb-memory-mb 15000 \
-  --duckdb-temp-dir ./tmp/
-
-# Merge regional archives into one
-cargo run --release --bin openlr-lens-build -- \
-  merge --output out/world/world.pmtiles out/nz-osm out/eur-osm
-```
-
-For local dev, drop the resulting `.pmtiles` file into `out/` and the built-in Vite tile server (step 2) picks it up automatically. For a deployed build, serve it from any PMTiles-compatible host (e.g. [`pmtiles serve`](https://github.com/protomaps/go-pmtiles), or R2/CDN with range-request support) and point the app at it.
+Building PMTiles archives is a separate repo now:
+[openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles). See its README
+for build commands. Point this repo's dev server at its output via
+`OPENLR_TILES_DIR` (step 2), or serve the archive from any PMTiles-compatible
+host (e.g. [`pmtiles serve`](https://github.com/protomaps/go-pmtiles), or
+R2/CDN with range-request support) and point the app at it via the **Tile
+source** menu.
 
 ## Tile format
 

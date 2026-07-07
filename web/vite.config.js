@@ -58,7 +58,11 @@ export default defineConfig({
   plugins: [react(), {
     name: 'tile-server',
     configureServer() {
-      const tilesDir = path.resolve(__dirname, '../out');
+      // PMTiles archives are built by the separate openlr-pmtiles repo, not
+      // this one -- point OPENLR_TILES_DIR at wherever its `out/` directory
+      // landed (e.g. ../../openlr-pmtiles/out). Falls back to a local ../out
+      // for convenience if you've copied/symlinked output here instead.
+      const tilesDir = path.resolve(__dirname, process.env.OPENLR_TILES_DIR || '../out');
 
       const srv = http.createServer((req, res) => {
         if (req.method === 'OPTIONS') {

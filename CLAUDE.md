@@ -57,8 +57,8 @@ queries at runtime. Two decode formats: **OpenLR binary v3** (TomTom; 11.25° be
 ## 3. Architecture
 
 ```
-  BUILD TIME (few times/year)
-  Road network source data ──▶ [pipeline/] ──▶ PMTiles archive ──▶ R2 + CDN
+  BUILD TIME (few times/year — separate repo: openlr-pmtiles)
+  Road network source data ──▶ [openlr-pmtiles-build] ──▶ PMTiles archive ──▶ R2 + CDN
 
   RUNTIME (browser only, no server)
   PMTiles ──range reads──▶ [TileLoader] ──▶ [OpenLRDataProvider] ──▶ in-memory graph
@@ -76,7 +76,17 @@ engine needs a tile it yields a tile-key request to JS; JS fetches and resumes w
 injected. This keeps the Rust provider synchronous and avoids async-trait across FFI.
 
 Crates: `openlr-codec`, `openlr-graph`, `openlr-engine`, `openlr-provider`, `openlr-wasm`.
-Pipeline binary: `pipeline/`. Web frontend: `web/` (Vite + React + MapLibre GL JS).
+Web frontend: `web/` (Vite + React + MapLibre GL JS).
+
+The PMTiles builder lives in a separate repo,
+[openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles) (private) — this
+repo is a *consumer* of the archives it produces, not the producer. The only
+contract between the two repos is the tile **format** itself (§4–5 below);
+`openlr-provider`'s decoder must be updated here whenever that format changes
+there. openlr-pmtiles verifies its own output against the same spec with a
+self-contained test-only decoder (no dependency in either direction on this
+repo's crates) — if the two ever disagree, trust the format spec, not
+whichever side hasn't been updated yet.
 
 ---
 
@@ -154,17 +164,12 @@ Coordinate precision: 1e-7 degrees ≈ 1 cm. `geom_offset` is a vertex index (no
 
 ---
 
-## 6. Build pipeline — COMPLETE
+## 6. Build pipeline
 
-All steps implemented and verified on NZ (1.5 M edges, 4 680 tiles at z12). Schema mapping for
-schema-driven sources is **external TOML** (default: `pipeline/schema/overture-default.toml`),
-not hardcoded — pass `--schema` to point at a different source's taxonomy.
-
-**Remaining TODOs:**
-- Restrictions are 0 in output for the Overture ingestion path — its `prohibited_transitions`
-  schema mapping not yet validated against live data
-- `write_tiles` in tile.rs buffers all payloads before writing — streaming writer needed for world-scale
-- Scale to full planet
+Lives entirely in the separate [openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles)
+repo now — not in this one. See that repo's own docs (PreProcessing.md) for
+pipeline internals, schema config, CLI reference, and open TODOs. Nothing
+here should reference `pipeline/` paths or the pipeline binary directly.
 
 ---
 
@@ -251,10 +256,11 @@ Hard tolerances and soft penalties must stay distinct types. A decode is
 
 ## 13. Licensing & attribution (non-negotiable)
 
-Licensing depends entirely on the configured source data — verify it before every build. Sources
-derived from OSM (OSM directly, or any provider whose road-network theme is OSM-derived, e.g.
-Overture) carry **ODbL**: the derived tile store and all served output must preserve attribution
-and honour share-alike obligations. Document exact attribution text before public release.
+Licensing depends entirely on the configured source data — verified at build time in
+[openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles), not here. Sources derived from OSM
+(OSM directly, or any provider whose road-network theme is OSM-derived, e.g. Overture) carry
+**ODbL**: the derived tile store and all served output must preserve attribution and honour
+share-alike obligations. Document exact attribution text before public release.
 
 ---
 
@@ -263,6 +269,8 @@ and honour share-alike obligations. Document exact attribution text before publi
 - Prefer small, well-typed crates with clear boundaries. Codec must not leak format specifics past
   the unified LRP model; engine must not know which provider backs it.
 - Keep cost function additive/decomposable; keep hard tolerances and soft penalties separate types.
-- Maintain the `fixtures/` regression corpus; add a fixture whenever a decode behaviour is pinned.
+- This repo has no pipeline/tile-building code and no `fixtures/` corpus of its own — those live in
+  openlr-pmtiles. Don't reintroduce `pipeline/`-shaped code or dependencies here; a tile-format
+  change belongs there first, then propagates to `openlr-provider`'s decoder in this repo.
 - When a decision is genuinely open, state the assumption inline and proceed; never silently
   violate a Critical Invariant to make something compile.

@@ -6,7 +6,6 @@ members  = [
     "crates/openlr-engine",
     "crates/openlr-provider",
     "crates/openlr-wasm",
-    "pipeline",
 ]
 
 [workspace.package]
