@@ -383,20 +383,31 @@ const ENTRIES_PER_LEAF: usize = 16_384;
 /// archive.  Header is 127 bytes, leaving 16 257 bytes for the compressed root.
 const MAX_ROOT_COMPRESSED_BYTES: usize = 16_384 - 127;
 
-struct DirectoryParts {
-    root_compressed: Vec<u8>,
-    leaf_dirs_data: Vec<u8>, // compressed leaf directories concatenated
-    n_tiles: u64,            // total tile entries (run_length ≥ 1)
+pub(crate) struct DirectoryParts {
+    pub(crate) root_compressed: Vec<u8>,
+    pub(crate) leaf_dirs_data: Vec<u8>, // compressed leaf directories concatenated
+    #[allow(dead_code)]
+    pub(crate) n_tiles: u64,            // total tile entries (run_length ≥ 1)
 }
 
-/// Build the PMTiles v3 directory structure.
+/// Build the PMTiles v3 directory structure. Shared by both the in-memory
+/// writer (below) and merge.rs's StreamingWriter -- there must be exactly one
+/// implementation of this, not two kept in sync by hand: a second, divergent
+/// copy in merge.rs once dropped the size-fallback check entirely (always
+/// used a flat root whenever entry count was under ENTRIES_PER_LEAF,
+/// regardless of the root's actual compressed byte size), producing archives
+/// whose root directory silently exceeded every PMTiles reader's fixed
+/// 16 384-byte initial speculative read -- readers truncate the root
+/// directory to that window with no fallback fetch, so any tile whose
+/// directory entry landed past byte 16 384 failed to decode with exactly the
+/// gzip "stream ended early" error this was diagnosed from.
 ///
 /// Tries a flat root first; falls back to a 2-level hierarchy if the compressed
 /// root would exceed the 16 384-byte PMTiles header window.
 ///
 /// 2 levels is sufficient for planet-scale at any zoom:
 ///   z12 world ~500k tiles → ~31 leaves; z15 world ~5M tiles → ~306 leaves.
-fn build_directory(tile_entries: &[(u64, u64, u32)]) -> Result<DirectoryParts> {
+pub(crate) fn build_directory(tile_entries: &[(u64, u64, u32)]) -> Result<DirectoryParts> {
     let n = tile_entries.len();
 
     if n <= ENTRIES_PER_LEAF {
@@ -1061,6 +1072,51 @@ mod tests {
         let dir = build_directory(&entries).unwrap();
         assert!(!dir.leaf_dirs_data.is_empty(), "should have leaf dirs");
         assert_eq!(dir.n_tiles, n as u64);
+    }
+
+    #[test]
+    fn build_directory_falls_back_to_leaves_when_root_bytes_exceed_limit_even_under_entry_count() {
+        // Regression test for a real production bug: a sparse/scattered tile set
+        // (e.g. a source that only covers a handful of non-contiguous countries,
+        // like MultiNet-R) can need FEWER than ENTRIES_PER_LEAF entries yet still
+        // produce a compressed root directory over MAX_ROOT_COMPRESSED_BYTES,
+        // because large, non-sequential Hilbert-id deltas don't compress well.
+        // merge.rs::StreamingWriter used to call its own copy of this function
+        // that only checked entry count, never the actual compressed byte size --
+        // every PMTiles reader's fixed 16 384-byte initial read then silently
+        // truncated the root directory, corrupting any tile whose entry landed
+        // past that point. Confirmed against a real 11 906-tile archive: entry
+        // count (11 906) was under ENTRIES_PER_LEAF (16 384), but the compressed
+        // root directory came out to 31 551 bytes.
+        let n = 10_000usize;
+        // Well-distributed pseudo-random (splitmix64-style) tile ids AND varied
+        // per-tile lengths -- both matter. A real archive's tile payloads vary
+        // in size (unlike a constant "10" in the other tests here), which
+        // defeats gzip's ability to crush the length/offset sections down to
+        // nothing the way uniform test data would; id deltas alone compressed
+        // to a few hundred bytes in an earlier attempt at this test.
+        let mut ids: Vec<u64> = (0..n as u64)
+            .map(|i| i.wrapping_mul(0x9E3779B97F4A7C15) & 0x0000_FFFF_FFFF_FFFF)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut offset = 0u64;
+        let entries: Vec<(u64, u64, u32)> = ids
+            .iter()
+            .map(|&id| {
+                let length = 500 + ((id.wrapping_mul(2_654_435_761)) & 0xFFF) as u32;
+                let entry = (id, offset, length);
+                offset += length as u64;
+                entry
+            })
+            .collect();
+
+        assert!(entries.len() <= ENTRIES_PER_LEAF, "test setup: must stay under the entry-count threshold");
+        let dir = build_directory(&entries).unwrap();
+        assert!(
+            !dir.leaf_dirs_data.is_empty(),
+            "a root directory over MAX_ROOT_COMPRESSED_BYTES must fall back to leaves even when entry count alone wouldn't trigger it"
+        );
     }
 
     // ── ISO 8601 timestamp ────────────────────────────────────────────────────

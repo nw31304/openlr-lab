@@ -11,6 +11,12 @@ use tracing::{debug, info};
 
 // ── Varint helpers ────────────────────────────────────────────────────────────
 
+// write_uvarint/encode_directory here are only used by this module's own
+// round-trip tests (verifying decode_directory against a known-good
+// encoding) -- the actual write path goes through crate::tile::build_directory,
+// the single shared implementation (see its doc comment for why there must
+// be only one).
+#[cfg(test)]
 fn write_uvarint(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let b = (v & 0x7F) as u8;
@@ -37,6 +43,7 @@ fn read_uvarint(data: &[u8], pos: &mut usize) -> Result<u64> {
 
 /// `entries`: `(tile_id, offset, length, run_length)`.
 /// `run_length >= 1` → tile; `run_length == 0` → leaf-directory pointer.
+#[cfg(test)]
 fn encode_directory(entries: &[(u64, u64, u32, u32)]) -> Vec<u8> {
     let mut raw = Vec::new();
     write_uvarint(&mut raw, entries.len() as u64);
@@ -102,42 +109,6 @@ fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     gz.read_to_end(&mut out).context("gzip decompress")?;
     Ok(out)
-}
-
-// ── Directory builder (mirrors tile.rs build_directory) ───────────────────────
-
-const ENTRIES_PER_LEAF: usize = 16_384;
-
-/// Build root + leaf directory blobs from a slice of `(tile_id, offset, length)`.
-/// Returns `(root_compressed, leaf_dirs_compressed_concatenated)`.
-fn build_directory(tile_entries: &[(u64, u64, u32)]) -> Result<(Vec<u8>, Vec<u8>)> {
-    if tile_entries.len() <= ENTRIES_PER_LEAF {
-        let entries: Vec<(u64, u64, u32, u32)> = tile_entries
-            .iter()
-            .map(|&(id, off, len)| (id, off, len, 1))
-            .collect();
-        let root = gzip_compress(&encode_directory(&entries))?;
-        Ok((root, Vec::new()))
-    } else {
-        let mut leaf_data: Vec<u8> = Vec::new();
-        let mut root_entries: Vec<(u64, u64, u32, u32)> = Vec::new();
-
-        for chunk in tile_entries.chunks(ENTRIES_PER_LEAF) {
-            let first_id    = chunk[0].0;
-            let leaf_offset = leaf_data.len() as u64;
-            let leaf_entries: Vec<(u64, u64, u32, u32)> = chunk
-                .iter()
-                .map(|&(id, off, len)| (id, off, len, 1))
-                .collect();
-            let compressed = gzip_compress(&encode_directory(&leaf_entries))?;
-            let leaf_len   = compressed.len() as u32;
-            leaf_data.extend_from_slice(&compressed);
-            root_entries.push((first_id, leaf_offset, leaf_len, 0));
-        }
-
-        let root = gzip_compress(&encode_directory(&root_entries))?;
-        Ok((root, leaf_data))
-    }
 }
 
 // ── PMTiles reader (sequential tile scan) ────────────────────────────────────
@@ -253,7 +224,8 @@ impl StreamingWriter {
 
     pub(crate) fn finish(mut self, output_path: &Path, tile_zoom: u8) -> Result<()> {
         let n_tiles = self.entries.len() as u64;
-        let (root_compressed, leaf_data) = build_directory(&self.entries)?;
+        let dir = crate::tile::build_directory(&self.entries)?;
+        let (root_compressed, leaf_data) = (dir.root_compressed, dir.leaf_dirs_data);
 
         let metadata            = b"{}";
         let root_dir_offset     = 127u64;
