@@ -670,13 +670,18 @@ pub fn write_tiles(
     let mut tile_intra: HashMap<TileKey, Vec<IntraTileRestriction>> = HashMap::new();
     let mut tile_cross: HashMap<TileKey, Vec<CrossTileRestriction>> = HashMap::new();
 
-    // from-edge: the split edge with parent == from_seg that ends at via_node.
-    // to-edge:   the split edge with parent == to_seg   that starts at via_node.
-    let mut from_edge_map: HashMap<([u8; 16], [u8; 16]), usize> = HashMap::new();
-    let mut to_edge_map:   HashMap<([u8; 16], [u8; 16]), usize> = HashMap::new();
+    // Keyed by (parent_id, endpoint_node_id) for EITHER endpoint of the split edge,
+    // not just the "arrival" end a from/to role would imply -- a restriction's
+    // via-node is whichever real-world junction the from/to edge actually touches,
+    // regardless of which end that happens to be relative to the edge's own
+    // digitized start/end order. Keying only by end (for from-edges) or only by
+    // start (for to-edges) silently drops any restriction where an edge is entered
+    // or left against its digitized direction, a real, common case for
+    // bidirectional edges (see the equivalent fix in lowmem_tile.rs).
+    let mut edge_endpoint_map: HashMap<([u8; 16], [u8; 16]), usize> = HashMap::new();
     for (i, e) in edges.iter().enumerate() {
-        from_edge_map.insert((e.parent_id, e.end_node_id),   i);
-        to_edge_map.insert(  (e.parent_id, e.start_node_id), i);
+        edge_endpoint_map.insert((e.parent_id, e.start_node_id), i);
+        edge_endpoint_map.insert((e.parent_id, e.end_node_id),   i);
     }
 
     let mut n_resolved = 0usize;
@@ -687,10 +692,10 @@ pub fn write_tiles(
             Some(&t) => t,
             None     => { n_skipped += 1; continue; }
         };
-        let Some(&from_global) = from_edge_map.get(&(r.from_segment_id, via_bytes)) else {
+        let Some(&from_global) = edge_endpoint_map.get(&(r.from_segment_id, via_bytes)) else {
             n_skipped += 1; continue;
         };
-        let Some(&to_global) = to_edge_map.get(&(r.to_segment_id, via_bytes)) else {
+        let Some(&to_global) = edge_endpoint_map.get(&(r.to_segment_id, via_bytes)) else {
             n_skipped += 1; continue;
         };
         let via_node_local = match tile_nodes.get(&via_tile).and_then(|(_, idx)| idx.get(&via_bytes)) {
@@ -1066,5 +1071,83 @@ mod tests {
         assert_eq!(ts.len(), 20); // "YYYY-MM-DDTHH:MM:SSZ"
         assert_eq!(&ts[10..11], "T");
         assert_eq!(&ts[19..20], "Z");
+    }
+
+    // ── Restriction resolution ───────────────────────────────────────────────────
+
+    #[test]
+    fn restriction_resolves_regardless_of_edge_traversal_direction() {
+        // Regression test (mirrors lowmem_tile.rs's equivalent): the restriction
+        // resolver used to require via_node_id to be specifically the from-edge's
+        // digitized END and the to-edge's digitized START, silently dropping any
+        // restriction where an edge is entered or left against its own digitized
+        // direction -- a real, common case for bidirectional edges (empirically
+        // ~59% of otherwise-valid MultiNet-R maneuvers were dropped by this before
+        // the fix). Both edges below are digitized backward relative to the
+        // restriction's actual travel direction through node_via.
+        let tile_zoom = 12u8;
+
+        let node_a:      [u8; 16] = [1u8; 16];
+        let node_via:    [u8; 16] = [2u8; 16];
+        let node_b:      [u8; 16] = [3u8; 16];
+        let parent_from: [u8; 16] = [8u8; 16];
+        let parent_to:   [u8; 16] = [9u8; 16];
+
+        let nodes = vec![
+            QuantizedNode { node_id: node_a,   lon_e7: 100_000_000, lat_e7: 500_000_000 },
+            QuantizedNode { node_id: node_via, lon_e7: 100_005_000, lat_e7: 500_000_000 },
+            QuantizedNode { node_id: node_b,   lon_e7: 100_010_000, lat_e7: 500_000_000 },
+        ];
+
+        // Digitized node_via -> node_a: arriving at node_via means traversing it
+        // backward (from its digitized end toward its start).
+        let edge_from = QuantizedEdge {
+            start_node_id: node_via, end_node_id: node_a,
+            geometry: vec![(100_005_000, 500_000_000), (100_000_000, 500_000_000)],
+            length_cm: 10, frc: 3, fow: 3, direction: Direction::Both,
+            parent_id: parent_from, split_idx: 0,
+        };
+        // Digitized node_b -> node_via: leaving node_via toward node_b means
+        // traversing it backward too (from its digitized end toward its start).
+        let edge_to = QuantizedEdge {
+            start_node_id: node_b, end_node_id: node_via,
+            geometry: vec![(100_010_000, 500_000_000), (100_005_000, 500_000_000)],
+            length_cm: 10, frc: 3, fow: 3, direction: Direction::Both,
+            parent_id: parent_to, split_idx: 0,
+        };
+
+        let restriction = RestrictionTriple {
+            from_segment_id: parent_from,
+            via_node_id: node_via,
+            to_segment_id: parent_to,
+            flags: 0,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        write_tiles(
+            vec![edge_from, edge_to], nodes, vec![restriction],
+            tile_zoom, dir.path(), "test", "test", false, false,
+        ).unwrap();
+
+        let archive = crate::find_pmtiles_in_dir(dir.path()).unwrap();
+        let mut reader = crate::merge::PmtilesReader::open(&archive).unwrap();
+        let (_, bytes) = reader.next_tile().unwrap().expect("must produce exactly one tile");
+        assert!(reader.next_tile().unwrap().is_none(), "all nodes/edges share one tile");
+
+        let mut loader = openlr_provider::TileLoader::new();
+        loader.load_tile_at(tile_zoom, 0, 0, &bytes).unwrap();
+        let graph = loader.graph;
+
+        assert_eq!(
+            graph.restrictions().len(), 1,
+            "restriction must resolve even though both edges are traversed against their digitized direction"
+        );
+        let r = &graph.restrictions()[0];
+        let from_seg = graph.segments.get(&r.from_seg).expect("from_seg must exist");
+        let to_seg   = graph.segments.get(&r.to_seg).expect("to_seg must exist");
+        let via_node = graph.nodes.get(&r.via_node).expect("via_node must exist");
+        assert_eq!(from_seg.stable_id, seg_stable_id_str(&parent_from, 0));
+        assert_eq!(to_seg.stable_id, seg_stable_id_str(&parent_to, 0));
+        assert_eq!(via_node.stable_id, node_stable_id_str(&node_via));
     }
 }

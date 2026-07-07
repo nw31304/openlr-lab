@@ -358,8 +358,16 @@ pub(crate) fn tile_from_duckdb(
 
     // ── Scan edge metadata to build edge maps and tile count ─────────────────────
     let mut seen_tile_ids: HashSet<u64>  = HashSet::new();
-    let mut from_edge_map: HashMap<([u8; 16], [u8; 16]), u32> = HashMap::new();
-    let mut to_edge_map:   HashMap<([u8; 16], [u8; 16]), u32> = HashMap::new();
+    // Keyed by (parent_id, endpoint_node_id) for EITHER endpoint of the edge, not
+    // just the "arrival" end a from/to role would imply -- a restriction's via-node
+    // is whichever real-world junction the from/to edge actually touches, regardless
+    // of which end that happens to be relative to the edge's own digitized
+    // start/end order. A single from_edge_map/to_edge_map split (keyed only by end/
+    // start respectively) silently drops any restriction where an edge is entered or
+    // left against its digitized direction -- a real, common case for bidirectional
+    // edges, confirmed empirically against MultiNet-R maneuvers (59% of otherwise-
+    // valid 2-hop restrictions were dropped before this fix).
+    let mut edge_endpoint_map: HashMap<([u8; 16], [u8; 16]), u32> = HashMap::new();
     let mut edge_stable_id: HashMap<u32, String> = HashMap::new();
     {
         let mut stmt = conn.prepare(
@@ -381,9 +389,9 @@ pub(crate) fn tile_from_duckdb(
             seen_tile_ids.insert(tile_id);
 
             // Same edge may appear twice (start tile + end tile); HashMap insert is
-            // idempotent here since both rows carry identical (parent_id, end/start_id).
-            from_edge_map.insert((parent_id, end_id),   edge_idx);
-            to_edge_map.insert(  (parent_id, start_id), edge_idx);
+            // idempotent here since both rows carry identical (parent_id, start/end_id).
+            edge_endpoint_map.insert((parent_id, start_id), edge_idx);
+            edge_endpoint_map.insert((parent_id, end_id),   edge_idx);
             edge_stable_id.insert(edge_idx, stable_id);
         }
     }
@@ -408,10 +416,10 @@ pub(crate) fn tile_from_duckdb(
             let via_id  = blob_to_id(&via_blob);
             let to_id   = blob_to_id(&to_blob);
 
-            let from_edge_idx = match from_edge_map.get(&(from_id, via_id)) {
+            let from_edge_idx = match edge_endpoint_map.get(&(from_id, via_id)) {
                 Some(&i) => i, None => { n_skipped += 1; continue; }
             };
-            let to_edge_idx = match to_edge_map.get(&(to_id, via_id)) {
+            let to_edge_idx = match edge_endpoint_map.get(&(to_id, via_id)) {
                 Some(&i) => i, None => { n_skipped += 1; continue; }
             };
             let (via_tile_x, via_tile_y) = match node_to_tile.get(&via_id) {
@@ -809,5 +817,92 @@ mod tests {
             let b = graph.nodes.values().find(|n| n.stable_id == "nodeB").expect("node B must be present");
             assert_ne!(a.is_boundary, b.is_boundary, "in any one tile, exactly one endpoint is local and the other is boundary");
         }
+    }
+
+    #[test]
+    fn restriction_resolves_regardless_of_edge_traversal_direction() {
+        // Regression test: the restriction resolver used to require via_id to be
+        // specifically the from-edge's digitized END and the to-edge's digitized
+        // START, silently dropping any restriction where an edge is entered or
+        // left against its own digitized direction -- a real, common case for
+        // bidirectional edges (empirically ~59% of otherwise-valid MultiNet-R
+        // maneuvers were dropped by this before the fix). Both eFrom and eTo
+        // below are digitized backward relative to the restriction's actual
+        // travel direction through nodeVia.
+        let tile_zoom = 12u8;
+        let (tx, ty) = lon_lat_to_tile_xy(10.0, 50.0, tile_zoom);
+
+        let node_a:    [u8; 16] = [1u8; 16];
+        let node_via:  [u8; 16] = [2u8; 16];
+        let node_b:    [u8; 16] = [3u8; 16];
+        let edge_from: [u8; 16] = [8u8; 16];
+        let edge_to:   [u8; 16] = [9u8; 16];
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_scratch_schema(&conn);
+
+        for (id, lon_e7, lat_e7, name) in [
+            (node_a,   100_000_000i32, 500_000_000i32, "nodeA"),
+            (node_via, 100_005_000i32, 500_000_000i32, "nodeVia"),
+            (node_b,   100_010_000i32, 500_000_000i32, "nodeB"),
+        ] {
+            conn.execute(
+                "INSERT INTO q_nodes VALUES (?, ?, ?, ?, ?, ?)",
+                params![&id[..], lon_e7, lat_e7, tx as i64, ty as i64, name],
+            ).unwrap();
+        }
+
+        // eFrom is digitized nodeVia -> nodeA: arriving at nodeVia means
+        // traversing it backward (from its digitized end toward its start).
+        let from_geom = geom_to_blob(&[(100_005_000, 500_000_000), (100_000_000, 500_000_000)]);
+        conn.execute(
+            "INSERT INTO q_edges VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                0i64, 0i64, &node_via[..], &node_a[..], &edge_from[..],
+                from_geom.as_slice(), 10i64, 3i64, 3i64, 0i64,
+                tx as i64, ty as i64, xyz_to_tile_id(tile_zoom, tx, ty) as i64, "eFrom",
+            ],
+        ).unwrap();
+
+        // eTo is digitized nodeB -> nodeVia: leaving nodeVia toward nodeB means
+        // traversing it backward too (from its digitized end toward its start).
+        let to_geom = geom_to_blob(&[(100_010_000, 500_000_000), (100_005_000, 500_000_000)]);
+        conn.execute(
+            "INSERT INTO q_edges VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                1i64, 0i64, &node_b[..], &node_via[..], &edge_to[..],
+                to_geom.as_slice(), 10i64, 3i64, 3i64, 0i64,
+                tx as i64, ty as i64, xyz_to_tile_id(tile_zoom, tx, ty) as i64, "eTo",
+            ],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO restriction_triples VALUES (?, ?, ?, ?)",
+            params![&edge_from[..], &node_via[..], &edge_to[..], 0i64],
+        ).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        tile_from_duckdb(&conn, tile_zoom, dir.path(), "test", "test", false, false).unwrap();
+
+        let archive = crate::find_pmtiles_in_dir(dir.path()).unwrap();
+        let mut reader = crate::merge::PmtilesReader::open(&archive).unwrap();
+        let (_, bytes) = reader.next_tile().unwrap().expect("must produce exactly one tile");
+        assert!(reader.next_tile().unwrap().is_none(), "all nodes/edges share one tile");
+
+        let mut loader = openlr_provider::TileLoader::new();
+        loader.load_tile_at(tile_zoom, 0, 0, &bytes).unwrap();
+        let graph = loader.graph;
+
+        assert_eq!(
+            graph.restrictions().len(), 1,
+            "restriction must resolve even though both edges are traversed against their digitized direction"
+        );
+        let r = &graph.restrictions()[0];
+        let from_seg = graph.segments.get(&r.from_seg).expect("from_seg must exist");
+        let to_seg   = graph.segments.get(&r.to_seg).expect("to_seg must exist");
+        let via_node = graph.nodes.get(&r.via_node).expect("via_node must exist");
+        assert_eq!(from_seg.stable_id, "eFrom");
+        assert_eq!(to_seg.stable_id, "eTo");
+        assert_eq!(via_node.stable_id, "nodeVia");
     }
 }
