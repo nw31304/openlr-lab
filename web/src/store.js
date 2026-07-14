@@ -95,6 +95,7 @@ export const PRESETS = {
     max_path_search_factor:         4.0,
     max_astar_expansions:       50000,
     lfrcnp_tolerance:               2,
+    max_interior_turn_deviation_deg: 180.0,
     max_routing_attempts:           0,
     trace_level: 'Summary',
   },
@@ -117,6 +118,7 @@ export const PRESETS = {
     max_path_search_factor:         5.0,
     max_astar_expansions:      100000,
     lfrcnp_tolerance:               2,
+    max_interior_turn_deviation_deg: 150.0,
     max_routing_attempts:          10,
     trace_level: 'Summary',
   },
@@ -139,6 +141,7 @@ export const PRESETS = {
     max_path_search_factor:         3.0,
     max_astar_expansions:           0,
     lfrcnp_tolerance:               0,
+    max_interior_turn_deviation_deg: 120.0,
     max_routing_attempts:           5,
     trace_level: 'Summary',
   },
@@ -709,7 +712,8 @@ export const useStore = create(persist(
           console.log(
             `[TRACE] A* leg ${t.leg}: ${t.nodes_expanded} expansions, reason=${JSON.stringify(t.reason)}` +
             ` skipped: frc=${t.edges_skipped_frc} dir=${t.edges_skipped_direction}` +
-            ` turn=${t.edges_skipped_turn} dist=${t.edges_skipped_distance}`
+            ` turn=${t.edges_skipped_turn} dist=${t.edges_skipped_distance}` +
+            ` sharp_turn=${t.edges_skipped_sharp_turn}`
           );
         });
       }

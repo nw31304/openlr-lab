@@ -138,6 +138,13 @@ pub struct DecodeParams {
     /// Extra FRC steps added to the encoded LFRCNP floor before passing to A*.
     /// Compensates for FRC mapping differences between encoder and decoder maps.
     pub lfrcnp_tolerance: u8,
+    /// Turn-angle gate: an interior A* edge is rejected if the geometric turn at
+    /// its node deviates from straight-ahead by more than this many degrees
+    /// (`0` = dead ahead only, `180` = a full U-turn). Set to `180.0` to disable.
+    /// Independent of `max_bearing_deviation_deg`, which only scores LRP endpoint
+    /// candidates and never constrains the interior path search.
+    #[serde(default = "default_max_interior_turn_deviation_deg")]
+    pub max_interior_turn_deviation_deg: f64,
 
     // ── Routing ───────────────────────────────────────────────────────────────
     /// Maximum total candidate-combination routing attempts across all legs
@@ -151,9 +158,10 @@ pub struct DecodeParams {
     pub trace_level: TraceLevel,
 }
 
-fn default_max_bearing_deviation_deg() -> f64 { 45.0 }
-fn default_max_candidate_score()        -> f64 { 1.5 }
-fn default_max_routing_attempts()       -> usize { 10 }
+fn default_max_bearing_deviation_deg()        -> f64 { 45.0 }
+fn default_max_candidate_score()              -> f64 { 1.5 }
+fn default_max_routing_attempts()             -> usize { 10 }
+fn default_max_interior_turn_deviation_deg()  -> f64 { 150.0 }
 
 impl DecodeParams {
     pub fn preset(p: Preset) -> Self {
@@ -177,6 +185,7 @@ impl DecodeParams {
                 max_path_search_factor:          4.0,
                 max_astar_expansions:         50_000,
                 lfrcnp_tolerance:                  2,
+                max_interior_turn_deviation_deg: 180.0,
                 max_routing_attempts:              0,
                 trace_level: TraceLevel::Summary,
             },
@@ -200,6 +209,7 @@ impl DecodeParams {
                 max_path_search_factor:          3.0,
                 max_astar_expansions:              0,
                 lfrcnp_tolerance:                  0,
+                max_interior_turn_deviation_deg: 120.0,
                 max_routing_attempts:              5,
                 trace_level: TraceLevel::Summary,
             },
@@ -228,6 +238,7 @@ impl Default for DecodeParams {
             max_path_search_factor:          5.0,
             max_astar_expansions:        100_000,
             lfrcnp_tolerance:                  2,
+            max_interior_turn_deviation_deg: 150.0,
             max_routing_attempts:             10,
             trace_level: TraceLevel::Summary,
         }

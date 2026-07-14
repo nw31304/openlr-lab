@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use crate::{NetworkNode, NetworkSegment, NodeId, SegmentId, TurnRestriction, Direction, TileKey};
-use crate::geometry::{haversine_m, project_onto_polyline};
+use crate::geometry::{bearing_at_offset, haversine_m, polyline_length_m, project_onto_polyline};
 
 // Grid cell size: 1/500 degree ≈ 222 m at equator.  Fine enough to cover the
 // default 30 m candidate radius in a 3×3 neighbourhood and the 200 m permissive
@@ -24,6 +24,28 @@ pub enum EdgeSkipReason {
     /// (indicates a graph-construction inconsistency), but surfaced here so it
     /// is never silently swallowed.
     DirectionBlocked,
+    /// The geometric turn angle at `node` exceeds `max_turn_deviation_deg`: the
+    /// route would double back on itself more sharply than configured.
+    SharpTurn { deviation_deg: f64 },
+}
+
+/// Compass bearing (degrees) from `node`'s position out along `seg`, away from
+/// the node — i.e. what you'd face standing at the junction looking into this
+/// road, regardless of which end of the segment `node` is or which way the
+/// segment is traversed. Used to measure the geometric angle between two roads
+/// meeting at a node. Returns `None` if `node` is not an endpoint of `seg` or
+/// the geometry is degenerate.
+fn bearing_away_from_node(seg: &NetworkSegment, node: NodeId) -> Option<f64> {
+    if seg.geometry.len() < 2 {
+        return None;
+    }
+    if seg.start_node == node {
+        Some(bearing_at_offset(&seg.geometry, 0.0, true))
+    } else if seg.end_node == node {
+        Some(bearing_at_offset(&seg.geometry, polyline_length_m(&seg.geometry), false))
+    } else {
+        None
+    }
 }
 
 /// In-memory routing graph built from loaded tile data.
@@ -175,17 +197,37 @@ impl Graph {
         })
     }
 
+    /// Angular deviation from a straight-through continuation at `node`, in
+    /// degrees, `[0, 180]`. `0` = the route continues straight ahead; `180` =
+    /// the route doubles back on itself (a full U-turn). `None` if either
+    /// segment's geometry can't be read at `node` (missing/degenerate data —
+    /// callers should treat this permissively, not as a rejection).
+    fn turn_deviation_deg(&self, from_seg: SegmentId, node: NodeId, to_seg: SegmentId) -> Option<f64> {
+        let from = self.segments.get(&from_seg)?;
+        let to = self.segments.get(&to_seg)?;
+        let b_in = bearing_away_from_node(from, node)?;
+        let b_out = bearing_away_from_node(to, node)?;
+        let mut diff = (b_in - b_out).abs() % 360.0;
+        if diff > 180.0 {
+            diff = 360.0 - diff;
+        }
+        Some(180.0 - diff)
+    }
+
     /// Successor edges reachable from `(node, incoming_seg)`.
     ///
     /// Returns `(next_node, seg_id, length_m)` for every edge that:
     /// - can be entered from `node` in the direction it permits,
     /// - has `seg.frc ≤ lfrcnp` (LFRCNP floor — Invariant 9),
-    /// - is not blocked by an explicit turn restriction.
+    /// - is not blocked by an explicit turn restriction,
+    /// - does not double back more sharply than `max_turn_deviation_deg` allows
+    ///   (set to `180.0` to disable this gate).
     pub fn successors(
         &self,
         node: NodeId,
         incoming_seg: SegmentId,
         lfrcnp: u8,
+        max_turn_deviation_deg: f64,
     ) -> Vec<(NodeId, SegmentId, f64)> {
         let mut result = Vec::new();
         for &seg_id in self.outgoing.get(&node).into_iter().flatten() {
@@ -211,6 +253,14 @@ impl Graph {
                 Direction::Backward | Direction::Both if seg.end_node == node   => seg.start_node,
                 _ => continue,
             };
+            // Turn-angle gate: reject candidates that double back beyond the configured limit.
+            if max_turn_deviation_deg < 180.0 {
+                if let Some(dev) = self.turn_deviation_deg(incoming_seg, node, seg_id) {
+                    if dev > max_turn_deviation_deg {
+                        continue;
+                    }
+                }
+            }
             result.push((next_node, seg_id, seg.length_m));
         }
         result
@@ -226,6 +276,7 @@ impl Graph {
         node: NodeId,
         incoming_seg: SegmentId,
         lfrcnp: u8,
+        max_turn_deviation_deg: f64,
     ) -> Vec<(SegmentId, EdgeSkipReason)> {
         let mut skipped = Vec::new();
         for &seg_id in self.outgoing.get(&node).into_iter().flatten() {
@@ -249,6 +300,14 @@ impl Graph {
             };
             if !ok {
                 skipped.push((seg_id, EdgeSkipReason::DirectionBlocked));
+                continue;
+            }
+            if max_turn_deviation_deg < 180.0 {
+                if let Some(dev) = self.turn_deviation_deg(incoming_seg, node, seg_id) {
+                    if dev > max_turn_deviation_deg {
+                        skipped.push((seg_id, EdgeSkipReason::SharpTurn { deviation_deg: dev }));
+                    }
+                }
             }
         }
         skipped
@@ -287,10 +346,45 @@ mod tests {
         g.add_segment(make_seg(3, 1, 3, 3, Direction::Both)); // FRC=3
 
         // From node 1 via seg 1, LFRCNP=3 → seg 2 (FRC 4 > 3) should be excluded
-        let succs = g.successors(NodeId(1), SegmentId(1), 3);
+        let succs = g.successors(NodeId(1), SegmentId(1), 3, 180.0);
         let ids: Vec<_> = succs.iter().map(|s| s.1.0).collect();
         assert!(ids.contains(&3), "seg 3 should be included");
         assert!(!ids.contains(&2), "seg 2 FRC=4 exceeds lfrcnp=3");
+    }
+
+    /// Segment 1 runs west→east into node 1. Segment 2 continues straight east.
+    /// Segment 3 folds back to the southwest — from node 1 looking back along
+    /// seg 1 you face west; continuing onto seg 3 would send you almost the
+    /// same way you came, i.e. close to a U-turn.
+    #[test]
+    fn successors_turn_angle_gate() {
+        let mut g = Graph::new();
+        let mut seg1 = make_seg(1, 0, 1, 3, Direction::Both);
+        seg1.geometry = vec![(0.0, 0.0), (0.01, 0.0)]; // west -> east, arrives at node 1 heading east
+        let mut seg2 = make_seg(2, 1, 2, 3, Direction::Both);
+        seg2.geometry = vec![(0.01, 0.0), (0.02, 0.0)]; // continues straight east
+        let mut seg3 = make_seg(3, 1, 3, 3, Direction::Both);
+        seg3.geometry = vec![(0.01, 0.0), (0.0, -0.0001)]; // folds back almost due west
+        g.add_segment(seg1);
+        g.add_segment(seg2);
+        g.add_segment(seg3);
+
+        // Disabled (180.0): both the straight continuation and the near-U-turn pass.
+        let succs = g.successors(NodeId(1), SegmentId(1), 3, 180.0);
+        let ids: Vec<_> = succs.iter().map(|s| s.1.0).collect();
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
+
+        // Capped at 150°: the near-U-turn onto seg 3 is excluded, straight-ahead seg 2 survives.
+        let succs = g.successors(NodeId(1), SegmentId(1), 3, 150.0);
+        let ids: Vec<_> = succs.iter().map(|s| s.1.0).collect();
+        assert!(ids.contains(&2), "straight continuation should survive a 150° cap");
+        assert!(!ids.contains(&3), "near-U-turn should be excluded by a 150° cap");
+
+        let skipped = g.successors_skipped(NodeId(1), SegmentId(1), 3, 150.0);
+        assert!(skipped.iter().any(|(id, reason)| {
+            *id == SegmentId(3) && matches!(reason, EdgeSkipReason::SharpTurn { deviation_deg } if *deviation_deg > 150.0)
+        }));
     }
 
     #[test]

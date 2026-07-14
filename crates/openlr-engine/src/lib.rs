@@ -513,6 +513,7 @@ fn try_route_combination(
                     leg, from, to, graph, lfrcnp, dnp,
                     params.max_path_search_factor,
                     params.max_astar_expansions,
+                    params.max_interior_turn_deviation_deg,
                     trace,
                     zoom,
                 ) {

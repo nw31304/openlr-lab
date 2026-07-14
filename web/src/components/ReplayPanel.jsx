@@ -166,11 +166,13 @@ function describeStep(step) {
       const dir    = step.edges_skipped_direction  ?? 0;
       const turn   = step.edges_skipped_turn       ?? 0;
       const dist   = step.edges_skipped_distance   ?? 0;
+      const sharp  = step.edges_skipped_sharp_turn ?? 0;
       const parts  = [];
       if (frc  > 0) parts.push(`${frc} FRC-blocked`);
       if (turn > 0) parts.push(`${turn} turn-restricted`);
       if (dir  > 0) parts.push(`${dir} direction-blocked`);
       if (dist > 0) parts.push(`${dist} over-distance`);
+      if (sharp > 0) parts.push(`${sharp} sharp-turn`);
       const skipStr = parts.length > 0 ? ` · skips: ${parts.join(', ')}` : '';
       if (reason === 'OpenSetExhausted' || reason?.OpenSetExhausted !== undefined) {
         return `Leg ${step.leg + 1} — A* exhausted · ${step.nodes_expanded} nodes expanded${skipStr}`;

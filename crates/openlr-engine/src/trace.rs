@@ -163,6 +163,8 @@ pub enum SkipReason {
     DirectionBlocked,
     TurnRestricted,
     ExceedsMaxDistance { distance_m: f64, max_m: f64 },
+    /// The geometric turn angle at the node exceeds `max_interior_turn_deviation_deg`.
+    SharpTurn { deviation_deg: f64 },
 }
 
 /// Why routing failed for a candidate pair.
@@ -253,6 +255,8 @@ pub enum DecodeEvent {
         edges_skipped_turn: u32,
         /// Edges skipped because accumulated path distance would exceed the A* cap.
         edges_skipped_distance: u32,
+        /// Edges blocked by the turn-angle gate (`max_interior_turn_deviation_deg`).
+        edges_skipped_sharp_turn: u32,
     },
     /// The engine needs a tile that isn't loaded; caller must inject it.
     TileNeeded {

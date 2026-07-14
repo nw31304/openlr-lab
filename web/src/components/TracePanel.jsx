@@ -109,6 +109,7 @@ function fmtSkipReason(reason) {
     case 'DirectionBlocked':  return 'One-way — wrong direction';
     case 'TurnRestricted':    return 'Turn restriction';
     case 'ExceedsMaxDistance': return `Exceeds max dist (${data.distance_m?.toFixed(0)}m > ${data.max_m?.toFixed(0)}m)`;
+    case 'SharpTurn':          return `Sharp turn (${data.deviation_deg?.toFixed(0)}° deviation)`;
     default: return type;
   }
 }

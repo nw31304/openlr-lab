@@ -181,7 +181,7 @@ function diagnoseNoRoute(failedLeg, ranked, terminated, routeFailed) {
   }
 
   // Aggregate skip counts across all terminations for this leg.
-  let totalExpanded = 0, totalFrc = 0, totalDir = 0, totalTurn = 0, totalDist = 0;
+  let totalExpanded = 0, totalFrc = 0, totalDir = 0, totalTurn = 0, totalDist = 0, totalSharpTurn = 0;
   let hitLimit = false;
   let expansionLimit = 0;
   for (const t of legTerminated) {
@@ -190,12 +190,13 @@ function diagnoseNoRoute(failedLeg, ranked, terminated, routeFailed) {
     totalDir      += t.edges_skipped_direction ?? 0;
     totalTurn     += t.edges_skipped_turn      ?? 0;
     totalDist     += t.edges_skipped_distance  ?? 0;
+    totalSharpTurn += t.edges_skipped_sharp_turn ?? 0;
     if (t.reason?.ExpansionLimitHit !== undefined) {
       hitLimit = true;
       expansionLimit = t.reason.ExpansionLimitHit.limit;
     }
   }
-  const totalSkipped = totalFrc + totalDir + totalTurn + totalDist;
+  const totalSkipped = totalFrc + totalDir + totalTurn + totalDist + totalSharpTurn;
 
   const bullets = [];
   const suggestions = [];
@@ -221,6 +222,10 @@ function diagnoseNoRoute(failedLeg, ranked, terminated, routeFailed) {
     if (totalDist > 0) {
       bullets.push(`${totalDist} edge${totalDist !== 1 ? 's' : ''} pruned for exceeding max search distance.`);
       if (!hitLimit) suggestions.push('Increase max path search factor to allow longer detours.');
+    }
+    if (totalSharpTurn > 0) {
+      bullets.push(`${totalSharpTurn} edge${totalSharpTurn !== 1 ? 's' : ''} blocked by the turn-angle gate (doubled back too sharply).`);
+      suggestions.push('Raise max_interior_turn_deviation_deg if a legitimate route requires a tight turn (e.g. a cul-de-sac or service-road loop).');
     }
   }
 

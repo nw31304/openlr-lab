@@ -128,6 +128,7 @@ export function buildReplaySteps(events) {
           edges_skipped_direction: d.edges_skipped_direction ?? 0,
           edges_skipped_turn:      d.edges_skipped_turn      ?? 0,
           edges_skipped_distance:  d.edges_skipped_distance  ?? 0,
+          edges_skipped_sharp_turn: d.edges_skipped_sharp_turn ?? 0,
         });
         i++;
         break;

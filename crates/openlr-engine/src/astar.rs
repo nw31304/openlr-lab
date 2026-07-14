@@ -54,6 +54,9 @@ type OpenElem = (Reverse<F64Key>, F64Key, NodeId, SegmentId, Option<usize>);
 /// `lfrcnp` — the maximum (least-important) FRC allowed on this leg.
 /// `dnp`    — the encoding interval for distance-to-next; used to compute the hard
 ///            upper bound `dnp.ub × max_path_search_factor`.
+/// `max_turn_deviation_deg` — turn-angle gate; edges that double back more sharply
+///            than this (degrees, `[0,180]`) are excluded. `180.0` disables the gate.
+#[allow(clippy::too_many_arguments)]
 pub fn find_route(
     leg: usize,
     from: &ScoredCandidate,
@@ -63,6 +66,7 @@ pub fn find_route(
     dnp: LinearInterval,
     max_path_search_factor: f64,
     max_astar_expansions: usize,
+    max_turn_deviation_deg: f64,
     trace: &mut DecodeTrace,
     zoom: u8,
 ) -> Result<RouteResult, RoutingFailure> {
@@ -110,6 +114,7 @@ pub fn find_route(
     let mut skip_dir:  u32 = 0;
     let mut skip_turn: u32 = 0;
     let mut skip_dist: u32 = 0;
+    let mut skip_sharp_turn: u32 = 0;
 
     while let Some((_, g_key, node, via_seg, parent_idx)) = open.pop() {
         let g = g_key.0;
@@ -166,11 +171,12 @@ pub fn find_route(
         // Count (and at Full level: report) edges filtered out before A* sees them.
         // Called at Summary+ so AStarTerminated can carry aggregate counts without Full trace.
         if trace.params.trace_level != TraceLevel::Off {
-            for (seg_id, reason) in graph.successors_skipped(node, via_seg, lfrcnp) {
+            for (seg_id, reason) in graph.successors_skipped(node, via_seg, lfrcnp, max_turn_deviation_deg) {
                 match &reason {
                     EdgeSkipReason::FrcBelowLfrcnp { .. } => skip_frc  += 1,
                     EdgeSkipReason::TurnRestricted        => skip_turn += 1,
                     EdgeSkipReason::DirectionBlocked      => skip_dir  += 1,
+                    EdgeSkipReason::SharpTurn { .. }      => skip_sharp_turn += 1,
                 }
                 if trace.params.trace_level == TraceLevel::Full {
                     trace.push_full(Ev::AStarEdgeSkipped {
@@ -182,6 +188,8 @@ pub fn find_route(
                                 SkipReason::FrcBelowLfrcnp { seg_frc, lfrcnp },
                             EdgeSkipReason::TurnRestricted   => SkipReason::TurnRestricted,
                             EdgeSkipReason::DirectionBlocked => SkipReason::DirectionBlocked,
+                            EdgeSkipReason::SharpTurn { deviation_deg } =>
+                                SkipReason::SharpTurn { deviation_deg },
                         },
                     });
                 }
@@ -189,7 +197,7 @@ pub fn find_route(
         }
 
         // Expand successors.
-        for (next_node, next_seg, seg_len) in graph.successors(node, via_seg, lfrcnp) {
+        for (next_node, next_seg, seg_len) in graph.successors(node, via_seg, lfrcnp, max_turn_deviation_deg) {
             let new_g = g + seg_len;
 
             if new_g > max_dist_m {
@@ -234,6 +242,7 @@ pub fn find_route(
         edges_skipped_direction: skip_dir,
         edges_skipped_turn:      skip_turn,
         edges_skipped_distance:  skip_dist,
+        edges_skipped_sharp_turn: skip_sharp_turn,
     });
 
     Err(RoutingFailure::NoPathFound)
@@ -328,7 +337,7 @@ mod tests {
         let to   = cand(2, 1, 2);
         let dnp  = LinearInterval { lb: 80.0, ub: 120.0 };
         let mut trace = DecodeTrace::new(DecodeParams::default());
-        let result = find_route(0, &from, &to, &g, 7, dnp, 5.0, 0, &mut trace, 12);
+        let result = find_route(0, &from, &to, &g, 7, dnp, 5.0, 0, 180.0, &mut trace, 12);
         assert!(result.is_ok() || true, "path found or trivial");
     }
 
@@ -350,7 +359,7 @@ mod tests {
         let to   = cand(3, 2, 3);  // entry_node = 2, exit_node = 3 — not adjacent to from
         let dnp  = LinearInterval { lb: 50.0, ub: 100.0 };
         let mut trace = DecodeTrace::new(DecodeParams::default());
-        let result = find_route(0, &from, &to, &g, 7, dnp, 5.0, 0, &mut trace, 12);
+        let result = find_route(0, &from, &to, &g, 7, dnp, 5.0, 0, 180.0, &mut trace, 12);
         assert!(result.is_err(), "expected no path: only route is 11 km but max_dist is 500 m");
     }
 }

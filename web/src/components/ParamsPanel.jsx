@@ -90,6 +90,11 @@ const PARAM_DOCS = {
     increase: 'The most common fix for A* failures where edges_skipped_frc in the trace is high. Allows lower-importance connector roads (ramps, service links) that were present in the encoding map to be used in routing. Risk: the route may use lower-class roads the encoder did not intend.',
     decrease: 'Enforces strict routing: only roads of the importance class the encoder intended may be used. Risk: A* fails on maps that classify connector roads at a different FRC than the encoding map.',
   },
+  max_interior_turn_deviation_deg: {
+    what: 'Hard gate on the interior A* path search: an edge is rejected if the geometric turn angle at its node deviates from straight-ahead by more than this many degrees (0° = dead ahead only, 180° = a full U-turn / doubling back). Independent of max_bearing_deviation_deg, which only scores candidates at the LRP endpoints and never constrains the interior route.',
+    increase: 'Tolerates sharper turns along the route, up to and including near-U-turns at 180°. Needed for legitimate tight maneuvers (cul-de-sacs, service-road loops, some diamond interchange ramps) that this gate would otherwise block. Set to 180 to fully disable.',
+    decrease: 'Rejects implausibly sharp turns (e.g. a route that doubles back on itself at a roundabout exit due to a missing OSM turn restriction). Risk: may block a legitimate route that genuinely requires a tight turn.',
+  },
 };
 
 // ── Field definitions ─────────────────────────────────────────────────────────
@@ -112,6 +117,7 @@ const SCALAR_FIELDS = [
   { key: 'max_astar_expansions',         label: 'A* expansion cap',        unit: '',      step: 10000, min: 0,     max: 500000, int: true },
   { key: 'max_routing_attempts',         label: 'Routing attempt cap',     unit: '',      step: 1,     min: 0,     max: 500,    int: true },
   { key: 'lfrcnp_tolerance',             label: 'LFRCNP tolerance',        unit: 'steps', step: 1,     min: 0,     max: 7,     int: true },
+  { key: 'max_interior_turn_deviation_deg', label: 'Max turn deviation',   unit: '°',     step: 5,     min: 0,     max: 180    },
 ];
 
 const FRC_LABELS = ['FRC0', 'FRC1', 'FRC2', 'FRC3', 'FRC4', 'FRC5', 'FRC6', 'FRC7'];
@@ -283,6 +289,7 @@ export default function ParamsPanel() {
   const {
     params, showParams, setParam, toggleParams,
     loadPreset, saveParamSet, deleteParamSet, loadParamSet, savedParamSets,
+    resetToDefaults,
   } = useStore();
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activeDoc, setActiveDoc] = useState(null);
@@ -364,6 +371,8 @@ export default function ParamsPanel() {
           ) : (
             <button className="preset-save-link" onClick={() => setSaving(true)}>+ Save current as…</button>
           )}
+
+          <button className="preset-save-link" onClick={resetToDefaults}>Reset decode params to defaults</button>
         </div>
 
         <div className="params-grid">

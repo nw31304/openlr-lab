@@ -675,6 +675,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
           edges_skipped_direction: a.edges_skipped_direction,
           edges_skipped_turn:      a.edges_skipped_turn,
           edges_skipped_distance:  a.edges_skipped_distance,
+          edges_skipped_sharp_turn: a.edges_skipped_sharp_turn,
           reason: a.reason,
         } : null,
       });
@@ -871,6 +872,7 @@ export async function executeTool(name, args, { decodeResult, params, decoder, s
           edges_skipped_direction: a.edges_skipped_direction,
           edges_skipped_turn:      a.edges_skipped_turn,
           edges_skipped_distance:  a.edges_skipped_distance,
+          edges_skipped_sharp_turn: a.edges_skipped_sharp_turn,
           reason: a.reason,
         } : null,
       });

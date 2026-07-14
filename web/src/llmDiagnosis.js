@@ -162,7 +162,7 @@ export function buildDiagnosticPrompt(decodeResult, params) {
         }
         if (leg.astar) {
           const t = leg.astar;
-          lines.push(`  A*: ${t.nodes_expanded} nodes expanded  skipped: frc=${t.edges_skipped_frc} dir=${t.edges_skipped_direction} turn=${t.edges_skipped_turn} dist=${t.edges_skipped_distance}`);
+          lines.push(`  A*: ${t.nodes_expanded} nodes expanded  skipped: frc=${t.edges_skipped_frc} dir=${t.edges_skipped_direction} turn=${t.edges_skipped_turn} dist=${t.edges_skipped_distance} sharp_turn=${t.edges_skipped_sharp_turn}`);
         }
       }
     }
@@ -174,6 +174,7 @@ export function buildDiagnosticPrompt(decodeResult, params) {
   lines.push([
     `  search radius: ${params?.candidate_search_radius_m ?? '?'} m`,
     `  bearing tolerance: ${params?.max_bearing_deviation_deg ?? '?'}°`,
+    `  turn-angle cap: ${params?.max_interior_turn_deviation_deg ?? '?'}° (180° = disabled)`,
     `  DNP tolerance: ${((params?.dnp_tolerance_pct ?? 0.1) * 100).toFixed(0)}%`,
     `  LFRCNP tolerance: ${lfrcnpTol} FRC steps (0 = strict, 7 = fully permissive)`,
     `  max candidate score: ${params?.max_candidate_score ?? '?'}`,
@@ -186,12 +187,16 @@ export function buildDiagnosticPrompt(decodeResult, params) {
     if (info.astar) {
       const t = info.astar;
       const totalSkipped = (t.edges_skipped_frc ?? 0) + (t.edges_skipped_direction ?? 0) +
-                           (t.edges_skipped_turn ?? 0) + (t.edges_skipped_distance ?? 0);
+                           (t.edges_skipped_turn ?? 0) + (t.edges_skipped_distance ?? 0) +
+                           (t.edges_skipped_sharp_turn ?? 0);
       const legNum = Number(leg) + 1;
       if (t.edges_skipped_frc > 0 && t.edges_skipped_frc >= (t.nodes_expanded ?? 0)) {
         signals.push(`Leg ${legNum}: FRC skips (${t.edges_skipped_frc}) >= nodes expanded (${t.nodes_expanded ?? 0}) — LFRCNP floor is blocking the search`);
       } else if (t.edges_skipped_frc > 0) {
         signals.push(`Leg ${legNum}: ${t.edges_skipped_frc} of ${totalSkipped} total skipped edges were due to LFRCNP floor`);
+      }
+      if ((t.edges_skipped_sharp_turn ?? 0) > 0) {
+        signals.push(`Leg ${legNum}: ${t.edges_skipped_sharp_turn} of ${totalSkipped} total skipped edges were blocked by the turn-angle gate (max_interior_turn_deviation_deg)`);
       }
       if ((t.nodes_expanded ?? 0) < 10 && !info.result?.found) {
         signals.push(`Leg ${legNum}: only ${t.nodes_expanded ?? 0} nodes expanded before failure — graph is nearly disconnected at current LFRCNP`);
