@@ -4,7 +4,7 @@
 //! dropped at the last point of agreement (preferring a valid node there) and
 //! the search restarts from there to the same end.
 
-use openlr_graph::{shortest_path, Graph, NodeId, SegmentId, NO_PRIOR_SEG};
+use openlr_graph::{shortest_path, Graph, NodeId, PathOutcome, SegmentId};
 
 use crate::EncodeError;
 
@@ -17,21 +17,43 @@ pub struct Leg {
 /// Sweep `path` (the full desired route, already expanded to valid start/end
 /// nodes) into legs, inserting intermediate LRPs wherever necessary so that
 /// each leg is independently reproducible by a shortest-path search.
+///
+/// `start_seg` biases the very first search the same way A* seeds an
+/// incoming segment for turn-angle purposes: pass `NO_PRIOR_SEG` when `path`
+/// is the whole location (no "before" to compare against), or the last
+/// segment of whatever led into `start_node` when sweeping a single
+/// waypoint-leg chunk of a larger via-pointed route (`line::encode_line`) —
+/// otherwise the turn-angle check below has nothing to compare the chunk's
+/// first hop against, silently admitting a sharp turn at the via-point
+/// boundary that a single, unchunked sweep would have caught.
+///
+/// `max_turn_deviation_deg` is the same turn-angle cap decode-side A* uses
+/// (`DecodeParams::max_interior_turn_deviation_deg`) — despite the decode-only
+/// name, it governs both directions: an encoder that would happily route
+/// across a physically-impossible U-turn (e.g. a dead end forcing a "walk
+/// back across the segment just arrived on") would produce a reference no
+/// real navigation system could sensibly reproduce. Pass `180.0` to disable.
 pub fn sweep_coverage(
     graph: &Graph,
     path: &[SegmentId],
     start_node: NodeId,
+    start_seg: SegmentId,
     end_node: NodeId,
     max_leg_m: f64,
+    max_turn_deviation_deg: f64,
+    zoom: u8,
 ) -> Result<Vec<Leg>, EncodeError> {
     let mut legs = Vec::new();
     let mut remaining = path;
     let mut current_start = start_node;
-    let mut current_start_seg = NO_PRIOR_SEG;
+    let mut current_start_seg = start_seg;
 
     loop {
-        let result = shortest_path(graph, current_start, current_start_seg, end_node, 7, 180.0, 0)
-            .ok_or(EncodeError::NoRoute)?;
+        let result = match shortest_path(graph, current_start, current_start_seg, end_node, 7, max_turn_deviation_deg, 0, zoom) {
+            PathOutcome::Found(r) => r,
+            PathOutcome::NoPath => return Err(EncodeError::NoRoute),
+            PathOutcome::NeedsTile(tk) => return Err(EncodeError::NeedsTile(tk)),
+        };
 
         let agreement = common_prefix_len(remaining, &result.segments);
 
@@ -119,7 +141,7 @@ fn best_intermediate_position(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openlr_graph::{Direction, NetworkNode, NetworkSegment};
+    use openlr_graph::{Direction, NetworkNode, NetworkSegment, NO_PRIOR_SEG};
 
     fn node(id: u32, lon: f64, lat: f64) -> NetworkNode {
         NetworkNode { id: NodeId(id), lon, lat, stable_id: String::new(), is_boundary: false }
@@ -147,7 +169,7 @@ mod tests {
         g.add_segment(seg(2, 1, 2, 100.0));
 
         let path = vec![SegmentId(1), SegmentId(2)];
-        let legs = sweep_coverage(&g, &path, NodeId(0), NodeId(2), 15_000.0).unwrap();
+        let legs = sweep_coverage(&g, &path, NodeId(0), NO_PRIOR_SEG, NodeId(2), 15_000.0, 180.0, 12).unwrap();
         assert_eq!(legs.len(), 1);
         assert_eq!(legs[0].segments, path);
         assert_eq!(legs[0].start_node, NodeId(0));

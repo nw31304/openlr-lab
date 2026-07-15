@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { PMTiles } from 'pmtiles';
-import { useStore, getSegmentId, getNodeId, getSegGeomCache, getSegIdToTile, getTileGeomCache } from '../store.js';
+import { useStore, getSegmentId, getNodeId, getSegGeomCache, getSegIdToTile, getTileGeomCache, getSnapCandidates } from '../store.js';
 import { useDraggable } from '../hooks.js';
 import { emptyState, applyStep, computeVisualState, stateToGeoJSON } from '../replayEngine.js';
 import { haversineM } from '../utils.js';
@@ -118,7 +118,8 @@ const CUSTOM_SOURCES = new Set([
   'lrp-snap', 'lrp-displacement',
   'offset-uncertainty', 'lrp-bearing', 'highlighted-segment', 'trace-segment',
   'replay-radius', 'replay-route', 'replay-traversed', 'replay-candidates', 'replay-cloud', 'replay-frontier', 'replay-leg', 'replay-flash',
-  'measure-line', 'measure-points', 'pal-point', 'pal-pulse',
+  'measure-line', 'measure-points', 'pal-point', 'pal-pulse', 'pal-uncertainty', 'encode-route', 'encode-ghost', 'encode-offset-stubs',
+  'encode-snap-candidates', 'encode-snap-candidate-active',
 ]);
 const CUSTOM_LAYER_IDS = new Set([
   'olr-frc0','olr-frc1','olr-frc2','olr-frc3','olr-frc4','olr-frc5','olr-frc6','olr-frc7',
@@ -137,7 +138,9 @@ const CUSTOM_LAYER_IDS = new Set([
   'replay-leg-from', 'replay-leg-to',
   'replay-flash-ring',
   'measure-line-layer', 'measure-points-layer',
-  'pal-point-layer', 'pal-pulse-ring',
+  'pal-point-layer', 'pal-pulse-ring', 'pal-uncertainty-line',
+  'encode-route-casing', 'encode-route-line', 'encode-ghost-line', 'encode-offset-stubs-line',
+  'encode-snap-candidates-circle', 'encode-snap-candidate-active-ring',
 ]);
 
 const FRC_COLOR = ['#e8002d', '#ff7700', '#e8c800', '#00aa44',
@@ -262,6 +265,69 @@ function compassBearing(lon1, lat1, lon2, lat2) {
 function fmtDist(m) {
   if (m < 1000) return `${Math.round(m)} m`;
   return `${(m / 1000).toFixed(2)} km`;
+}
+
+// Perpendicular distance from (px,py) to segment (ax,ay)-(bx,by), plain
+// lon/lat degree space — only used to rank candidate waypoint pairs against
+// each other, so no need for a proper great-circle metric.
+function pointToSegmentDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  if (len2 === 0) return Math.hypot(px - ax, py - ay);
+  let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+// Cumulative distance (plain lon/lat degree units, not geodesic — only used
+// to compare positions against each other) along `coords` to the point on it
+// nearest (lon,lat). Lets us order a click against each waypoint's own
+// position along the *actual routed geometry*, including the recoverable
+// POFF/NOFF overshoot before the first / after the last waypoint (the
+// straight-chord heuristic below has no representation for either, since it
+// only ever considers gaps *between* existing waypoints).
+function arcLengthAlongPolyline(coords, lon, lat) {
+  if (!coords || coords.length < 2) return 0;
+  let bestDist = Infinity, bestArc = 0, cum = 0;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const [ax, ay] = coords[i], [bx, by] = coords[i + 1];
+    const dx = bx - ax, dy = by - ay;
+    const len = Math.hypot(dx, dy);
+    const len2 = dx * dx + dy * dy;
+    let t = len2 === 0 ? 0 : ((lon - ax) * dx + (lat - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const d = Math.hypot(lon - (ax + t * dx), lat - (ay + t * dy));
+    if (d < bestDist) { bestDist = d; bestArc = cum + t * len; }
+    cum += len;
+  }
+  return bestArc;
+}
+
+// Which gap a click point falls into — used to decide the insertion index
+// for the drag-to-insert gesture. When `routeGeometry` (the actual routed
+// road polyline, including any valid-node-expansion overshoot at either
+// end) is available, orders the click against each waypoint's own arc-length
+// position along it — so a click past the last waypoint (in the overshoot
+// that the neg-offset stub recovers) correctly appends a new final waypoint
+// instead of always landing between the first two (see project notes: a
+// straight waypoint-to-waypoint chord heuristic has no index for "beyond the
+// last waypoint" at all when there are only two waypoints, since its only
+// candidate gap is the single (0,1) pair). Falls back to the straight-chord
+// heuristic if no route geometry is loaded yet.
+function nearestWaypointPairIndex(waypoints, lon, lat, routeGeometry) {
+  if (routeGeometry?.length >= 2) {
+    const clickArc = arcLengthAlongPolyline(routeGeometry, lon, lat);
+    const arcs = waypoints.map(w => arcLengthAlongPolyline(routeGeometry, w.lon, w.lat));
+    const idx = arcs.findIndex(a => a > clickArc);
+    return idx === -1 ? waypoints.length : idx;
+  }
+  let bestIdx = 1, bestDist = Infinity;
+  for (let i = 0; i < waypoints.length - 1; i++) {
+    const a = waypoints[i], b = waypoints[i + 1];
+    const d = pointToSegmentDist(lon, lat, a.lon, a.lat, b.lon, b.lat);
+    if (d < bestDist) { bestDist = d; bestIdx = i + 1; }
+  }
+  return bestIdx;
 }
 
 // Interpolated midpoint of a polyline by vertex index — handles 2-vertex segments
@@ -470,13 +536,31 @@ export default function MapView({ tilesBase, ready }) {
   const showSegmentLayer      = useStore(s => s.showSegmentLayer);
   const searchRadiusM         = useStore(s => s.params.candidate_search_radius_m);
   const lfrcnpTolerance       = useStore(s => s.params.lfrcnp_tolerance ?? 0);
-  const replayStep  = useStore(s => s.replayStep);
-  const replaySteps = useStore(s => s.replaySteps);
-  const replayStats = useStore(s => s.replayStats);
+  // In encode mode these read the round-trip verify-decode's replay data
+  // instead of the last manual decode's.
+  const replayStep  = useStore(s => s.mode === 'encode' ? s.verifyReplayStep  : s.replayStep);
+  const replaySteps = useStore(s => s.mode === 'encode' ? s.verifyReplaySteps : s.replaySteps);
+  const replayStats = useStore(s => s.mode === 'encode' ? s.verifyReplayStats : s.replayStats);
   const showReplay         = useStore(s => s.showReplay);
   const showTrace          = useStore(s => s.showTrace);
   const candidatePopup     = useStore(s => s.candidatePopup);
   const clearCandidatePopup = useStore(s => s.clearCandidatePopup);
+
+  // ── Encode mode ───────────────────────────────────────────────────────────
+  const mode          = useStore(s => s.mode);
+  const waypoints     = useStore(s => s.waypoints);
+  const liveRoute      = useStore(s => s.liveRoute);
+  const addWaypoint    = useStore(s => s.addWaypoint);
+  const moveWaypoint   = useStore(s => s.moveWaypoint);
+  const encodeModeRef  = useRef(false);
+  const waypointMarkersRef = useRef([]);
+  const snapPickerPopupRef = useRef(null);
+  const suppressNextClickRef = useRef(false);
+  const insertWaypoint = useStore(s => s.insertWaypoint);
+  const removeWaypoint = useStore(s => s.removeWaypoint);
+  const waypointHistory = useStore(s => s.waypointHistory);
+  const clearWaypoints  = useStore(s => s.clearWaypoints);
+  const undoWaypoint     = useStore(s => s.undo);
 
   // Only one map popup (segment / LRP / node / candidate) may be visible at a time —
   // call this before opening any of them so the others don't linger on screen.
@@ -1118,6 +1202,155 @@ export default function MapView({ tilesBase, ready }) {
           'circle-opacity':        0,
         },
       });
+      // POFF uncertainty: the v3-encoded offset is itself a quantization
+      // bucket [lb, ub] — the true point could genuinely be anywhere in it.
+      // Drawn the same dark-navy dashed style as Line decode's offset-
+      // uncertainty caps (`offset-uncertainty-line`), since it's the same
+      // underlying concept, just applied to a point instead of a path
+      // boundary — the point marker itself sits at the bucket's center.
+      map.addSource('pal-uncertainty', { type: 'geojson', data: emptyFC2 });
+      map.addLayer({
+        id: 'pal-uncertainty-line', type: 'line', source: 'pal-uncertainty',
+        paint: {
+          'line-color':     '#0088bb',
+          'line-width':     5,
+          'line-opacity':   0.95,
+          'line-dasharray': [1, 0.5],
+        },
+      });
+
+      // ── Encode mode: live waypoint-route preview ─────────────────────────
+      map.addSource('encode-route', { type: 'geojson', data: emptyFC2 });
+      map.addLayer({
+        id: 'encode-route-casing', type: 'line', source: 'encode-route',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': '#0a0a14', 'line-width': 7, 'line-opacity': 0.6 },
+      });
+      map.addLayer({
+        id: 'encode-route-line', type: 'line', source: 'encode-route',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': '#33ddaa', 'line-width': 4, 'line-opacity': 0.9 },
+      });
+
+      // Live-stretch preview during a waypoint drag or a drag-to-insert
+      // gesture — straight dashed line, real routing recomputes on release.
+      map.addSource('encode-ghost', { type: 'geojson', data: emptyFC2 });
+      map.addLayer({
+        id: 'encode-ghost-line', type: 'line', source: 'encode-ghost',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': '#ffffff', 'line-width': 2.5, 'line-dasharray': [2, 2], 'line-opacity': 0.85 },
+      });
+
+      // Waypoint → snapped-node "offset" stubs: a waypoint is not an LRP —
+      // it's just where the encoder starts looking. This makes the gap
+      // between your click and where the encoder actually anchors visible,
+      // color-coded by whether that gap is recoverable: amber for the
+      // overall start/end (the true position survives as a POFF/NOFF
+      // offset) vs red for an interior via-point (OpenLR's Line format has
+      // no offset field on interior LRPs, so that precision is genuinely
+      // not stored — only the snapped node is).
+      map.addSource('encode-offset-stubs', { type: 'geojson', data: emptyFC2 });
+      map.addLayer({
+        id: 'encode-offset-stubs-line', type: 'line', source: 'encode-offset-stubs',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-width': 2.5,
+          'line-dasharray': [1, 1.5],
+          'line-opacity': 0.9,
+          'line-color': ['match', ['get', 'category'], 'boundary', '#ffaa33', 'via', '#ff4455', '#ffaa33'],
+        },
+      });
+
+      // Snap-candidate markers, shown while the disambiguation picker is
+      // open: every nearby option as a small dot (blue = intersection, grey
+      // = point along a road), plus a larger ring around whichever option
+      // the user is currently hovering in the picker list.
+      map.addSource('encode-snap-candidates', { type: 'geojson', data: emptyFC2 });
+      map.addLayer({
+        id: 'encode-snap-candidates-circle', type: 'circle', source: 'encode-snap-candidates',
+        paint: {
+          'circle-radius': 5,
+          'circle-color': ['match', ['get', 'kind'], 'node', '#3399ff', '#aaaaaa'],
+          'circle-stroke-color': '#0a0a14',
+          'circle-stroke-width': 1.5,
+        },
+      });
+      map.addSource('encode-snap-candidate-active', { type: 'geojson', data: emptyFC2 });
+      map.addLayer({
+        id: 'encode-snap-candidate-active-ring', type: 'circle', source: 'encode-snap-candidate-active',
+        paint: {
+          'circle-radius': 9,
+          'circle-color': 'transparent',
+          'circle-stroke-color': '#33ddaa',
+          'circle-stroke-width': 3,
+        },
+      });
+
+      // ── Encode mode: drag-to-insert a via-point on the route line ────────
+      // mousedown near the route (a forgiving pixel buffer, not the exact
+      // rendered pixel) starts a manual drag: map panning is suspended, a
+      // ghost line stretches from the two bracketing waypoints to the
+      // cursor, and mouseup commits a new waypoint at that position.
+      let dragInsert = null;
+      function updateEncodeGhost(idx, cursor) {
+        const wps = useStore.getState().waypoints;
+        const prev = wps[idx - 1];
+        const next = wps[idx];
+        const coords = [];
+        if (prev) coords.push([prev.lon, prev.lat]);
+        coords.push(cursor);
+        if (next) coords.push([next.lon, next.lat]);
+        map.getSource('encode-ghost')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: coords }, properties: {} });
+      }
+      function clearEncodeGhost() {
+        map.getSource('encode-ghost')?.setData({ type: 'FeatureCollection', features: [] });
+      }
+      function onEncodeDragMove(e) {
+        if (!dragInsert) return;
+        updateEncodeGhost(dragInsert.index, [e.lngLat.lng, e.lngLat.lat]);
+      }
+      function endEncodeDrag() {
+        map.dragPan.enable();
+        map.getCanvas().style.cursor = 'crosshair';
+        map.off('mousemove', onEncodeDragMove);
+        map.off('mouseup', onEncodeDragUp);
+        document.removeEventListener('keydown', onEncodeDragKeyDown);
+        clearEncodeGhost();
+        dragInsert = null;
+      }
+      function onEncodeDragUp(e) {
+        if (!dragInsert) return;
+        const { index } = dragInsert;
+        const lonLat = { lon: e.lngLat.lng, lat: e.lngLat.lat };
+        endEncodeDrag();
+        insertWaypoint(index, lonLat);
+      }
+      function onEncodeDragKeyDown(e) {
+        if (e.key === 'Escape' && dragInsert) endEncodeDrag();
+      }
+      function onEncodeMouseDown(e) {
+        if (!encodeModeRef.current) return;
+        const waypoints = useStore.getState().waypoints;
+        if (waypoints.length < 2) return;
+        const buf = 6;
+        const hits = map.queryRenderedFeatures(
+          [[e.point.x - buf, e.point.y - buf], [e.point.x + buf, e.point.y + buf]],
+          { layers: ['encode-route-line', 'encode-route-casing'] }
+        );
+        if (!hits.length) return;
+        e.preventDefault();
+        const routeGeometry = useStore.getState().liveRoute?.geometry;
+        const index = nearestWaypointPairIndex(waypoints, e.lngLat.lng, e.lngLat.lat, routeGeometry);
+        dragInsert = { index };
+        suppressNextClickRef.current = true;
+        map.dragPan.disable();
+        map.getCanvas().style.cursor = 'grabbing';
+        updateEncodeGhost(index, [e.lngLat.lng, e.lngLat.lat]);
+        map.on('mousemove', onEncodeDragMove);
+        map.on('mouseup', onEncodeDragUp);
+        document.addEventListener('keydown', onEncodeDragKeyDown);
+      }
+      map.on('mousedown', onEncodeMouseDown);
 
       // ── Click handlers ────────────────────────────────────────────────────
       const pointerOn  = () => { if (!measuringRef.current && !bearingActiveRef.current && !coordCaptureActiveRef.current) map.getCanvas().style.cursor = 'pointer'; };
@@ -1475,6 +1708,79 @@ export default function MapView({ tilesBase, ready }) {
     e.originalEvent.stopPropagation();
   }
 
+  // A click landed near 2+ distinct roads — let the user pick which one this
+  // waypoint should snap onto, instead of silently choosing the nearest.
+  function showSnapPicker(lon, lat, candidates) {
+    const map = mapRef.current;
+    if (!map) return;
+    if (snapPickerPopupRef.current) { snapPickerPopupRef.current.remove(); snapPickerPopupRef.current = null; }
+
+    const clearSnapHighlights = () => {
+      map.getSource('encode-snap-candidates')?.setData({ type: 'FeatureCollection', features: [] });
+      map.getSource('encode-snap-candidate-active')?.setData({ type: 'FeatureCollection', features: [] });
+    };
+    const setActiveHighlight = (c) => {
+      map.getSource('encode-snap-candidate-active')?.setData({
+        type: 'Feature', geometry: { type: 'Point', coordinates: [c.snapped_lon, c.snapped_lat] }, properties: {},
+      });
+    };
+    // Show every candidate as a small dot immediately, so it's clear at a
+    // glance where each option actually is before hovering any of them.
+    map.getSource('encode-snap-candidates')?.setData({
+      type: 'FeatureCollection',
+      features: candidates.map(c => ({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [c.snapped_lon, c.snapped_lat] },
+        properties: { kind: c.kind },
+      })),
+    });
+    setActiveHighlight(candidates[0]);
+
+    const content = document.createElement('div');
+    content.className = 'loc-pin-popup snap-picker-popup';
+    const title = document.createElement('div');
+    title.className = 'loc-pin-coord';
+    title.textContent = 'Multiple options nearby — choose one:';
+    content.appendChild(title);
+
+    const list = document.createElement('div');
+    list.className = 'snap-picker-list';
+    candidates.forEach(c => {
+      const btn = document.createElement('button');
+      btn.className = 'snap-picker-option';
+      const label = c.kind === 'node'
+        ? 'Intersection'
+        : (c.stable_id || `Segment #${c.segment_id}`);
+      const detail = c.kind === 'node' ? '' : ` · FRC${c.frc}`;
+      btn.textContent = `${label}${detail} · ${c.distance_m.toFixed(0)}m`;
+      btn.addEventListener('mouseenter', () => setActiveHighlight(c));
+      btn.addEventListener('click', () => {
+        addWaypoint(c.kind === 'node'
+          ? { lon, lat, node_id: c.node_id }
+          : { lon, lat, segment_id: c.segment_id });
+        popup.remove();
+      });
+      list.appendChild(btn);
+    });
+    content.appendChild(list);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'snap-picker-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => popup.remove());
+    content.appendChild(cancelBtn);
+
+    const popup = new maplibregl.Popup({ closeButton: true, offset: 12, className: 'loc-pin-popup-wrap' })
+      .setLngLat([lon, lat])
+      .setDOMContent(content)
+      .addTo(map);
+    popup.on('close', () => {
+      clearSnapHighlights();
+      if (snapPickerPopupRef.current === popup) snapPickerPopupRef.current = null;
+    });
+    snapPickerPopupRef.current = popup;
+  }
+
   function onMapClick(e) {
     if (coordCaptureActiveRef.current) {
       cursorCoordRef.current = [e.lngLat.lng, e.lngLat.lat];
@@ -1493,6 +1799,20 @@ export default function MapView({ tilesBase, ready }) {
       const next = [...measurePtsRef.current, pt];
       measurePtsRef.current = next;
       setMeasurePts(next);
+      return;
+    }
+    if (encodeModeRef.current) {
+      if (suppressNextClickRef.current) { suppressNextClickRef.current = false; return; }
+      const lon = e.lngLat.lng, lat = e.lngLat.lat;
+      const candidates = getSnapCandidates(lon, lat);
+      if (candidates.length >= 2) {
+        showSnapPicker(lon, lat, candidates);
+      } else {
+        const only = candidates[0];
+        addWaypoint(only?.kind === 'node'
+          ? { lon, lat, node_id: only.node_id }
+          : { lon, lat, segment_id: only?.segment_id });
+      }
       return;
     }
     const layerIds = [...Array.from({ length: 8 }, (_, i) => `olr-frc${i}`), 'lrp-markers-circle', 'decoded-path-line'];
@@ -2191,6 +2511,7 @@ export default function MapView({ tilesBase, ready }) {
     const uncertaintySource = map.getSource('offset-uncertainty');
     const palSource         = map.getSource('pal-point');
     const palPulseSource    = map.getSource('pal-pulse');
+    const palUncertaintySource = map.getSource('pal-uncertainty');
 
     // Cancel any in-progress PAL pulse from a previous decode.
     if (palPulseRef.current) { cancelAnimationFrame(palPulseRef.current); palPulseRef.current = null; }
@@ -2200,13 +2521,19 @@ export default function MapView({ tilesBase, ready }) {
     }
 
     const emptyFC = { type: 'FeatureCollection', features: [] };
-    if (!decodeResult) {
+    // Encode mode has its own waypoint/route rendering — the last actual
+    // decode's markers/path/etc. would otherwise keep showing underneath it,
+    // since switching mode back to 'encode' doesn't touch `decodeResult` at
+    // all (nothing re-populates or clears it), so this effect would never
+    // re-run without `mode` in its own right.
+    if (!decodeResult || mode !== 'decode') {
       pathSource?.setData(emptyFC);
       lrpSource?.setData(emptyFC);
       snapSource?.setData(emptyFC);
       displSource?.setData(emptyFC);
       uncertaintySource?.setData(emptyFC);
       palSource?.setData(emptyFC);
+      palUncertaintySource?.setData(emptyFC);
       closeAllPopups();
       return;
     }
@@ -2258,8 +2585,12 @@ export default function MapView({ tilesBase, ready }) {
     // Per-segment geometries span full segments and ignore arc-offset trim;
     // the WKT from path_to_wkt already applies first_lrp_arc + pos_offset at
     // the head and last_lrp_arc - neg_offset at the tail.
+    // PAL has no "path" of its own to show — it's just the reference line
+    // the point sits on — so skip it there and let the LRP markers + point +
+    // uncertainty stub speak for themselves without a distracting full line.
+    const isPalResult = decodeResult.location_type === 'PointAlongLine';
     const wktCoords = parseWktLinestring(decodeResult.wkt);
-    const pathFeatures = (decodeResult.ok && wktCoords?.length >= 2)
+    const pathFeatures = (decodeResult.ok && !isPalResult && wktCoords?.length >= 2)
       ? [{ type: 'Feature', geometry: { type: 'LineString', coordinates: wktCoords }, properties: {} }]
       : [];
     pathSource?.setData({ type: 'FeatureCollection', features: pathFeatures });
@@ -2301,6 +2632,30 @@ export default function MapView({ tilesBase, ready }) {
       palSource?.setData(palPointFC);
       palPulseSource?.setData(palPointFC);
 
+      // POFF uncertainty — the v3-encoded offset is a quantization bucket
+      // [lb, ub], not an exact distance; the point marker sits at the
+      // bucket's center (`point_lon`/`point_lat`, computed that way engine-
+      // side), and this dashed segment spans the bucket itself so the
+      // uncertainty is visible rather than implied by a single dot.
+      if (decodeResult.point_lon_lb != null && decodeResult.point_lon_ub != null) {
+        palUncertaintySource?.setData({
+          type: 'FeatureCollection',
+          features: [{
+            type: 'Feature',
+            geometry: {
+              type: 'LineString',
+              coordinates: [
+                [decodeResult.point_lon_lb, decodeResult.point_lat_lb],
+                [decodeResult.point_lon_ub, decodeResult.point_lat_ub],
+              ],
+            },
+            properties: {},
+          }],
+        });
+      } else {
+        palUncertaintySource?.setData(emptyFC);
+      }
+
       // Two sonar-ping pulses over 2 s, then stop.
       if (palPulseSource && map.getLayer('pal-pulse-ring')) {
         const TOTAL_MS = 2000, CYCLE_MS = 1000;
@@ -2325,6 +2680,7 @@ export default function MapView({ tilesBase, ready }) {
       }
     } else {
       palSource?.setData(emptyFC);
+      palUncertaintySource?.setData(emptyFC);
     }
 
     // ── Fit camera — always include all LRP positions AND the decoded path ──────
@@ -2350,45 +2706,48 @@ export default function MapView({ tilesBase, ready }) {
       const bounds = [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]];
       requestAnimationFrame(() => {
         map.fitBounds(bounds, { padding: 80, duration: 600, maxZoom: 17 });
+        // Runs the pulse in parallel with the camera move rather than
+        // waiting on `moveend` — if the camera's already roughly where it
+        // needs to be (e.g. decoding a reference for a location you just
+        // finished drawing waypoints on), fitBounds is a no-op and
+        // `moveend` may never fire, silently skipping the animation.
         if (decodeResult?.ok) {
-          map.once('moveend', () => {
+          if (!map.getLayer('decoded-path-line')) return;
+          const GREEN = [22, 163, 74];
+          const CYAN  = [0, 212, 255];
+          const lerpRgb = (a, b, t) =>
+            `rgb(${Math.round(a[0]+(b[0]-a[0])*t)},${Math.round(a[1]+(b[1]-a[1])*t)},${Math.round(a[2]+(b[2]-a[2])*t)})`;
+          const PULSE_MS = 1500, FADE_MS = 1500;
+          const t0 = performance.now();
+          const anim = (now) => {
             if (!map.getLayer('decoded-path-line')) return;
-            const GREEN = [22, 163, 74];
-            const CYAN  = [0, 212, 255];
-            const lerpRgb = (a, b, t) =>
-              `rgb(${Math.round(a[0]+(b[0]-a[0])*t)},${Math.round(a[1]+(b[1]-a[1])*t)},${Math.round(a[2]+(b[2]-a[2])*t)})`;
-            const PULSE_MS = 1500, FADE_MS = 1500;
-            const t0 = performance.now();
-            const anim = (now) => {
-              if (!map.getLayer('decoded-path-line')) return;
-              const elapsed = now - t0;
-              try {
-                if (elapsed < PULSE_MS) {
-                  const swell = Math.abs(Math.sin((elapsed / 500) * Math.PI));
-                  map.setPaintProperty('decoded-path-line', 'line-color',   '#16a34a');
-                  map.setPaintProperty('decoded-path-line', 'line-width',   5 + 4 * swell);
-                  map.setPaintProperty('decoded-path-line', 'line-opacity', 0.7 + 0.3 * swell);
-                  decodePulseRef.current = requestAnimationFrame(anim);
-                } else if (elapsed < PULSE_MS + FADE_MS) {
-                  const t = (elapsed - PULSE_MS) / FADE_MS;
-                  map.setPaintProperty('decoded-path-line', 'line-color',   lerpRgb(GREEN, CYAN, t));
-                  map.setPaintProperty('decoded-path-line', 'line-width',   9 - 4 * t);
-                  map.setPaintProperty('decoded-path-line', 'line-opacity', 0.9);
-                  decodePulseRef.current = requestAnimationFrame(anim);
-                } else {
-                  map.setPaintProperty('decoded-path-line', 'line-color',   '#00d4ff');
-                  map.setPaintProperty('decoded-path-line', 'line-width',   5);
-                  map.setPaintProperty('decoded-path-line', 'line-opacity', 0.9);
-                  decodePulseRef.current = null;
-                }
-              } catch (_) { decodePulseRef.current = null; }
-            };
-            decodePulseRef.current = requestAnimationFrame(anim);
-          });
+            const elapsed = now - t0;
+            try {
+              if (elapsed < PULSE_MS) {
+                const swell = Math.abs(Math.sin((elapsed / 500) * Math.PI));
+                map.setPaintProperty('decoded-path-line', 'line-color',   '#16a34a');
+                map.setPaintProperty('decoded-path-line', 'line-width',   5 + 4 * swell);
+                map.setPaintProperty('decoded-path-line', 'line-opacity', 0.7 + 0.3 * swell);
+                decodePulseRef.current = requestAnimationFrame(anim);
+              } else if (elapsed < PULSE_MS + FADE_MS) {
+                const t = (elapsed - PULSE_MS) / FADE_MS;
+                map.setPaintProperty('decoded-path-line', 'line-color',   lerpRgb(GREEN, CYAN, t));
+                map.setPaintProperty('decoded-path-line', 'line-width',   9 - 4 * t);
+                map.setPaintProperty('decoded-path-line', 'line-opacity', 0.9);
+                decodePulseRef.current = requestAnimationFrame(anim);
+              } else {
+                map.setPaintProperty('decoded-path-line', 'line-color',   '#00d4ff');
+                map.setPaintProperty('decoded-path-line', 'line-width',   5);
+                map.setPaintProperty('decoded-path-line', 'line-opacity', 0.9);
+                decodePulseRef.current = null;
+              }
+            } catch (_) { decodePulseRef.current = null; }
+          };
+          decodePulseRef.current = requestAnimationFrame(anim);
         }
       });
     }
-  }, [decodeResult]);
+  }, [decodeResult, mode]);
 
   // ── Measurement tool ──────────────────────────────────────────────────────────
 
@@ -2508,6 +2867,20 @@ export default function MapView({ tilesBase, ready }) {
       if (!bearingActiveRef.current && !measuringRef.current) map.getCanvas().style.cursor = '';
     };
   }, [bearingActive]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    encodeModeRef.current = mode === 'encode';
+    const map = mapRef.current;
+    if (!map) return;
+    if (mode !== 'encode') {
+      if (!measuringRef.current && !bearingActiveRef.current && !coordCaptureActiveRef.current) map.getCanvas().style.cursor = '';
+      return;
+    }
+    map.getCanvas().style.cursor = 'crosshair';
+    return () => {
+      if (!encodeModeRef.current && !measuringRef.current && !bearingActiveRef.current && !coordCaptureActiveRef.current) map.getCanvas().style.cursor = '';
+    };
+  }, [mode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function doPermalink() {
     const url = `${window.location.origin}${window.location.pathname}#q=${encodeURIComponent(openlrString)}`;
@@ -2638,6 +3011,104 @@ export default function MapView({ tilesBase, ready }) {
       locPinMarkersRef.current[pin.id] = { marker, popup };
     });
   }, [locPins]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Encode mode: live route line ─────────────────────────────────────────────
+  // Gated on mode — `liveRoute` deliberately survives a mode switch (so
+  // waypoints/preview are still there if you switch back to Encode), which
+  // means this effect would otherwise never re-run to clear itself when you
+  // leave encode mode, leaving the green route + casing visible underneath
+  // whatever decode mode draws next.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !map.getSource('encode-route')) return;
+    const coords = mode === 'encode' ? (liveRoute?.geometry ?? []) : [];
+    map.getSource('encode-route').setData(
+      coords.length >= 2
+        ? { type: 'Feature', geometry: { type: 'LineString', coordinates: coords }, properties: {} }
+        : { type: 'FeatureCollection', features: [] }
+    );
+  }, [liveRoute, mode]);
+
+  // ── Encode mode: waypoint → snapped-node offset stubs ────────────────────────
+  // A waypoint is not an LRP — it's just where the encoder starts looking for
+  // one. Visualize the gap between the click and the actual anchor node, so
+  // it's clear the route wasn't drawn "wrong", it just doesn't start exactly
+  // where you clicked. Same mode-gating reasoning as the route line above.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !map.getSource('encode-offset-stubs')) return;
+    const features = [];
+    if (mode === 'encode') {
+      const snapped = liveRoute?.snapped ?? [];
+      waypoints.forEach((wp, i) => {
+        const snap = snapped[i];
+        if (!snap) return;
+        const dLon = (snap[0] - wp.lon) * Math.cos(wp.lat * Math.PI / 180);
+        const dLat = snap[1] - wp.lat;
+        const distM = Math.sqrt(dLon * dLon + dLat * dLat) * 111_000;
+        if (distM < 2) return; // negligible — don't clutter the map
+        const category = (i === 0 || i === waypoints.length - 1) ? 'boundary' : 'via';
+        features.push({
+          type: 'Feature',
+          geometry: { type: 'LineString', coordinates: [[wp.lon, wp.lat], snap] },
+          properties: { category },
+        });
+      });
+    }
+    map.getSource('encode-offset-stubs').setData({ type: 'FeatureCollection', features });
+  }, [waypoints, liveRoute, mode]);
+
+  // ── Encode mode: waypoint markers ────────────────────────────────────────────
+  // Rebuilt in full on every change — waypoint lists are short (a handful of
+  // points), so this is simpler and cheap enough compared to id-based diffing.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    waypointMarkersRef.current.forEach(m => m.remove());
+    waypointMarkersRef.current = [];
+    if (mode !== 'encode') return;
+
+    const updateGhostForDrag = (i, cursor) => {
+      const prev = waypoints[i - 1];
+      const next = waypoints[i + 1];
+      const coords = [];
+      if (prev) coords.push([prev.lon, prev.lat]);
+      coords.push(cursor);
+      if (next) coords.push([next.lon, next.lat]);
+      map.getSource('encode-ghost')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: coords }, properties: {} });
+    };
+    const clearGhost = () => map.getSource('encode-ghost')?.setData({ type: 'FeatureCollection', features: [] });
+
+    waypoints.forEach((wp, i) => {
+      const el = document.createElement('div');
+      el.className = 'encode-waypoint-marker';
+      el.textContent = String(i + 1);
+      el.title = 'Drag to move · click to remove';
+
+      const marker = new maplibregl.Marker({ element: el, draggable: true, anchor: 'center' })
+        .setLngLat([wp.lon, wp.lat])
+        .addTo(map);
+
+      let didDrag = false;
+      marker.on('dragstart', () => { didDrag = true; });
+      marker.on('drag', () => {
+        const { lng, lat } = marker.getLngLat();
+        updateGhostForDrag(i, [lng, lat]);
+      });
+      marker.on('dragend', () => {
+        clearGhost();
+        const { lng, lat } = marker.getLngLat();
+        moveWaypoint(i, { lon: lng, lat });
+      });
+      el.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (didDrag) { didDrag = false; return; }
+        removeWaypoint(i);
+      });
+
+      waypointMarkersRef.current.push(marker);
+    });
+  }, [waypoints, mode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
@@ -2852,6 +3323,24 @@ export default function MapView({ tilesBase, ready }) {
               <span>{label}</span>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* ── Encode mode: Clear/Undo ────────────────────────────────────────── */}
+      {mode === 'encode' && (
+        <div className="encode-tools">
+          <button
+            className="map-tool-btn"
+            onClick={undoWaypoint}
+            disabled={!waypointHistory.length}
+            title="Undo last waypoint edit"
+          >↺</button>
+          <button
+            className="map-tool-btn"
+            onClick={clearWaypoints}
+            disabled={!waypoints.length}
+            title="Clear all waypoints"
+          >🗑</button>
         </div>
       )}
 

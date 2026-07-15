@@ -8,6 +8,7 @@ import { TOOL_DEFINITIONS, executeTool } from './llm/tools.js';
 
 let _pmtiles = null;
 let _decoder = null;
+let _encoder = null;
 let _zoom = 12;
 
 // The pmtiles JS library auto-decompresses tile data before returning it from
@@ -38,7 +39,37 @@ let _segGeomCache = new Map();
 
 export function setPmtiles(p) { _pmtiles = p; }
 export function setDecoder(d) { _decoder = d; }
+export function setEncoder(e) { _encoder = e; }
 export function setZoom(z)    { _zoom = z; }
+
+/** Load the 3x3 tile neighborhood around a waypoint into the encoder's graph.
+ *  Best-effort prefetch — runLiveRoute()/runEncode()'s own needs_tile retry
+ *  loop covers anything this misses (e.g. a route leg passing through tiles
+ *  far from either endpoint). */
+async function loadEncoderTilesNear(lon, lat) {
+  if (!_encoder || !_pmtiles) return;
+  const { tiles } = JSON.parse(_encoder.tiles_near_point(lon, lat, _zoom));
+  await Promise.all(tiles.map(async ([z, x, y]) => {
+    try {
+      const res = await _pmtiles.getZxy(z, x, y);
+      const bytes = tileBytes(res);
+      _encoder.load_tile(z, x, y, bytes ?? new Uint8Array(0));
+    } catch { /* best-effort; needs_tile retry loop covers gaps */ }
+  }));
+}
+
+/** Nearby distinct road candidates a click could snap onto — used to decide
+ *  whether to show a disambiguation picker before committing a waypoint.
+ *  Returns [] if the encoder isn't ready or nothing is within snap radius. */
+export function getSnapCandidates(lon, lat) {
+  if (!_encoder) return [];
+  try {
+    return JSON.parse(_encoder.candidates_near_point(lon, lat)).candidates ?? [];
+  } catch {
+    return [];
+  }
+}
+
 export function getSegIdToTile()   { return _segIdToTile; }
 export function getTileGeomCache() { return _tileGeomCache; }
 export function getSegGeomCache()  { return _segGeomCache; }
@@ -200,6 +231,28 @@ export const useStore = create(persist(
   replaySteps: [],        // pre-built display steps from buildReplaySteps()
   replayStats: null,      // { maxG, totalNodes, phases }
   replayStep: 0,          // current display step index
+
+  // ── Encode mode state ────────────────────────────────────────────────────
+  mode: 'decode',           // 'decode' | 'encode'
+  // 'Line' and 'PointAlongLine' are implemented; the other 7 OpenLR location
+  // types are listed in the UI (disabled) for discoverability but have no
+  // encoder support yet.
+  locationType: 'Line',
+  waypoints: [],            // ordered [{lon,lat}], user-drawn
+  waypointHistory: [],      // undo stack: prior `waypoints` snapshots
+  liveRoute: null,          // { segments, geometry, length_m } from route_between()
+  liveRouteError: null,
+  liveRouteLoading: false,
+  encoding: false,
+  encodeResult: null,       // { v3, tpeg, error } | null
+  // Round-trip verification: the freshly-encoded location, decoded straight back
+  // via the existing _decoder. Mirrors decodeResult/replaySteps/replayStats
+  // shape exactly so Results/Trace/Replay panels can read this in encode mode.
+  verifyResult: null,
+  verifyToast: null,
+  verifyReplaySteps: [],
+  verifyReplayStats: null,
+  verifyReplayStep: 0,
 
   setOpenlrString: (s) => set({ openlrString: s }),
   setTileUrl: (url) => set({ tileUrl: url }),
@@ -385,10 +438,14 @@ export const useStore = create(persist(
   toggleReplay:        () => set(state => ({ showReplay:        !state.showReplay })),
   toggleSegmentLayer:  () => set(state => ({ showSegmentLayer:  !state.showSegmentLayer })),
 
-  setReplayStep:  (n)  => set(state => ({ replayStep: Math.max(0, Math.min(n, state.replaySteps.length - 1)) })),
-  stepReplay: (delta) => set(state => ({
-    replayStep: Math.max(0, Math.min(state.replayStep + delta, state.replaySteps.length - 1)),
-  })),
+  // Both mode-aware: in encode mode these drive the round-trip verify-decode's
+  // replay data instead of the last manual decode's.
+  setReplayStep: (n) => set(state => state.mode === 'encode'
+    ? { verifyReplayStep: Math.max(0, Math.min(n, state.verifyReplaySteps.length - 1)) }
+    : { replayStep:       Math.max(0, Math.min(n, state.replaySteps.length - 1)) }),
+  stepReplay: (delta) => set(state => state.mode === 'encode'
+    ? { verifyReplayStep: Math.max(0, Math.min(state.verifyReplayStep + delta, state.verifyReplaySteps.length - 1)) }
+    : { replayStep:       Math.max(0, Math.min(state.replayStep + delta, state.replaySteps.length - 1)) }),
 
   // Re-decode at an elevated trace level and open the trace panel.
   // Off → Summary on first call; Summary or Full → Full on subsequent calls.
@@ -400,10 +457,44 @@ export const useStore = create(persist(
     await get().runDecode();
   },
 
+  // Same idea as debugDecode, but re-runs the encode-mode round-trip verify
+  // decode instead of the manual openlrString decode.
+  debugVerify: async () => {
+    const { params, encodeResult } = get();
+    if (!encodeResult?.v3) return;
+    const current = params.trace_level ?? 'Summary';
+    const elevated = current === 'Off' ? 'Summary' : 'Full';
+    set(state => ({ params: { ...state.params, trace_level: elevated }, showTrace: true }));
+    await get().runVerifyDecode(encodeResult.v3);
+  },
+
   hideResult:    () => set({ showResult: false }),
   toggleResult:  () => set(state => ({ showResult: !state.showResult })),
   clearDecodeToast: () => set({ decodeToast: null }),
-  clearResult: () => set({ decodeResult: null, showResult: false, highlightedSegment: null, traceHighlightSegIds: null, traceHighlightSnaps: null, traceLrpFocus: null, candidatePopup: null, llmApiHistory: [] }),
+  // "Clear" button next to Decode — wipes the input and everything a decode
+  // produced (map layers follow decodeResult:null automatically), so the
+  // user gets a blank slate rather than a stale route left on screen.
+  clearResult: () => set({
+    openlrString: '',
+    decodeResult: null,
+    decodeToast: null,
+    showResult: false,
+    showTrace: false,
+    showReplay: false,
+    highlightedSegment: null,
+    traceHighlightSegIds: null,
+    traceHighlightSnaps: null,
+    traceLrpFocus: null,
+    candidatePopup: null,
+    replaySteps: [],
+    replayStats: null,
+    replayStep: 0,
+    pinnedCandidates: {},
+    forcedDecodeResult: null,
+    llmMessages: [],
+    llmApiHistory: [],
+    llmLoading: false,
+  }),
   setHighlightedSegment: (seg) => set({ highlightedSegment: seg }),
   // Request the segment info popup to open for a given tile+local_index.
   // Map.jsx watches this and opens the popup; call clearRequestedInfoSegment() after handling.
@@ -744,6 +835,310 @@ export const useStore = create(persist(
         const errorMsg = e instanceof Error ? e.message : String(e);
         set({ decoding: false, decodeResult: clientDecodeFailure(errorMsg), decodeToast: { message: errorMsg } });
       }
+    }
+  },
+
+  // ── Encode mode ───────────────────────────────────────────────────────────
+
+  setMode: (mode) => set({ mode }),
+  setLocationType: (locationType) => set({ locationType }),
+
+  // Bulk-replace all waypoints at once (e.g. from the debug textarea input
+  // before map-based drawing exists). Prefetches tiles for every point.
+  setWaypoints: async (list) => {
+    const { waypoints } = get();
+    set(state => ({ waypointHistory: [...state.waypointHistory, waypoints], waypoints: list }));
+    await Promise.all(list.map(w => loadEncoderTilesNear(w.lon, w.lat)));
+    await get().runLiveRoute();
+  },
+
+  addWaypoint: async (lonLat) => {
+    const { waypoints } = get();
+    set(state => ({ waypointHistory: [...state.waypointHistory, waypoints], waypoints: [...waypoints, lonLat] }));
+    await loadEncoderTilesNear(lonLat.lon, lonLat.lat);
+    await get().runLiveRoute();
+  },
+
+  insertWaypoint: async (index, lonLat) => {
+    const { waypoints } = get();
+    const next = [...waypoints.slice(0, index), lonLat, ...waypoints.slice(index)];
+    set(state => ({ waypointHistory: [...state.waypointHistory, waypoints], waypoints: next }));
+    await loadEncoderTilesNear(lonLat.lon, lonLat.lat);
+    await get().runLiveRoute();
+  },
+
+  moveWaypoint: async (index, lonLat) => {
+    const { waypoints } = get();
+    const next = waypoints.map((w, i) => (i === index ? lonLat : w));
+    set(state => ({ waypointHistory: [...state.waypointHistory, waypoints], waypoints: next }));
+    await loadEncoderTilesNear(lonLat.lon, lonLat.lat);
+    await get().runLiveRoute();
+  },
+
+  removeWaypoint: async (index) => {
+    const { waypoints } = get();
+    const next = waypoints.filter((_, i) => i !== index);
+    set(state => ({ waypointHistory: [...state.waypointHistory, waypoints], waypoints: next }));
+    await get().runLiveRoute();
+  },
+
+  // Swap waypoint `index` with its neighbor in `direction` (-1 or +1) —
+  // reordering via the EncodePanel's waypoint list.
+  moveWaypointIndex: async (index, direction) => {
+    const { waypoints } = get();
+    const j = index + direction;
+    if (j < 0 || j >= waypoints.length) return;
+    const next = [...waypoints];
+    [next[index], next[j]] = [next[j], next[index]];
+    set(state => ({ waypointHistory: [...state.waypointHistory, waypoints], waypoints: next }));
+    await get().runLiveRoute();
+  },
+
+  undo: async () => {
+    const { waypointHistory } = get();
+    if (!waypointHistory.length) return;
+    const prev = waypointHistory[waypointHistory.length - 1];
+    set({ waypoints: prev, waypointHistory: waypointHistory.slice(0, -1) });
+    await get().runLiveRoute();
+  },
+
+  clearWaypoints: () => {
+    const { waypoints } = get();
+    set(state => ({
+      waypointHistory: [...state.waypointHistory, waypoints],
+      waypoints: [],
+      liveRoute: null,
+      liveRouteError: null,
+      encodeResult: null,
+      verifyResult: null,
+      verifyToast: null,
+      verifyReplaySteps: [],
+      verifyReplayStats: null,
+      verifyReplayStep: 0,
+    }));
+  },
+
+  // Layer 1: snap waypoints to the road network and chain shortest-path
+  // between consecutive points, loading any tile the search discovers it
+  // needs along the way. Mirrors runDecode's needs_tile retry loop.
+  runLiveRoute: async () => {
+    const { waypoints } = get();
+    if (waypoints.length < 2 || !_encoder || !_pmtiles) {
+      set({ liveRoute: null, liveRouteError: null });
+      return;
+    }
+    set({ liveRouteLoading: true });
+    try {
+      const attemptedTiles = new Set();
+      const MAX_DYNAMIC_LOADS = 20;
+      let dynamicLoads = 0;
+      let out = null;
+      while (true) {
+        out = JSON.parse(_encoder.route_between(JSON.stringify(waypoints), _zoom));
+        if (!out.needs_tile) break;
+        if (dynamicLoads >= MAX_DYNAMIC_LOADS) {
+          out = { error: `Route search exceeded the maximum of ${MAX_DYNAMIC_LOADS} dynamically-loaded tiles.` };
+          break;
+        }
+        const [z, x, y] = out.needs_tile;
+        const tileKey = `${z}/${x}/${y}`;
+        if (attemptedTiles.has(tileKey)) {
+          out = { error: `Route search re-requested tile ${tileKey} that was already loaded — internal bug` };
+          break;
+        }
+        attemptedTiles.add(tileKey);
+        dynamicLoads++;
+        try {
+          const res = await _pmtiles.getZxy(z, x, y);
+          const bytes = tileBytes(res);
+          _encoder.load_tile(z, x, y, bytes ?? new Uint8Array(0));
+        } catch (e) {
+          out = { error: `Failed to load tile ${tileKey}: ${e?.message ?? e}` };
+          break;
+        }
+      }
+      if (out.error) {
+        set({ liveRoute: null, liveRouteError: out.error, liveRouteLoading: false });
+      } else {
+        set({ liveRoute: out, liveRouteError: null, liveRouteLoading: false });
+      }
+    } catch (e) {
+      set({ liveRoute: null, liveRouteError: String(e), liveRouteLoading: false });
+    }
+  },
+
+  // Encode the current waypoints to a Line location (v3 + TPEG), then
+  // immediately decode the v3 string back via the existing _decoder so
+  // Results/Trace/Replay can show a real round-trip verification.
+  runEncode: async () => {
+    const { waypoints, params } = get();
+    if (waypoints.length < 2 || !_encoder || !_pmtiles) return;
+    set({
+      encoding: true, encodeResult: null,
+      verifyResult: null, verifyToast: null, verifyReplaySteps: [], verifyReplayStats: null, verifyReplayStep: 0,
+    });
+    try {
+      const attemptedTiles = new Set();
+      const MAX_DYNAMIC_LOADS = 20;
+      let dynamicLoads = 0;
+      let out = null;
+      // max_interior_turn_deviation_deg applies to encoding too, despite the
+      // decode-only-sounding name — see openlr-encoder::coverage::sweep_coverage.
+      while (true) {
+        out = JSON.parse(_encoder.encode_line(JSON.stringify(waypoints), params.max_interior_turn_deviation_deg, _zoom));
+        if (!out.needs_tile) break;
+        if (dynamicLoads >= MAX_DYNAMIC_LOADS) {
+          out = { error: `Encode exceeded the maximum of ${MAX_DYNAMIC_LOADS} dynamically-loaded tiles.` };
+          break;
+        }
+        const [z, x, y] = out.needs_tile;
+        const tileKey = `${z}/${x}/${y}`;
+        if (attemptedTiles.has(tileKey)) {
+          out = { error: `Encode re-requested tile ${tileKey} that was already loaded — internal bug` };
+          break;
+        }
+        attemptedTiles.add(tileKey);
+        dynamicLoads++;
+        try {
+          const res = await _pmtiles.getZxy(z, x, y);
+          const bytes = tileBytes(res);
+          _encoder.load_tile(z, x, y, bytes ?? new Uint8Array(0));
+        } catch (e) {
+          out = { error: `Failed to load tile ${tileKey}: ${e?.message ?? e}` };
+          break;
+        }
+      }
+
+      if (out.error) {
+        set({ encoding: false, encodeResult: { v3: null, tpeg: null, error: out.error } });
+        return;
+      }
+
+      set({ encodeResult: { v3: out.v3, tpeg: out.tpeg, error: null } });
+      await get().runVerifyDecode(out.v3);
+    } catch (e) {
+      set({ encodeResult: { v3: null, tpeg: null, error: String(e) } });
+    } finally {
+      set({ encoding: false });
+    }
+  },
+
+  // Encode the first waypoint as a PointAlongLine location, then verify via
+  // round-trip decode exactly like runEncode does for Line.
+  runEncodePal: async (orientation, sideOfRoad) => {
+    const { waypoints } = get();
+    if (waypoints.length < 1 || !_encoder) return;
+    set({
+      encoding: true, encodeResult: null,
+      verifyResult: null, verifyToast: null, verifyReplaySteps: [], verifyReplayStats: null, verifyReplayStep: 0,
+    });
+    try {
+      const { lon, lat, segment_id, node_id } = waypoints[0];
+      const out = JSON.parse(_encoder.encode_pal(lon, lat, segment_id, node_id, orientation, sideOfRoad));
+      if (out.error) {
+        set({ encodeResult: { v3: null, tpeg: null, error: out.error } });
+        return;
+      }
+      set({ encodeResult: { v3: out.v3, tpeg: out.tpeg, error: null } });
+      await get().runVerifyDecode(out.v3);
+    } catch (e) {
+      set({ encodeResult: { v3: null, tpeg: null, error: String(e) } });
+    } finally {
+      set({ encoding: false });
+    }
+  },
+
+  // Decode `v3String` with the existing _decoder, following the same
+  // needs_tile retry protocol and segment-geometry cache build-out as
+  // runDecode, but writing to verifyResult/verifyReplay* instead.
+  runVerifyDecode: async (v3String) => {
+    const { params } = get();
+    if (!v3String || !_pmtiles || !_decoder) return;
+    let result = null;
+    try {
+      _decoder.reset_tiles();
+      const paramsJson = JSON.stringify(params);
+      const startResult = JSON.parse(_decoder.start(v3String, paramsJson, _zoom));
+
+      await Promise.all(startResult.tiles.map(async ([z, x, y]) => {
+        try {
+          const res = await _pmtiles.getZxy(z, x, y);
+          const bytes = tileBytes(res);
+          if (bytes) {
+            _decoder.load_tile(z, x, y, bytes);
+            _tileGeomCache.set(`${z}/${x}/${y}`, decodeTile(bytes.buffer, z, x, y).features);
+          }
+        } catch (e) {
+          console.warn(`[verify-decode] tile ${z}/${x}/${y} load failed:`, e?.message ?? e);
+        }
+      }));
+
+      const attemptedTiles = new Set(startResult.tiles.map(([z,x,y]) => `${z}/${x}/${y}`));
+      const MAX_DYNAMIC_LOADS = 20;
+      let dynamicLoads = 0;
+      while (true) {
+        result = JSON.parse(_decoder.decode());
+        if (!result.needs_tile) break;
+        if (dynamicLoads >= MAX_DYNAMIC_LOADS) {
+          result = clientDecodeFailure(`Verify-decode exceeded the maximum of ${MAX_DYNAMIC_LOADS} dynamically-loaded tiles.`);
+          break;
+        }
+        const [z, x, y] = result.needs_tile;
+        const tileKey = `${z}/${x}/${y}`;
+        if (attemptedTiles.has(tileKey)) {
+          result = clientDecodeFailure(`Verify-decode re-requested tile ${tileKey} that was already loaded — internal bug`);
+          break;
+        }
+        attemptedTiles.add(tileKey);
+        dynamicLoads++;
+        try {
+          const res = await _pmtiles.getZxy(z, x, y);
+          const bytes = tileBytes(res);
+          if (bytes) {
+            _decoder.load_tile(z, x, y, bytes);
+            _tileGeomCache.set(tileKey, decodeTile(bytes.buffer, z, x, y).features);
+          } else {
+            _decoder.load_tile(z, x, y, new Uint8Array(0));
+          }
+        } catch (e) {
+          result = clientDecodeFailure(`Failed to load tile ${tileKey}: ${e?.message ?? e}`);
+          break;
+        }
+      }
+
+      // Rebuild segment_id → tile/geometry caches so Results/Segments can
+      // draw the verified route, same as runDecode's post-processing.
+      const tileFeatureIndex = new Map();
+      for (const [tileKey, features] of _tileGeomCache) {
+        const idx = new Map();
+        for (const feat of features) idx.set(feat.properties.local_index, feat);
+        tileFeatureIndex.set(tileKey, idx);
+      }
+      const rawMappings = JSON.parse(_decoder.all_segment_tile_mappings());
+      for (const [segId, z, x, y, li] of rawMappings) {
+        const tileKey = `${z}/${x}/${y}`;
+        _segIdToTile.set(segId, { tile_key: tileKey, local_index: li });
+        const feat = tileFeatureIndex.get(tileKey)?.get(li);
+        if (feat) _segGeomCache.set(segId, feat);
+      }
+      for (const seg of result.segments ?? []) {
+        const feat = _segGeomCache.get(seg.segment_id);
+        if (feat) seg.stable_id = feat.properties.stable_id ?? null;
+      }
+
+      const replayData = result.trace?.events?.length
+        ? buildReplaySteps(result.trace.events)
+        : { steps: [], stats: null };
+      set({
+        verifyResult: result,
+        verifyToast: result.ok ? null : { message: result.error ?? 'Verify-decode failed' },
+        verifyReplaySteps: replayData.steps,
+        verifyReplayStats: replayData.stats,
+        verifyReplayStep: 0,
+      });
+    } catch (e) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      set({ verifyResult: clientDecodeFailure(errorMsg), verifyToast: { message: errorMsg } });
     }
   },
  }),

@@ -85,7 +85,7 @@ fn find_real_path(graph: &openlr_graph::Graph, hops: usize) -> Option<(NodeId, V
         if node == start_node {
             continue;
         }
-        if let Some(result) = openlr_graph::shortest_path(graph, start_node, openlr_graph::NO_PRIOR_SEG, node, 7, 180.0, 0) {
+        if let openlr_graph::PathOutcome::Found(result) = openlr_graph::shortest_path(graph, start_node, openlr_graph::NO_PRIOR_SEG, node, 7, 180.0, 0, 12) {
             if result.segments.len() >= 2 {
                 return Some((start_node, result.segments));
             }
@@ -136,8 +136,9 @@ fn encode_then_decode_real_path_round_trips() {
         start_node,
         start_offset_m: 0.0,
         end_offset_m: 0.0,
+        via_split_points: vec![],
     };
-    let loc_ref = encode_line(graph, &input).expect("encoding failed");
+    let loc_ref = encode_line(graph, &input, 150.0, 12).expect("encoding failed");
     for (i, lrp) in loc_ref.lrps().unwrap().iter().enumerate() {
         eprintln!(
             "LRP{i}: coord={:?} frc={} fow={} lfrcnp={:?} dnp={:?} pos_off={:?} neg_off={:?}",
@@ -240,12 +241,12 @@ fn scan_for_edge_cases() {
                 }
             }
             if !ok_walk || node == start_node { continue; }
-            let Some(sp) = openlr_graph::shortest_path(graph, start_node, openlr_graph::NO_PRIOR_SEG, node, 7, 180.0, 0) else { continue };
+            let openlr_graph::PathOutcome::Found(sp) = openlr_graph::shortest_path(graph, start_node, openlr_graph::NO_PRIOR_SEG, node, 7, 180.0, 0, 12) else { continue };
             if sp.segments.len() < 2 { continue; }
             let path = sp.segments;
 
-            let input = LineLocationInput { path: path.clone(), start_node, start_offset_m: 0.0, end_offset_m: 0.0 };
-            match encode_line(graph, &input) {
+            let input = LineLocationInput { path: path.clone(), start_node, start_offset_m: 0.0, end_offset_m: 0.0, via_split_points: vec![] };
+            match encode_line(graph, &input, 180.0, 12) {
                 Err(openlr_encoder::EncodeError::NoRoute) => { no_route += 1; continue; }
                 Err(e) => { other_encode_err += 1; eprintln!("OTHER ENCODE ERR seed=({start_seg_id:?},{hops}): {e}"); continue; }
                 Ok(loc_ref) => {

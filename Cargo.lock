@@ -141,6 +141,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "openlr-codec",
+ "openlr-encoder",
  "openlr-engine",
  "openlr-graph",
  "openlr-provider",

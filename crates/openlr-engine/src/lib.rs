@@ -61,8 +61,14 @@ pub struct DecodedLocation {
     /// `None` when `params.trace_level == TraceLevel::Off`.
     pub trace: Option<DecodeTrace>,
     // ── PointAlongLine-specific fields ────────────────────────────────────────
-    /// The decoded point coordinate (lon, lat). Set for PAL; None for line locations.
+    /// The decoded point coordinate (lon, lat) — the *center* of the offset's
+    /// v3 quantization uncertainty window (`(point_coord_lb + point_coord_ub) / 2`
+    /// along the path). Set for PAL; None for line locations.
     pub point_coord: Option<(f64, f64)>,
+    /// The near end of that uncertainty window (offset's lower bound).
+    pub point_coord_lb: Option<(f64, f64)>,
+    /// The far end of that uncertainty window (offset's upper bound).
+    pub point_coord_ub: Option<(f64, f64)>,
     /// PAL orientation attribute.
     pub orientation: Option<Orientation>,
     /// PAL side-of-road attribute.
@@ -386,14 +392,18 @@ pub fn decode(
         .collect();
 
     // ── 5. PAL: compute point coordinate ───────────────────────────────────
-    // Use the conservative (LB) trim — smallest offset keeps the point closest
-    // to the LRP, maximising coverage when the interval is wide (v3 buckets).
-    let (point_coord, orientation, side_of_road) = if is_pal {
-        let dist = first_lrp_arc_m + pos_offset.map_or(0.0, |i| i.lb);
-        let pt = wkt::point_at_path_distance(&path, dist, first_seg_traversal, graph);
-        (pt, pal_orientation, pal_side_of_road)
+    // The v3-encoded POFF is itself a quantization bucket [lb, ub] — the true
+    // point could genuinely be anywhere in it. Report the center as the best
+    // estimate, plus both ends so callers can render the uncertainty.
+    let (point_coord, point_coord_lb, point_coord_ub, orientation, side_of_road) = if is_pal {
+        let lb = pos_offset.map_or(0.0, |i| i.lb);
+        let ub = pos_offset.map_or(0.0, |i| i.ub);
+        let pt_center = wkt::point_at_path_distance(&path, first_lrp_arc_m + (lb + ub) / 2.0, first_seg_traversal, graph);
+        let pt_lb = wkt::point_at_path_distance(&path, first_lrp_arc_m + lb, first_seg_traversal, graph);
+        let pt_ub = wkt::point_at_path_distance(&path, first_lrp_arc_m + ub, first_seg_traversal, graph);
+        (pt_center, pt_lb, pt_ub, pal_orientation, pal_side_of_road)
     } else {
-        (None, None, None)
+        (None, None, None, None, None)
     };
 
     // ── 6. Emit completion ──────────────────────────────────────────────────
@@ -412,7 +422,7 @@ pub fn decode(
         first_seg_traversal, last_seg_traversal,
         lrp_snap_points, lrp_snap_is_endpoint, lrp_snap_distances_m,
         trace,
-        point_coord, orientation, side_of_road,
+        point_coord, point_coord_lb, point_coord_ub, orientation, side_of_road,
     };
 
     Ok(match loc_ref {
@@ -471,6 +481,11 @@ fn try_route_combination(
     let mut path: Vec<SegmentId> = Vec::new();
     let mut total_path_m: f64 = 0.0;
     let mut leg_lengths: Vec<f64> = Vec::with_capacity(lrps.len().saturating_sub(1));
+    // The segment (and its declared traversal) that the path most recently
+    // arrived via — i.e. `to.segment_id` of whichever leg just finished. `None`
+    // before leg 0, matching how A* itself has no incoming-segment bias on its
+    // very first hop. Used to catch a class of turn A* never sees (see below).
+    let mut prev_arrival_seg: Option<SegmentId> = None;
 
     for leg in 0..lrps.len() - 1 {
         let from = &all_candidates[leg][indices[leg]];
@@ -485,7 +500,9 @@ fn try_route_combination(
         // same direction, with the from-LRP before the to-LRP.  No A* needed — the
         // distance is simply the difference of arc offsets.  Routing from exit_node back
         // to entry_node would force a U-turn on the same segment, which A* correctly
-        // blocks; we must bypass A* entirely for this case.
+        // blocks; we must bypass A* entirely for this case.  This is a straight
+        // continuation along one road, not a junction, so the boundary turn-angle
+        // check below does not apply here.
         if from.segment_id == to.segment_id
             && from.traversal == to.traversal
             && from.projection.arc_offset_m <= to.projection.arc_offset_m
@@ -508,7 +525,40 @@ fn try_route_combination(
                 path.push(from.segment_id);
             }
             // to.segment_id == from.segment_id — already in path; do not push again.
+            // The segment just walked (the only one involved in this leg) is
+            // what the next leg's boundary check should compare against.
+            prev_arrival_seg = Some(from.segment_id);
             continue;
+        }
+
+        // Boundary turn-angle gate: `from`'s own "partial edge" (from wherever
+        // it sits to its exit_node) is an arithmetic distance, never run
+        // through `graph.successors()` — so A*'s turn-angle gate never sees
+        // this transition. Without this check, a dead end whose only
+        // candidate requires walking back across the segment just arrived on
+        // (a literal 180° U-turn) is silently accepted as a valid route,
+        // because nothing ever asks "is this turn too sharp" at this specific
+        // node. `prev_arrival_seg` is the segment *actually walked* to reach
+        // `from.entry_node` — the previous leg's last A*-interior hop, or (if
+        // that leg had no interior route, i.e. its own exit_node landed
+        // exactly on this entry_node) that leg's own `from.segment_id`.
+        // Deliberately NOT that leg's `to.segment_id` (this same LRP's own
+        // candidate segment) — since `to` at leg N-1 and `from` at leg N are
+        // the same candidate object, using `to.segment_id` there would always
+        // compare a segment against itself here, reporting a false 180°
+        // "reversal" for every ordinary multi-segment leg regardless of the
+        // real geometry (see project notes for how this was found).
+        if let Some(prev_seg) = prev_arrival_seg {
+            if let Some(dev) = graph.turn_deviation_deg(prev_seg, from.entry_node, from.segment_id) {
+                if dev > params.max_interior_turn_deviation_deg {
+                    trace.push_summary(DecodeEvent::RouteFailed {
+                        leg,
+                        reason: RoutingFailure::SharpBoundaryTurn { deviation_deg: dev },
+                    });
+                    *out_failed_leg = leg;
+                    return None;
+                }
+            }
         }
 
         let key = (from.exit_node, to.entry_node, lfrcnp);
@@ -600,6 +650,15 @@ fn try_route_combination(
         if !segments.is_empty() || to.segment_id != from.segment_id {
             path.push(to.segment_id);
         }
+        // The segment actually walked immediately before reaching `to`'s own
+        // boundary — the last A*-searched interior hop, or (when the interior
+        // is empty, i.e. `from.exit_node == to.entry_node` exactly) `from`'s
+        // own segment. NOT `to.segment_id`: that's the *next* thing to walk,
+        // not what was just walked — using it here made the next leg's check
+        // always compare a segment to itself (since `to` here becomes `from`
+        // for the next leg), reporting a false 180° "reversal" for every
+        // ordinary leg with a real interior route.
+        prev_arrival_seg = Some(segments.last().copied().unwrap_or(from.segment_id));
     }
 
     // Consecutive duplicate segments mean A* traversed the to-candidate's own
@@ -736,12 +795,15 @@ pub fn decode_forced(
         all_candidates.iter().map(|c| c[0].projection.distance_m).collect();
 
     // ── PAL ───────────────────────────────────────────────────────────────────
-    let (point_coord, orientation, side_of_road) = if is_pal {
-        let dist = first_lrp_arc_m + pos_offset.map_or(0.0, |i| i.lb);
-        let pt = wkt::point_at_path_distance(&path, dist, first_seg_traversal, graph);
-        (pt, pal_orientation, pal_side_of_road)
+    let (point_coord, point_coord_lb, point_coord_ub, orientation, side_of_road) = if is_pal {
+        let lb = pos_offset.map_or(0.0, |i| i.lb);
+        let ub = pos_offset.map_or(0.0, |i| i.ub);
+        let pt_center = wkt::point_at_path_distance(&path, first_lrp_arc_m + (lb + ub) / 2.0, first_seg_traversal, graph);
+        let pt_lb = wkt::point_at_path_distance(&path, first_lrp_arc_m + lb, first_seg_traversal, graph);
+        let pt_ub = wkt::point_at_path_distance(&path, first_lrp_arc_m + ub, first_seg_traversal, graph);
+        (pt_center, pt_lb, pt_ub, pal_orientation, pal_side_of_road)
     } else {
-        (None, None, None)
+        (None, None, None, None, None)
     };
 
     let outcome = DecodeOutcome::Success { path: path.clone(), pos_offset, neg_offset };
@@ -755,7 +817,7 @@ pub fn decode_forced(
         first_seg_traversal, last_seg_traversal,
         lrp_snap_points, lrp_snap_is_endpoint, lrp_snap_distances_m,
         trace,
-        point_coord, orientation, side_of_road,
+        point_coord, point_coord_lb, point_coord_ub, orientation, side_of_road,
     };
 
     Ok(match loc_ref {
@@ -856,5 +918,89 @@ mod tests {
             vec![SegmentId(1), SegmentId(2), SegmentId(3)],
             "path should be [A, B, C] with B (junction) appearing exactly once",
         );
+    }
+
+    fn forced_candidate(
+        segment_id: SegmentId, traversal: TraversalDir,
+        entry_node: NodeId, exit_node: NodeId,
+        arc_offset_m: f64, point: (f64, f64),
+    ) -> ScoredCandidate {
+        ScoredCandidate {
+            segment_id, traversal, entry_node, exit_node,
+            projection: ProjectionResult {
+                arc_offset_m, point, distance_m: 0.0, bearing_deg: 0.0,
+                is_at_entry: arc_offset_m == 0.0, is_at_exit: false,
+            },
+            score: CandidateScore {
+                distance_score: 0.0, bearing_score: 0.0, frc_score: 0.0, fow_score: 0.0,
+                interior_score: 0.0, wrong_endpoint_score: 0.0, total: 0.0,
+            },
+        }
+    }
+
+    /// A dead end (node B, touched only by segment AB) forces the only
+    /// candidate for an LRP sitting there to describe its outgoing leg by
+    /// walking back across the very segment just arrived on — a literal
+    /// 180° U-turn. `try_route_combination` must reject this combination
+    /// rather than silently accept it (which is what produced the straight-line
+    /// rendering artifact this test guards against: a route that "arrives" at
+    /// B then "departs" by retracing the same segment has no continuous
+    /// geometry to draw in between).
+    ///
+    ///   A(0,0) ──seg1──▶ B(0.002,0)       [B is a dead end: only seg1 touches it]
+    ///   A(0,0) ──seg2──▶ C(0,-0.002) ──seg3──▶ D(0,-0.004)
+    #[test]
+    fn boundary_uturn_at_dead_end_is_rejected() {
+        let mut g = Graph::new();
+        g.add_node(node(1, 0.000, 0.000));  // A
+        g.add_node(node(2, 0.002, 0.000));  // B — dead end
+        g.add_node(node(3, 0.000, -0.002)); // C
+        g.add_node(node(4, 0.000, -0.004)); // D
+        g.add_segment(seg(1, 1, 2, 222.0, vec![(0.000, 0.000), (0.002, 0.000)]));   // A->B
+        g.add_segment(seg(2, 1, 3, 222.0, vec![(0.000, 0.000), (0.000, -0.002)]));  // A->C
+        g.add_segment(seg(3, 3, 4, 222.0, vec![(0.000, -0.002), (0.000, -0.004)])); // C->D
+
+        // LRP0 at A, describing its own outgoing leg via seg1 forward (toward B).
+        let lrp0 = forced_candidate(SegmentId(1), TraversalDir::Forward, NodeId(1), NodeId(2), 0.0, (0.000, 0.000));
+        // LRP1 at B (the dead end) — its only real candidate: seg1 backward,
+        // "looking back" toward A, since B has no other connection at all.
+        let lrp1 = forced_candidate(SegmentId(1), TraversalDir::Backward, NodeId(2), NodeId(1), 0.0, (0.002, 0.000));
+        // LRP2 (last), positioned just short of D along seg3 (forward, entry=C) —
+        // an ordinary interior candidate, so A* targets C (reachable via seg2)
+        // and the remaining stretch to the true point is a plain arithmetic
+        // partial, exactly like the passing `three_lrp_path_continuous` test's
+        // last LRP. (Placing it exactly at node D instead would target A* at D
+        // directly, which can only be reached by fully traversing seg3 — a
+        // separate, unrelated edge case this test isn't about.)
+        let lrp2 = forced_candidate(SegmentId(3), TraversalDir::Forward, NodeId(3), NodeId(4), 200.0, (0.000, -0.0038));
+
+        let loc_ref = LocationReference::Line { lrps: vec![
+            Lrp { coord: (0.000, 0.000), bearing: CircularInterval { lb_deg: 0.0, ub_deg: 0.0 },
+                  frc: 3, fow: 3, lfrcnp: Some(7), dnp: Some(LinearInterval { lb: 0.0, ub: 2000.0 }),
+                  pos_offset: None, neg_offset: None, pos_offset_raw: None, neg_offset_raw: None },
+            Lrp { coord: (0.002, 0.000), bearing: CircularInterval { lb_deg: 0.0, ub_deg: 0.0 },
+                  frc: 3, fow: 3, lfrcnp: Some(7), dnp: Some(LinearInterval { lb: 0.0, ub: 2000.0 }),
+                  pos_offset: None, neg_offset: None, pos_offset_raw: None, neg_offset_raw: None },
+            Lrp { coord: (0.000, -0.0038), bearing: CircularInterval { lb_deg: 0.0, ub_deg: 0.0 },
+                  frc: 3, fow: 3, lfrcnp: None, dnp: None,
+                  pos_offset: None, neg_offset: None, pos_offset_raw: None, neg_offset_raw: None },
+        ]};
+
+        // Default turn-angle cap (150°) must reject the 180° boundary reversal.
+        let mut strict_params = DecodeParams::preset(Preset::Default);
+        strict_params.trace_level = TraceLevel::Off;
+        let err = decode_forced(&loc_ref, vec![lrp0.clone(), lrp1.clone(), lrp2.clone()], &g, &strict_params, 12)
+            .expect_err("a 180° boundary U-turn must be rejected, not silently routed");
+        assert!(matches!(err.error, DecodeError::AllCombinationsFailed(_)), "error={:?}", err.error);
+
+        // Control: with the turn-angle gate fully disabled (180°), the same
+        // combination must still succeed — confirms the new check is gated by
+        // the configured threshold, not an unconditional hard block.
+        let mut permissive_params = strict_params.clone();
+        permissive_params.max_interior_turn_deviation_deg = 180.0;
+        let result = decode_forced(&loc_ref, vec![lrp0, lrp1, lrp2], &g, &permissive_params, 12)
+            .expect("with the gate disabled, the same combination should route successfully");
+        let decoded = result.as_network().expect("expected network result");
+        assert_eq!(decoded.path, vec![SegmentId(1), SegmentId(2), SegmentId(3)]);
     }
 }

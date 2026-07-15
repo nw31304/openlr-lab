@@ -734,10 +734,12 @@ function ForcedDecodeSection({ forcedDecodeResult, originalTrace, pinnedSnaps, s
 // ── Main panel ────────────────────────────────────────────────────────────────
 
 export default function TracePanel() {
-  const { decodeResult, openlrString, params, setParam,
+  const { decodeResult: decodeResultRaw, verifyResult, mode, openlrString, params, setParam,
           setTraceHighlight, setTraceLrpFocus, replaySteps, setCandidatePopup,
           pinnedCandidates, setPinnedCandidate, clearPinnedCandidates,
           forcedDecodeResult, forcedDecoding, runForcedDecode } = useStore();
+  // In encode mode, show the trace from the round-trip verify-decode.
+  const decodeResult = mode === 'encode' ? verifyResult : decodeResultRaw;
 
   const traceLevel = params.trace_level ?? 'Summary';
   const trace = decodeResult?.trace;

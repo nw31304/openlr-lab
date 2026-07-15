@@ -273,7 +273,16 @@ impl Graph {
     /// the route doubles back on itself (a full U-turn). `None` if either
     /// segment's geometry can't be read at `node` (missing/degenerate data —
     /// callers should treat this permissively, not as a rejection).
-    fn turn_deviation_deg(&self, from_seg: SegmentId, node: NodeId, to_seg: SegmentId) -> Option<f64> {
+    ///
+    /// `pub` (not just used internally by `successors`/`successors_skipped`)
+    /// because the same check is needed for transitions `successors()` never
+    /// sees: an LRP's own boundary segment — the "partial edge" spanning from
+    /// where a candidate sits to the node it hands off to the next leg at —
+    /// is an arithmetic distance computation, not an A*-searched edge, so it
+    /// never passes through `successors()`'s turn-angle gate at all. Decode's
+    /// candidate-combination logic (`openlr-engine`) calls this directly to
+    /// close that gap.
+    pub fn turn_deviation_deg(&self, from_seg: SegmentId, node: NodeId, to_seg: SegmentId) -> Option<f64> {
         let from = self.segments.get(&from_seg)?;
         let to = self.segments.get(&to_seg)?;
         let b_in = bearing_away_from_node(from, node)?;

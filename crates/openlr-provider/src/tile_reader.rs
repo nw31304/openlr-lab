@@ -91,6 +91,17 @@ pub struct TileLoader {
     pub graph: Graph,
     /// Stable source ID → global NodeId, universal dedup map (all nodes, not just boundary).
     boundary_nodes: HashMap<String, NodeId>,
+    /// Stable source ID → global SegmentId, dedup map. A segment straddling a
+    /// tile boundary is emitted into every tile it touches, so without this
+    /// the same real-world edge would be re-parsed into a second, distinct
+    /// `SegmentId` each time an overlapping tile loads — two "identical twin"
+    /// segments (same stable_id/nodes/geometry/length) that `shortest_path`
+    /// can't tell apart, so two otherwise-identical searches for the same
+    /// edge can silently pick different twins and disagree with each other
+    /// (e.g. route construction resolving one twin, then the encoder's own
+    /// shortest-path reproduction check picking the other and failing to
+    /// find the "same" path at all).
+    boundary_segs: HashMap<String, SegmentId>,
     next_node_id: u32,
     next_seg_id: u32,
     /// Maps each SegmentId → (tile_z, tile_x, tile_y, local_segment_index_within_tile).
@@ -112,6 +123,7 @@ impl TileLoader {
         Self {
             graph: Graph::new(),
             boundary_nodes: HashMap::new(),
+            boundary_segs: HashMap::new(),
             next_node_id: 0,
             next_seg_id: 0,
             seg_tile: HashMap::new(),
@@ -125,19 +137,21 @@ impl TileLoader {
     /// segments; any that reference not-yet-loaded segments stay pending and will be resolved
     /// when the next tile is loaded.
     ///
-    /// Returns the per-tile local node index → global `NodeId` table (see `load_tile_at`,
-    /// which is how most callers get `node_tile` populated instead of using this directly).
-    pub fn load_tile(&mut self, bytes: &[u8]) -> Result<Vec<NodeId>, TileReadError> {
-        let local_nodes = parse_tile(
+    /// Returns the per-tile local node/segment index → global `NodeId`/`SegmentId` tables
+    /// (see `load_tile_at`, which is how most callers get `node_tile`/`seg_tile` populated
+    /// instead of using this directly).
+    pub fn load_tile(&mut self, bytes: &[u8]) -> Result<(Vec<NodeId>, Vec<SegmentId>), TileReadError> {
+        let (local_nodes, local_segs) = parse_tile(
             bytes,
             &mut self.graph,
             &mut self.boundary_nodes,
+            &mut self.boundary_segs,
             &mut self.next_node_id,
             &mut self.next_seg_id,
             &mut self.pending_xrestr,
         )?;
         self.stitch_cross_tile();
-        Ok(local_nodes)
+        Ok((local_nodes, local_segs))
     }
 
     /// Like `load_tile`, but also records the tile key and local index for each
@@ -152,10 +166,12 @@ impl TileLoader {
             self.graph.mark_tile_loaded(z, x, y);
             return Ok(());
         }
-        let first_seg = self.next_seg_id;
-        let local_nodes = self.load_tile(bytes)?;
-        for local_idx in 0..(self.next_seg_id - first_seg) {
-            self.seg_tile.insert(SegmentId(first_seg + local_idx), (z, x, y, local_idx));
+        let (local_nodes, local_segs) = self.load_tile(bytes)?;
+        // Index by the *returned* per-tile tables, not an assumed contiguous
+        // ID range — a segment/node deduplicated against an earlier tile
+        // reuses that tile's existing ID rather than getting a fresh one.
+        for (local_idx, seg_id) in local_segs.into_iter().enumerate() {
+            self.seg_tile.insert(seg_id, (z, x, y, local_idx as u32));
         }
         for (local_idx, node_id) in local_nodes.into_iter().enumerate() {
             self.node_tile.insert((z, x, y, local_idx as u32), node_id);
@@ -211,10 +227,11 @@ fn parse_tile(
     b: &[u8],
     graph: &mut Graph,
     boundary_nodes: &mut HashMap<String, NodeId>,
+    boundary_segs: &mut HashMap<String, SegmentId>,
     next_node: &mut u32,
     next_seg: &mut u32,
     pending_xrestr: &mut Vec<PendingXRestr>,
-) -> Result<Vec<NodeId>, TileReadError> {
+) -> Result<(Vec<NodeId>, Vec<SegmentId>), TileReadError> {
     require(b, 40)?;
 
     let magic: [u8; 4] = b[0..4].try_into().expect("slice is exactly 4 bytes");
@@ -325,21 +342,26 @@ fn parse_tile(
         let geometry  = geom_pool[geom_idx..geom_idx + geom_len].to_vec();
         let stable_id = read_pool_str(sid_off, sid_len)?;
 
-        let seg_id = SegmentId(*next_seg);
-        *next_seg += 1;
+        let seg_id = *boundary_segs.entry(stable_id.clone()).or_insert_with(|| {
+            let id = SegmentId(*next_seg);
+            *next_seg += 1;
+            id
+        });
         local_seg.push(seg_id);
 
-        graph.add_segment(NetworkSegment {
-            id: seg_id,
-            start_node: local_node[start_local],
-            end_node:   local_node[end_local],
-            geometry,
-            length_m: length_cm as f64 / 100.0,
-            frc,
-            fow,
-            direction,
-            stable_id,
-        });
+        if !graph.segments.contains_key(&seg_id) {
+            graph.add_segment(NetworkSegment {
+                id: seg_id,
+                start_node: local_node[start_local],
+                end_node:   local_node[end_local],
+                geometry,
+                length_m: length_cm as f64 / 100.0,
+                frc,
+                fow,
+                direction,
+                stable_id,
+            });
+        }
     }
 
     // ── Intra-tile restrictions ───────────────────────────────────────────────
@@ -382,7 +404,7 @@ fn parse_tile(
         });
     }
 
-    Ok(local_node)
+    Ok((local_node, local_seg))
 }
 
 // ── Byte helpers ──────────────────────────────────────────────────────────────

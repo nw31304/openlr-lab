@@ -9,7 +9,8 @@ import TracePanel   from './components/TracePanel.jsx';
 import ParamsPanel  from './components/ParamsPanel.jsx';
 import LlmSettingsPanel from './components/LlmSettingsPanel.jsx';
 import LlmChatPanel     from './components/LlmChatPanel.jsx';
-import { setPmtiles, setDecoder, setZoom, useStore } from './store.js';
+import EncodePanel      from './components/EncodePanel.jsx';
+import { setPmtiles, setDecoder, setEncoder, setZoom, useStore } from './store.js';
 import DecodeToast from './components/DecodeToast.jsx';
 import { initWasm } from './wasm.js';
 
@@ -19,7 +20,8 @@ export default function App() {
   const [tilesBase, setTilesBase] = useState('/tiles');
   const [urlDraft, setUrlDraft]   = useState('');
 
-  const { showResult, toggleResult, showTrace, toggleTrace, showReplay, replaySteps } = useStore();
+  const { showResult, toggleResult, showTrace, toggleTrace, showReplay, mode, replaySteps: decodeReplaySteps, verifyReplaySteps } = useStore();
+  const replaySteps = mode === 'encode' ? verifyReplaySteps : decodeReplaySteps;
 
   function resolveBase() {
     const tilesParam = new URLSearchParams(window.location.search).get('tiles') ?? '';
@@ -39,9 +41,10 @@ export default function App() {
         setUrlDraft(base);
         const manifest = await fetch(`${base}/manifest.json`).then(r => r.json());
         const pmtiles  = new PMTiles(`${base}/${manifest.archive}`);
-        const decoder  = await initWasm();
+        const { decoder, encoder } = await initWasm();
         setPmtiles(pmtiles);
         setDecoder(decoder);
+        setEncoder(encoder);
         setZoom(manifest.tile_zoom ?? manifest.zoom ?? 12);
         setReady(true);
       } catch (e) {
@@ -125,6 +128,7 @@ export default function App() {
       <ParamsPanel />
       <LlmSettingsPanel />
       <LlmChatPanel />
+      <EncodePanel />
 
       <DecodeToast />
     </div>

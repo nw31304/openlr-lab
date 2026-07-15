@@ -2,7 +2,7 @@ import React from 'react';
 import { useStore } from '../store.js';
 
 export default function BottomBar() {
-  const { openlrString, setOpenlrString, decoding, runDecode } = useStore();
+  const { openlrString, setOpenlrString, decoding, runDecode, decodeResult, clearResult } = useStore();
 
   return (
     <div className="bottom-bar">
@@ -19,6 +19,12 @@ export default function BottomBar() {
       <button className="decode-btn" onClick={runDecode} disabled={decoding}>
         {decoding ? '…' : 'Decode'}
       </button>
+      <button
+        className="clear-btn"
+        onClick={clearResult}
+        disabled={decoding || (!openlrString && !decodeResult)}
+        title="Clear the input and decoded route"
+      >Clear</button>
     </div>
   );
 }

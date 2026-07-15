@@ -166,10 +166,13 @@ const FOW_NAMES = ['Undef', 'Motorway', 'Dual C/W', 'Single C/W', 'Roundabout', 
 const FRC_NAMES = ['FRC0', 'FRC1', 'FRC2', 'FRC3', 'FRC4', 'FRC5', 'FRC6', 'FRC7'];
 
 export default function ResultPanel() {
-  const { decodeResult, highlightedSegment, setHighlightedSegment,
-          requestInfoSegment, showTrace, toggleTrace, debugDecode, params,
+  const { decodeResult: decodeResultRaw, verifyResult, mode, highlightedSegment, setHighlightedSegment,
+          requestInfoSegment, showTrace, toggleTrace, debugDecode, debugVerify, params,
           llmConfig, llmChatOpen, toggleLlmChat, toggleLlmSettings,
           setTraceLrpFocus, openlrString } = useStore();
+  // In encode mode, this panel shows the round-trip verify-decode of the
+  // just-encoded location rather than the (unrelated) last manual decode.
+  const decodeResult = mode === 'encode' ? verifyResult : decodeResultRaw;
 
   const [refHeight, setRefHeight] = useState(280);
   const [exportFlash, setExportFlash] = useState(false);
@@ -276,7 +279,7 @@ export default function ResultPanel() {
                    : !isFull             ? 'Re-decode with full trace'
                    : !showTrace ? 'Open trace panel'
                    : null;
-  const debugAction = (!hasTrace || !isFull) ? debugDecode : toggleTrace;
+  const debugAction = (!hasTrace || !isFull) ? (mode === 'encode' ? debugVerify : debugDecode) : toggleTrace;
 
   return (
     <div className="result-panel">

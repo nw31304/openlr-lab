@@ -175,6 +175,14 @@ pub enum RoutingFailure {
     /// A* reached a boundary node whose home tile has not been loaded yet.
     /// This is not a true routing failure — the caller must load the tile and retry.
     NeedsTile { z: u8, x: u32, y: u32 },
+    /// This LRP's own boundary segment reverses direction too sharply relative
+    /// to how the path arrived at it — the OpenLR-level analogue of A*'s
+    /// interior turn-angle gate, applied to a transition `successors()` never
+    /// sees (the candidate's own "partial edge" is an arithmetic distance, not
+    /// an A*-searched edge). At 180° this is a literal U-turn — e.g. a via-point
+    /// whose only viable continuation is to walk back across the segment just
+    /// arrived on (a dead end).
+    SharpBoundaryTurn { deviation_deg: f64 },
 }
 
 // ── Event enum ────────────────────────────────────────────────────────────────

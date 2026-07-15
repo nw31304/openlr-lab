@@ -2,9 +2,10 @@ import React, { useEffect } from 'react';
 import { useStore } from '../store.js';
 
 export default function ReplayPanel() {
-  const replaySteps   = useStore(s => s.replaySteps);
-  const replayStats   = useStore(s => s.replayStats);
-  const replayStep    = useStore(s => s.replayStep);
+  // In encode mode these read the round-trip verify-decode's replay data.
+  const replaySteps   = useStore(s => s.mode === 'encode' ? s.verifyReplaySteps : s.replaySteps);
+  const replayStats   = useStore(s => s.mode === 'encode' ? s.verifyReplayStats : s.replayStats);
+  const replayStep    = useStore(s => s.mode === 'encode' ? s.verifyReplayStep  : s.replayStep);
   const stepReplay    = useStore(s => s.stepReplay);
   const setReplayStep = useStore(s => s.setReplayStep);
   const traceLevel    = useStore(s => s.params?.trace_level ?? 'Summary');

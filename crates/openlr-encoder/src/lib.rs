@@ -23,6 +23,8 @@ pub enum EncodeError {
     Disconnected { index: usize },
     #[error("no route exists between the requested points on this graph")]
     NoRoute,
+    #[error("tile {0:?} required by the route search is not loaded")]
+    NeedsTile(openlr_graph::TileKey),
     #[error("segment {0:?} referenced by the input path is not loaded in this graph")]
     UnknownSegment(openlr_graph::SegmentId),
     #[error("node {0:?} referenced by the input path is not loaded in this graph")]

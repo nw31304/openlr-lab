@@ -3,6 +3,20 @@ import { useStore, PRESETS } from '../store.js';
 
 const TRACE_LEVELS = ['Off', 'Summary', 'Full'];
 
+// The 9 OpenLR location types. Only Line and PointAlongLine have an encoder
+// implemented so far; the rest are listed for discoverability.
+const LOCATION_TYPES = [
+  { id: 'Line',               label: 'Line',                    enabled: true },
+  { id: 'PointAlongLine',     label: 'Point Along Line',        enabled: true },
+  { id: 'ClosedLine',         label: 'Closed Line',             enabled: false },
+  { id: 'PoiWithAccessPoint', label: 'POI with Access Point',   enabled: false },
+  { id: 'GeoCoordinate',      label: 'Geo Coordinate',          enabled: false },
+  { id: 'Circle',             label: 'Circle',                  enabled: false },
+  { id: 'Rectangle',          label: 'Rectangle',               enabled: false },
+  { id: 'Grid',               label: 'Grid',                    enabled: false },
+  { id: 'Polygon',            label: 'Polygon',                 enabled: false },
+];
+
 export default function MenuBar() {
   const {
     showSegmentLayer, toggleSegmentLayer,
@@ -11,16 +25,19 @@ export default function MenuBar() {
     showResult, toggleResult, decodeResult,
     toggleParams, toggleLlmSettings,
     llmConfig, llmChatOpen, toggleLlmChat,
-    params, setTraceLevel, resetToDefaults,
+    params, setTraceLevel,
     tileUrl, setTileUrl,
     decoding,
+    mode, setMode, locationType, setLocationType,
   } = useStore();
 
   const [showTileMenu,  setShowTileMenu]  = useState(false);
   const [showTraceMenu, setShowTraceMenu] = useState(false);
+  const [showLocTypeMenu, setShowLocTypeMenu] = useState(false);
   const [urlDraft, setUrlDraft]           = useState('');
-  const tileMenuRef  = useRef(null);
-  const traceMenuRef = useRef(null);
+  const tileMenuRef   = useRef(null);
+  const traceMenuRef  = useRef(null);
+  const locTypeMenuRef = useRef(null);
   const traceLevel   = params?.trace_level ?? 'Summary';
 
   // Sync urlDraft with the active tile URL whenever the menu opens.
@@ -50,6 +67,17 @@ export default function MenuBar() {
     return () => document.removeEventListener('mousedown', handler);
   }, [showTraceMenu]);
 
+  // Close location-type menu on outside click.
+  useEffect(() => {
+    if (!showLocTypeMenu) return;
+    const handler = (e) => {
+      if (locTypeMenuRef.current && !locTypeMenuRef.current.contains(e.target))
+        setShowLocTypeMenu(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showLocTypeMenu]);
+
   function applyTileUrl() {
     const trimmed = urlDraft.trim();
     if (!trimmed) return;
@@ -61,6 +89,19 @@ export default function MenuBar() {
     <div className="menu-bar">
       <span className="menu-title">OpenLRLens</span>
 
+      <div className="mode-toggle">
+        <button
+          className={`mode-toggle-btn${mode !== 'encode' ? ' active' : ''}`}
+          onClick={() => setMode('decode')}
+          title="Decode mode"
+        >Decode</button>
+        <button
+          className={`mode-toggle-btn${mode === 'encode' ? ' active' : ''}`}
+          onClick={() => setMode('encode')}
+          title="Encode mode"
+        >Encode</button>
+      </div>
+
       <div className="menu-divider" />
 
       <button
@@ -69,29 +110,56 @@ export default function MenuBar() {
         title="Toggle road segment layer"
       >Segments</button>
 
-      <button
-        className={`menu-btn${showTrace ? ' active' : ''}`}
-        onClick={toggleTrace}
-        title="Toggle decode trace panel"
-      >Trace</button>
+      {mode !== 'encode' ? (
+        <>
+          <button
+            className={`menu-btn${showTrace ? ' active' : ''}`}
+            onClick={toggleTrace}
+            title="Toggle decode trace panel"
+          >Trace</button>
 
-      <button
-        className={`menu-btn${showReplay ? ' active' : ''}`}
-        onClick={toggleReplay}
-        title="Toggle step replay bar"
-      >Replay</button>
+          <button
+            className={`menu-btn${showReplay ? ' active' : ''}`}
+            onClick={toggleReplay}
+            title="Toggle step replay bar"
+          >Replay</button>
 
-      {decodeResult && (
-        <button
-          className={`menu-btn${showResult ? ' active' : ''}`}
-          onClick={toggleResult}
-          title="Toggle results panel"
-        >
-          Results
-          {decodeResult.ok
-            ? <span className="menu-result-badge menu-result-ok">{decodeResult.segments?.length ?? '✓'}</span>
-            : <span className="menu-result-badge menu-result-fail">✗</span>}
-        </button>
+          {decodeResult && (
+            <button
+              className={`menu-btn${showResult ? ' active' : ''}`}
+              onClick={toggleResult}
+              title="Toggle results panel"
+            >
+              Results
+              {decodeResult.ok
+                ? <span className="menu-result-badge menu-result-ok">{decodeResult.segments?.length ?? '✓'}</span>
+                : <span className="menu-result-badge menu-result-fail">✗</span>}
+            </button>
+          )}
+        </>
+      ) : (
+        <div className="menu-tile-wrap" ref={locTypeMenuRef}>
+          <button
+            className={`menu-btn${showLocTypeMenu ? ' active' : ''}`}
+            onClick={() => setShowLocTypeMenu(v => !v)}
+            title="Location type to encode"
+          >Location: {LOCATION_TYPES.find(t => t.id === locationType)?.label ?? locationType}</button>
+
+          {showLocTypeMenu && (
+            <div className="menu-tile-dropdown">
+              <div className="menu-tile-label">Location type</div>
+              {LOCATION_TYPES.map(t => (
+                <button
+                  key={t.id}
+                  className={`menu-trace-opt${locationType === t.id ? ' active' : ''}${!t.enabled ? ' disabled' : ''}`}
+                  disabled={!t.enabled}
+                  title={t.enabled ? '' : 'Not implemented yet'}
+                  onClick={() => { setLocationType(t.id); setShowLocTypeMenu(false); }}
+                >{t.label}</button>
+              ))}
+            </div>
+          )}
+        </div>
       )}
 
       <div className="menu-spacer" />
@@ -163,10 +231,6 @@ export default function MenuBar() {
               onClick={applyTileUrl}
               disabled={!urlDraft.trim()}
             >Apply &amp; reload</button>
-            <div className="menu-tile-divider" />
-            <button className="menu-tile-action" onClick={() => { resetToDefaults(); setShowTileMenu(false); }}>
-              Reset decode params to defaults
-            </button>
           </div>
         )}
       </div>

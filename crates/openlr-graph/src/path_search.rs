@@ -1,7 +1,7 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Reverse;
 
-use crate::{Graph, NodeId, SegmentId};
+use crate::{Graph, NodeId, SegmentId, TileKey};
 
 /// Sentinel `start_seg` for a search with no real incoming edge to bias against
 /// (e.g. routing from a bare waypoint that isn't the exit of some prior LRP
@@ -16,6 +16,17 @@ pub const NO_PRIOR_SEG: SegmentId = SegmentId(u32::MAX);
 pub struct PathResult {
     pub segments: Vec<SegmentId>,
     pub length_m: f64,
+}
+
+/// Outcome of `shortest_path`, distinguishing "genuinely no path" from "the
+/// search reached a graph boundary whose home tile isn't loaded yet" — the
+/// caller must load that tile and retry, exactly like decode-side A*
+/// (`astar.rs`) already does via `RoutingFailure::NeedsTile`.
+#[derive(Debug, Clone)]
+pub enum PathOutcome {
+    Found(PathResult),
+    NoPath,
+    NeedsTile(TileKey),
 }
 
 #[derive(Clone, PartialEq)]
@@ -56,8 +67,8 @@ type OpenElem = (Reverse<F64Key>, F64Key, NodeId, SegmentId, Option<usize>);
 /// as it would be mid-route. Pass `lfrcnp = 7` for an unrestricted search and
 /// `max_turn_deviation_deg = 180.0` to disable the turn-angle gate.
 ///
-/// Does not handle multi-tile boundary loading — the caller must ensure `graph`
-/// already has every tile the search might need.
+/// `zoom` is used only for the tile-boundary check (see `PathOutcome`) — it
+/// must match the zoom level `graph`'s tiles were loaded at.
 pub fn shortest_path(
     graph: &Graph,
     start_node: NodeId,
@@ -66,12 +77,15 @@ pub fn shortest_path(
     lfrcnp: u8,
     max_turn_deviation_deg: f64,
     max_expansions: usize,
-) -> Option<PathResult> {
+    zoom: u8,
+) -> PathOutcome {
     if start_node == goal_node {
-        return Some(PathResult { segments: vec![], length_m: 0.0 });
+        return PathOutcome::Found(PathResult { segments: vec![], length_m: 0.0 });
     }
 
-    let (goal_lon, goal_lat) = graph.nodes.get(&goal_node).map(|n| (n.lon, n.lat))?;
+    let Some((goal_lon, goal_lat)) = graph.nodes.get(&goal_node).map(|n| (n.lon, n.lat)) else {
+        return PathOutcome::NoPath;
+    };
 
     let mut closed: HashMap<(NodeId, SegmentId), usize> = HashMap::new();
     let mut closed_list: Vec<ClosedEntry> = Vec::new();
@@ -88,7 +102,7 @@ pub fn shortest_path(
 
         expansions += 1;
         if max_expansions > 0 && expansions > max_expansions {
-            return None;
+            return PathOutcome::NoPath;
         }
 
         if let Some(&prev_idx) = closed.get(&state) {
@@ -102,7 +116,19 @@ pub fn shortest_path(
         closed.insert(state, entry_idx);
 
         if node == goal_node && via_seg != start_seg {
-            return Some(reconstruct(entry_idx, &closed_list, start_seg));
+            return PathOutcome::Found(reconstruct(entry_idx, &closed_list, start_seg));
+        }
+
+        // Mirrors astar.rs's boundary check: a segment (B->C) is stored in both
+        // tile_of(B) and tile_of(C), so outgoing[B] may look complete even when
+        // B's home tile isn't loaded — its true successors could be invisible.
+        if let Some(n) = graph.nodes.get(&node) {
+            if n.is_boundary {
+                let tk = TileKey::from_lonlat(n.lon, n.lat, zoom);
+                if !graph.is_tile_loaded(tk) {
+                    return PathOutcome::NeedsTile(tk);
+                }
+            }
         }
 
         for (next_node, next_seg, seg_len) in graph.successors(node, via_seg, lfrcnp, max_turn_deviation_deg) {
@@ -118,7 +144,7 @@ pub fn shortest_path(
         }
     }
 
-    None
+    PathOutcome::NoPath
 }
 
 /// Reconstruct the ordered segment list from the closed list. `start_seg` is
@@ -162,6 +188,13 @@ mod tests {
         }
     }
 
+    fn unwrap_found(outcome: PathOutcome) -> PathResult {
+        match outcome {
+            PathOutcome::Found(r) => r,
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
     #[test]
     fn finds_direct_path() {
         let mut g = Graph::new();
@@ -171,27 +204,30 @@ mod tests {
         g.add_segment(seg(1, 0, 1, 100.0));
         g.add_segment(seg(2, 1, 2, 100.0));
 
-        let result = shortest_path(&g, NodeId(0), NO_PRIOR_SEG, NodeId(2), 7, 180.0, 0).unwrap();
+        let result = unwrap_found(shortest_path(&g, NodeId(0), NO_PRIOR_SEG, NodeId(2), 7, 180.0, 0, 12));
         assert_eq!(result.segments, vec![SegmentId(1), SegmentId(2)]);
         assert!((result.length_m - 200.0).abs() < 1e-6);
     }
 
     #[test]
-    fn no_path_returns_none() {
+    fn no_path_returns_no_path() {
         let mut g = Graph::new();
         g.add_node(node(0, 0.0, 0.0));
         g.add_node(node(1, 0.001, 0.0));
         g.add_node(node(2, 0.1, 0.1));
         g.add_segment(seg(1, 0, 1, 100.0));
         // node 2 is disconnected
-        assert!(shortest_path(&g, NodeId(0), NO_PRIOR_SEG, NodeId(2), 7, 180.0, 0).is_none());
+        assert!(matches!(
+            shortest_path(&g, NodeId(0), NO_PRIOR_SEG, NodeId(2), 7, 180.0, 0, 12),
+            PathOutcome::NoPath
+        ));
     }
 
     #[test]
     fn trivial_same_node() {
         let mut g = Graph::new();
         g.add_node(node(0, 0.0, 0.0));
-        let result = shortest_path(&g, NodeId(0), NO_PRIOR_SEG, NodeId(0), 7, 180.0, 0).unwrap();
+        let result = unwrap_found(shortest_path(&g, NodeId(0), NO_PRIOR_SEG, NodeId(0), 7, 180.0, 0, 12));
         assert!(result.segments.is_empty());
         assert_eq!(result.length_m, 0.0);
     }
@@ -206,7 +242,24 @@ mod tests {
         g.add_node(node(2, 0.002, 0.0));
         g.add_segment(seg(1, 0, 1, 100.0));
         g.add_segment(seg(2, 1, 2, 100.0));
-        let result = shortest_path(&g, NodeId(1), SegmentId(1), NodeId(2), 7, 180.0, 0).unwrap();
+        let result = unwrap_found(shortest_path(&g, NodeId(1), SegmentId(1), NodeId(2), 7, 180.0, 0, 12));
         assert_eq!(result.segments, vec![SegmentId(2)]);
+    }
+
+    #[test]
+    fn stops_at_unloaded_boundary_tile() {
+        let mut g = Graph::new();
+        g.add_node(node(0, 0.0, 0.0));
+        let mut boundary = node(1, 0.001, 0.0);
+        boundary.is_boundary = true;
+        g.add_node(boundary);
+        g.add_node(node(2, 0.002, 0.0));
+        g.add_segment(seg(1, 0, 1, 100.0));
+        g.add_segment(seg(2, 1, 2, 100.0));
+        // Note: the boundary node's home tile is never marked loaded here.
+        match shortest_path(&g, NodeId(0), NO_PRIOR_SEG, NodeId(2), 7, 180.0, 0, 12) {
+            PathOutcome::NeedsTile(_) => {}
+            other => panic!("expected NeedsTile, got {other:?}"),
+        }
     }
 }
