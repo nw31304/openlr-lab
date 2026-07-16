@@ -462,13 +462,22 @@ function addMapImages(map) {
 
 // ── Map Component ──────────────────────────────────────────────────────────────
 
-export default function MapView({ tilesBase, ready }) {
+export default function MapView({ tilesBase, ready, initialBounds }) {
   const mapContainer    = useRef(null);
   const mapRef          = useRef(null);
   const tileCacheRef    = useRef(new Map());
   const nodesCacheRef   = useRef(new Map());
   const pendingCountRef = useRef(0);
   const pmtilesRef      = useRef(null);
+  // Captured once, before the map is constructed, so a later effect can tell
+  // whether the page loaded with an explicit #hash (bookmark/share link) —
+  // if so, the auto-fit-to-dataset-bounds effect below must not override it.
+  const initialHashRef  = useRef(null);
+  // Set on the first user-originated pan/zoom (`e.originalEvent` is only
+  // present for real input, not for our own `fitBounds`/`jumpTo` calls) —
+  // guards against yanking the view out from under someone who started
+  // exploring before the dataset bounds fetch resolved.
+  const userInteractedRef = useRef(false);
   const pulseRef        = useRef(null);
   const frontierPulseRef = useRef(null);
   const lrpPanelRef     = useRef(null);
@@ -779,11 +788,21 @@ export default function MapView({ tilesBase, ready }) {
   useEffect(() => {
     if (mapRef.current) return; // already initialized
 
+    // Captured before construction — the map's own `hash: true` option starts
+    // rewriting the URL on the very first `moveend` (including our synthetic
+    // initial view), so reading `window.location.hash` any later would no
+    // longer reflect what the page actually loaded with.
+    initialHashRef.current = window.location.hash;
+
     const map = new maplibregl.Map({
       container: mapContainer.current,
       style:     'https://tiles.openfreemap.org/styles/liberty',
-      center:    [10, 48],
-      zoom:      4,
+      // Conservative default: the whole world. Overridden by the effect below
+      // once the configured PMTiles archive's own bounds are known (or left
+      // as-is if that lookup fails or the page loaded with an explicit
+      // #hash — see the effect's comment).
+      center:    [0, 0],
+      zoom:      1,
       hash:      true,
       // This is a flat, north-up routing tool — rotate/pitch is never used
       // anywhere in the app. Disabled outright so the right mouse button
@@ -794,6 +813,10 @@ export default function MapView({ tilesBase, ready }) {
       touchPitch: false,
     });
     mapRef.current = map;
+
+    const markInteracted = e => { if (e.originalEvent) userInteractedRef.current = true; };
+    map.on('dragstart', markInteracted);
+    map.on('zoomstart', markInteracted);
 
     // The right mouse button is repurposed for encode-mode waypoint editing
     // (see the mousedown handlers below) — suppress the native browser
@@ -1495,6 +1518,20 @@ export default function MapView({ tilesBase, ready }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── Fly to the configured PMTiles archive's bounds ───────────────────────────
+  // `initialBounds` starts `null` and is set at most once, after App.jsx's
+  // startup effect resolves `pmtiles.getHeader()` (or stays `null` forever if
+  // that lookup fails or returns a degenerate box — the map just keeps its
+  // world-view default from the constructor above). Skipped if the page
+  // loaded with an explicit #hash (a bookmark/share link naming a specific
+  // view) or if the user already started panning/zooming before this fired.
+  useEffect(() => {
+    if (!initialBounds) return;
+    if (initialHashRef.current) return;
+    if (userInteractedRef.current) return;
+    mapRef.current?.fitBounds(initialBounds, { padding: 40, duration: 0 });
+  }, [initialBounds]);
 
   // ── Basemap switch ───────────────────────────────────────────────────────────
 

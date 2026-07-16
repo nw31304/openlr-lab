@@ -18,6 +18,7 @@ export default function App() {
   const [error, setError]   = useState(null);
   const [tilesBase, setTilesBase] = useState('/tiles');
   const [urlDraft, setUrlDraft]   = useState('');
+  const [initialBounds, setInitialBounds] = useState(null); // [[minLon,minLat],[maxLon,maxLat]] | null
 
   const { showResult, toggleResult, showTrace, toggleTrace, showReplay, mode, replaySteps: decodeReplaySteps, verifyReplaySteps } = useStore();
   const replaySteps = mode === 'encode' ? verifyReplaySteps : decodeReplaySteps;
@@ -40,11 +41,18 @@ export default function App() {
         setUrlDraft(base);
         const manifest = await fetch(`${base}/manifest.json`).then(r => r.json());
         const pmtiles  = new PMTiles(`${base}/${manifest.archive}`);
-        const { decoder, encoder } = await initWasm();
+        const [{ decoder, encoder }, header] = await Promise.all([
+          initWasm(),
+          pmtiles.getHeader().catch(() => null),
+        ]);
         setPmtiles(pmtiles);
         setDecoder(decoder);
         setEncoder(encoder);
         setZoom(manifest.tile_zoom ?? manifest.zoom ?? 12);
+        const { minLon, minLat, maxLon, maxLat } = header ?? {};
+        const boundsValid = [minLon, minLat, maxLon, maxLat].every(Number.isFinite)
+          && maxLon > minLon && maxLat > minLat;
+        setInitialBounds(boundsValid ? [[minLon, minLat], [maxLon, maxLat]] : null);
         setReady(true);
       } catch (e) {
         setError(e.message);
@@ -97,7 +105,7 @@ export default function App() {
 
         {/* ── Map area ─────────────────────────────────────── */}
         <div className="map-area">
-          <MapView tilesBase={tilesBase} ready={ready} />
+          <MapView tilesBase={tilesBase} ready={ready} initialBounds={initialBounds} />
 
           {/* Panel edge tabs — always visible; arrow direction shows open/closed state */}
           <button
