@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { PMTiles } from 'pmtiles';
-import { useStore, getSegmentId, getNodeId, getSegGeomCache, getSegIdToTile, getTileGeomCache, getSnapCandidates } from '../store.js';
+import { useStore, getSegmentId, getNodeId, getSegGeomCache, getSegIdToTile, getTileGeomCache, getSnapCandidates, loadEncoderTilesNear, previewRouteBetween } from '../store.js';
 import { useDraggable } from '../hooks.js';
 import { emptyState, applyStep, computeVisualState, stateToGeoJSON } from '../replayEngine.js';
 import { haversineM } from '../utils.js';
@@ -119,7 +119,7 @@ const CUSTOM_SOURCES = new Set([
   'offset-uncertainty', 'lrp-bearing', 'highlighted-segment', 'trace-segment',
   'replay-radius', 'replay-route', 'replay-traversed', 'replay-candidates', 'replay-cloud', 'replay-frontier', 'replay-leg', 'replay-flash',
   'measure-line', 'measure-points', 'pal-point', 'pal-pulse', 'pal-uncertainty', 'encode-route', 'encode-ghost', 'encode-offset-stubs',
-  'encode-snap-candidates', 'encode-snap-candidate-active',
+  'encode-snap-candidates', 'encode-snap-candidate-active', 'encode-preview-route', 'encode-click-point',
 ]);
 const CUSTOM_LAYER_IDS = new Set([
   'olr-frc0','olr-frc1','olr-frc2','olr-frc3','olr-frc4','olr-frc5','olr-frc6','olr-frc7',
@@ -141,6 +141,8 @@ const CUSTOM_LAYER_IDS = new Set([
   'pal-point-layer', 'pal-pulse-ring', 'pal-uncertainty-line',
   'encode-route-casing', 'encode-route-line', 'encode-ghost-line', 'encode-offset-stubs-line',
   'encode-snap-candidates-circle', 'encode-snap-candidate-active-ring',
+  'encode-preview-route-casing', 'encode-preview-route-line',
+  'encode-click-point-circle',
 ]);
 
 const FRC_COLOR = ['#e8002d', '#ff7700', '#e8c800', '#00aa44',
@@ -548,6 +550,7 @@ export default function MapView({ tilesBase, ready }) {
 
   // ── Encode mode ───────────────────────────────────────────────────────────
   const mode          = useStore(s => s.mode);
+  const locationType  = useStore(s => s.locationType);
   const waypoints     = useStore(s => s.waypoints);
   const liveRoute      = useStore(s => s.liveRoute);
   const addWaypoint    = useStore(s => s.addWaypoint);
@@ -556,11 +559,19 @@ export default function MapView({ tilesBase, ready }) {
   const waypointMarkersRef = useRef([]);
   const snapPickerPopupRef = useRef(null);
   const suppressNextClickRef = useRef(false);
+  // Assigned once, inside the map-load effect, to the (kind, index, e) => void
+  // drag-starter — called from the separate waypoint-marker effect's own
+  // per-marker mousedown listener (marker "move" drags start on the marker's
+  // own DOM element, not the map canvas, so they can't share a mousedown
+  // handler directly; this ref is how the two effects meet in the middle).
+  const startEncodeDragRef = useRef(null);
   const insertWaypoint = useStore(s => s.insertWaypoint);
   const removeWaypoint = useStore(s => s.removeWaypoint);
   const waypointHistory = useStore(s => s.waypointHistory);
   const clearWaypoints  = useStore(s => s.clearWaypoints);
   const undoWaypoint     = useStore(s => s.undo);
+  const openResult        = useStore(s => s.openResult);
+  const showResult        = useStore(s => s.showResult);
 
   // Only one map popup (segment / LRP / node / candidate) may be visible at a time —
   // call this before opening any of them so the others don't linger on screen.
@@ -774,8 +785,20 @@ export default function MapView({ tilesBase, ready }) {
       center:    [10, 48],
       zoom:      4,
       hash:      true,
+      // This is a flat, north-up routing tool — rotate/pitch is never used
+      // anywhere in the app. Disabled outright so the right mouse button
+      // (which MapLibre's default drag-rotate handler otherwise claims) is
+      // free for encode mode's right-click waypoint editing.
+      dragRotate: false,
+      pitchWithRotate: false,
+      touchPitch: false,
     });
     mapRef.current = map;
+
+    // The right mouse button is repurposed for encode-mode waypoint editing
+    // (see the mousedown handlers below) — suppress the native browser
+    // context menu everywhere on the map so it doesn't appear alongside.
+    map.getCanvasContainer().addEventListener('contextmenu', e => e.preventDefault());
 
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
 
@@ -1232,6 +1255,24 @@ export default function MapView({ tilesBase, ready }) {
         paint: { 'line-color': '#33ddaa', 'line-width': 4, 'line-opacity': 0.9 },
       });
 
+      // Candidate-choice route preview: while the snap-candidate popup is
+      // open, redrawn (a real routed polyline, not a straight ghost line)
+      // every time a different candidate is selected, so you can compare
+      // how the route actually changes before committing to one with
+      // Enter. Dashed + amber to read as "not yet committed", distinct from
+      // the solid teal committed route underneath.
+      map.addSource('encode-preview-route', { type: 'geojson', data: emptyFC2 });
+      map.addLayer({
+        id: 'encode-preview-route-casing', type: 'line', source: 'encode-preview-route',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': '#0a0a14', 'line-width': 6, 'line-opacity': 0.7 },
+      });
+      map.addLayer({
+        id: 'encode-preview-route-line', type: 'line', source: 'encode-preview-route',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': '#ffaa33', 'line-width': 3.5, 'line-opacity': 0.95, 'line-dasharray': [2, 1.5] },
+      });
+
       // Live-stretch preview during a waypoint drag or a drag-to-insert
       // gesture — straight dashed line, real routing recomputes on release.
       map.addSource('encode-ghost', { type: 'geojson', data: emptyFC2 });
@@ -1264,7 +1305,7 @@ export default function MapView({ tilesBase, ready }) {
       // Snap-candidate markers, shown while the disambiguation picker is
       // open: every nearby option as a small dot (blue = intersection, grey
       // = point along a road), plus a larger ring around whichever option
-      // the user is currently hovering in the picker list.
+      // is currently *selected* (click only — see selectCandidate below).
       map.addSource('encode-snap-candidates', { type: 'geojson', data: emptyFC2 });
       map.addLayer({
         id: 'encode-snap-candidates-circle', type: 'circle', source: 'encode-snap-candidates',
@@ -1285,29 +1326,52 @@ export default function MapView({ tilesBase, ready }) {
           'circle-stroke-width': 3,
         },
       });
+      // The raw point the user actually right-clicked/released at — distinct
+      // from every snap candidate (which are all *options for where it might
+      // anchor instead*), so it's never ambiguous which dot is your actual
+      // click versus a suggested snap target.
+      map.addSource('encode-click-point', { type: 'geojson', data: emptyFC2 });
+      map.addLayer({
+        id: 'encode-click-point-circle', type: 'circle', source: 'encode-click-point',
+        paint: {
+          'circle-radius': 6,
+          'circle-color': '#ff3366',
+          'circle-stroke-color': '#ffffff',
+          'circle-stroke-width': 2,
+        },
+      });
 
-      // ── Encode mode: drag-to-insert a via-point on the route line ────────
-      // mousedown near the route (a forgiving pixel buffer, not the exact
-      // rendered pixel) starts a manual drag: map panning is suspended, a
-      // ghost line stretches from the two bracketing waypoints to the
-      // cursor, and mouseup commits a new waypoint at that position.
-      let dragInsert = null;
-      function updateEncodeGhost(idx, cursor) {
-        const wps = useStore.getState().waypoints;
-        const prev = wps[idx - 1];
-        const next = wps[idx];
+      // ── Encode mode: right-click(-drag) waypoint editing ─────────────────
+      // The right mouse button is dedicated entirely to placing/moving/
+      // inserting waypoints — left click/drag stays plain map panning
+      // (dragRotate is disabled and the native context menu suppressed
+      // above specifically to free this button up). mousedown hit-tests, in
+      // priority order, an existing marker (handled by the marker's own
+      // listener below, which calls startEncodeDragRef), the route line
+      // (insert a via-point), or else empty map (append — or for
+      // PointAlongLine, replace the one point). Dragging is optional: a
+      // right-click with zero movement and a right-click-drag both end the
+      // same way — mouseup always opens the snap-candidate popup at the
+      // release point, so this is a deliberate, precise action rather than
+      // a low-friction default.
+      function updateEncodeGhost(prevWp, nextWp, cursor) {
         const coords = [];
-        if (prev) coords.push([prev.lon, prev.lat]);
+        if (prevWp) coords.push([prevWp.lon, prevWp.lat]);
         coords.push(cursor);
-        if (next) coords.push([next.lon, next.lat]);
+        if (nextWp) coords.push([nextWp.lon, nextWp.lat]);
         map.getSource('encode-ghost')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: coords }, properties: {} });
       }
       function clearEncodeGhost() {
         map.getSource('encode-ghost')?.setData({ type: 'FeatureCollection', features: [] });
       }
+      let dragState = null; // { kind: 'move'|'insert'|'add', index }
       function onEncodeDragMove(e) {
-        if (!dragInsert) return;
-        updateEncodeGhost(dragInsert.index, [e.lngLat.lng, e.lngLat.lat]);
+        if (!dragState) return;
+        const wps = useStore.getState().waypoints;
+        const cursor = [e.lngLat.lng, e.lngLat.lat];
+        if (dragState.kind === 'move') updateEncodeGhost(wps[dragState.index - 1], wps[dragState.index + 1], cursor);
+        else if (dragState.kind === 'insert') updateEncodeGhost(wps[dragState.index - 1], wps[dragState.index], cursor);
+        else if (dragState.kind === 'add' && wps.length > 0) updateEncodeGhost(wps[wps.length - 1], null, cursor);
       }
       function endEncodeDrag() {
         map.dragPan.enable();
@@ -1316,39 +1380,56 @@ export default function MapView({ tilesBase, ready }) {
         map.off('mouseup', onEncodeDragUp);
         document.removeEventListener('keydown', onEncodeDragKeyDown);
         clearEncodeGhost();
-        dragInsert = null;
+        dragState = null;
       }
       function onEncodeDragUp(e) {
-        if (!dragInsert) return;
-        const { index } = dragInsert;
+        if (!dragState) return;
+        const { kind, index } = dragState;
         const lonLat = { lon: e.lngLat.lng, lat: e.lngLat.lat };
         endEncodeDrag();
-        insertWaypoint(index, lonLat);
+        showWaypointPopup(lonLat.lon, lonLat.lat, kind, index);
       }
       function onEncodeDragKeyDown(e) {
-        if (e.key === 'Escape' && dragInsert) endEncodeDrag();
+        if (e.key === 'Escape' && dragState) endEncodeDrag();
       }
-      function onEncodeMouseDown(e) {
-        if (!encodeModeRef.current) return;
+      // Shared by the map-level mousedown handler below (insert/add) and the
+      // waypoint marker effect's own per-marker mousedown listener (move).
+      function startEncodeDrag(kind, index, e) {
         const waypoints = useStore.getState().waypoints;
-        if (waypoints.length < 2) return;
-        const buf = 6;
-        const hits = map.queryRenderedFeatures(
-          [[e.point.x - buf, e.point.y - buf], [e.point.x + buf, e.point.y + buf]],
-          { layers: ['encode-route-line', 'encode-route-casing'] }
-        );
-        if (!hits.length) return;
-        e.preventDefault();
-        const routeGeometry = useStore.getState().liveRoute?.geometry;
-        const index = nearestWaypointPairIndex(waypoints, e.lngLat.lng, e.lngLat.lat, routeGeometry);
-        dragInsert = { index };
+        dragState = { kind, index };
         suppressNextClickRef.current = true;
         map.dragPan.disable();
         map.getCanvas().style.cursor = 'grabbing';
-        updateEncodeGhost(index, [e.lngLat.lng, e.lngLat.lat]);
+        const cursor = [e.lngLat.lng, e.lngLat.lat];
+        if (kind === 'move') updateEncodeGhost(waypoints[index - 1], waypoints[index + 1], cursor);
+        else if (kind === 'insert') updateEncodeGhost(waypoints[index - 1], waypoints[index], cursor);
+        else if (waypoints.length > 0) updateEncodeGhost(waypoints[waypoints.length - 1], null, cursor);
         map.on('mousemove', onEncodeDragMove);
         map.on('mouseup', onEncodeDragUp);
         document.addEventListener('keydown', onEncodeDragKeyDown);
+      }
+      startEncodeDragRef.current = startEncodeDrag;
+
+      function onEncodeMouseDown(e) {
+        if (!encodeModeRef.current) return;
+        if (e.originalEvent.button !== 2) return; // right button only
+        e.preventDefault();
+        const waypoints = useStore.getState().waypoints;
+        const locType = useStore.getState().locationType;
+        if (locType !== 'PointAlongLine' && waypoints.length >= 2) {
+          const buf = 6;
+          const hits = map.queryRenderedFeatures(
+            [[e.point.x - buf, e.point.y - buf], [e.point.x + buf, e.point.y + buf]],
+            { layers: ['encode-route-line', 'encode-route-casing'] }
+          );
+          if (hits.length) {
+            const routeGeometry = useStore.getState().liveRoute?.geometry;
+            const index = nearestWaypointPairIndex(waypoints, e.lngLat.lng, e.lngLat.lat, routeGeometry);
+            startEncodeDrag('insert', index, e);
+            return;
+          }
+        }
+        startEncodeDrag('add', undefined, e);
       }
       map.on('mousedown', onEncodeMouseDown);
 
@@ -1708,24 +1789,45 @@ export default function MapView({ tilesBase, ready }) {
     e.originalEvent.stopPropagation();
   }
 
-  // A click landed near 2+ distinct roads — let the user pick which one this
-  // waypoint should snap onto, instead of silently choosing the nearest.
-  function showSnapPicker(lon, lat, candidates) {
+  // The one popup shown after every right-click(-drag) waypoint edit —
+  // lets the user pick precisely which nearby road/intersection to snap
+  // onto (rather than silently choosing the nearest), see the exact
+  // coordinate, and — for Line — optionally mark this as the last waypoint
+  // to jump straight to the Results panel, or — for PointAlongLine — set
+  // orientation/side-of-road right here since there's only ever one click.
+  //
+  // `kind` is 'add' | 'insert' | 'move'; `index` is the via-point/waypoint
+  // index for 'insert'/'move' (unused for 'add').
+  async function showWaypointPopup(lon, lat, kind, index) {
     const map = mapRef.current;
     if (!map) return;
     if (snapPickerPopupRef.current) { snapPickerPopupRef.current.remove(); snapPickerPopupRef.current = null; }
 
+    // Candidates come from the *encoder's* own loaded graph, which (unlike
+    // the always-on decode tile set) only has tiles fetched for areas
+    // already touched by a committed waypoint — a fresh area right-clicked
+    // for the first time would otherwise show a false "no roads found"
+    // just because nothing has loaded there yet, not because there's
+    // nothing there. Load first, then check.
+    await loadEncoderTilesNear(lon, lat);
+    if (mapRef.current !== map) return; // map was torn down while awaiting
+
+    const isPal = useStore.getState().locationType === 'PointAlongLine';
+    const candidates = getSnapCandidates(lon, lat);
+
     const clearSnapHighlights = () => {
       map.getSource('encode-snap-candidates')?.setData({ type: 'FeatureCollection', features: [] });
       map.getSource('encode-snap-candidate-active')?.setData({ type: 'FeatureCollection', features: [] });
+      map.getSource('encode-click-point')?.setData({ type: 'FeatureCollection', features: [] });
     };
     const setActiveHighlight = (c) => {
+      if (!c) { map.getSource('encode-snap-candidate-active')?.setData({ type: 'FeatureCollection', features: [] }); return; }
       map.getSource('encode-snap-candidate-active')?.setData({
         type: 'Feature', geometry: { type: 'Point', coordinates: [c.snapped_lon, c.snapped_lat] }, properties: {},
       });
     };
     // Show every candidate as a small dot immediately, so it's clear at a
-    // glance where each option actually is before hovering any of them.
+    // glance where each option actually is before selecting any of them.
     map.getSource('encode-snap-candidates')?.setData({
       type: 'FeatureCollection',
       features: candidates.map(c => ({
@@ -1734,51 +1836,313 @@ export default function MapView({ tilesBase, ready }) {
         properties: { kind: c.kind },
       })),
     });
-    setActiveHighlight(candidates[0]);
+    // The raw click point itself, visually distinct from every candidate —
+    // see the layer's own comment above for why.
+    map.getSource('encode-click-point')?.setData({
+      type: 'Feature', geometry: { type: 'Point', coordinates: [lon, lat] }, properties: {},
+    });
+
+    let activeCandidate = candidates[0] ?? null;
+    setActiveHighlight(activeCandidate);
+    // Assigned below when building the actions row (Line only) — declared
+    // here so `commit()`'s closure can read whatever it ends up being.
+    let lastWaypointCheckbox = null;
+
+    const pointFromCandidate = (c) => c?.kind === 'node'
+      ? { lon, lat, node_id: c.node_id }
+      : c?.kind === 'segment'
+        ? { lon, lat, segment_id: c.segment_id }
+        : { lon, lat };
+
+    // The waypoint list this popup would produce for a given point choice,
+    // without touching real store state — same splice logic addWaypoint/
+    // insertWaypoint/moveWaypoint apply, computed here purely to drive the
+    // route preview below.
+    const currentWaypoints = useStore.getState().waypoints;
+    const hypotheticalWaypoints = (point) => {
+      if (kind === 'insert') return [...currentWaypoints.slice(0, index), point, ...currentWaypoints.slice(index)];
+      if (kind === 'move')   return currentWaypoints.map((w, i) => (i === index ? point : w));
+      return [...currentWaypoints, point];
+    };
+    // A single point (PAL, or the very first waypoint of a fresh Line) has
+    // no route to draw at all — Rule-1's "at least 2 waypoints" floor.
+    const hypotheticalCount = kind === 'insert' || kind === 'move' ? currentWaypoints.length : currentWaypoints.length + 1;
+
+    const clearPreviewRoute = () => map.getSource('encode-preview-route')?.setData({ type: 'FeatureCollection', features: [] });
+
+    // Open the popup on whichever side of the click point has the *least*
+    // stuff to cover — both the adjoining waypoint(s) (the already-drawn
+    // approach) and every candidate's snapped position (wherever the
+    // preview route extends to, which moves as the selection changes — see
+    // previewFor below). Averaging both in means the popup can't perfectly
+    // dodge every possible selection when candidates scatter in different
+    // directions, but it beats only accounting for the incoming route and
+    // then covering the very cluster of candidates/preview it's there to
+    // let you compare.
+    const neighborWaypoints = kind === 'add'
+      ? (currentWaypoints.length ? [currentWaypoints[currentWaypoints.length - 1]] : [])
+      : kind === 'move'
+        ? [currentWaypoints[index - 1], currentWaypoints[index + 1]].filter(Boolean)
+        : [currentWaypoints[index - 1], currentWaypoints[index]].filter(Boolean); // 'insert': the pair it splits
+    const avoidPoints = [
+      ...neighborWaypoints.map(n => ({ lon: n.lon, lat: n.lat })),
+      ...candidates.map(c => ({ lon: c.snapped_lon, lat: c.snapped_lat })),
+    ];
+    let popupAnchor;
+    if (avoidPoints.length) {
+      let dx = 0, dy = 0;
+      for (const p of avoidPoints) { dx += p.lon - lon; dy += p.lat - lat; }
+      dx /= avoidPoints.length; dy /= avoidPoints.length;
+      const preferred = Math.abs(dx) > Math.abs(dy)
+        ? (dx > 0 ? 'right' : 'left')   // stuff-to-avoid is east/west → open on the opposite side
+        : (dy > 0 ? 'top' : 'bottom');  // stuff-to-avoid is north/south → open on the opposite side
+
+      // A forced anchor disables MapLibre's own built-in viewport clamping
+      // (it only auto-keeps the popup on-screen when `anchor` is left
+      // unset) — so if the click is close enough to that edge of the map
+      // that the popup would run off-screen anyway, don't force it: fall
+      // back to auto-placement, which stays on-screen even if that means
+      // covering the route in this edge case.
+      const EST_W = 340, EST_H = 420; // generous estimate incl. candidate list + PAL selects
+      const p = map.project([lon, lat]);
+      const container = map.getContainer();
+      const fits = {
+        left:   p.x + EST_W <= container.clientWidth,   // popup extends right
+        right:  p.x - EST_W >= 0,                       // popup extends left
+        top:    p.y + EST_H <= container.clientHeight,  // popup extends down
+        bottom: p.y - EST_H >= 0,                       // popup extends up
+      };
+      if (fits[preferred]) popupAnchor = preferred;
+    }
+
+    // Redraws the *actual* routed geometry for choosing `c` — not a straight
+    // ghost line — so clicking through candidates lets you compare how the
+    // real route differs for each before committing one with Enter.
+    let previewToken = 0;
+    const previewFor = async (c) => {
+      if (isPal || hypotheticalWaypoints(pointFromCandidate(c)).length < 2) { clearPreviewRoute(); return; }
+      const myToken = ++previewToken; // guards against a slow earlier preview overwriting a later one
+      const maxTurnDeviationDeg = useStore.getState().params.max_interior_turn_deviation_deg;
+      const result = await previewRouteBetween(hypotheticalWaypoints(pointFromCandidate(c)), maxTurnDeviationDeg);
+      if (myToken !== previewToken || mapRef.current !== map) return;
+      if (!result?.geometry?.length) { clearPreviewRoute(); return; }
+      map.getSource('encode-preview-route')?.setData({
+        type: 'Feature', geometry: { type: 'LineString', coordinates: result.geometry }, properties: {},
+      });
+    };
+
+    // Commits `c` (a candidate, or null to fall back to plain lon/lat —
+    // the encoder's own nearest-road search then applies) as the
+    // add/insert/move action this popup was opened for. Awaits the store
+    // action all the way through — including its own internal tile-load +
+    // runLiveRoute() — so the caller can gate the Enter button's re-enable
+    // on the highlighted route geometry actually having been updated, not
+    // just on the call having been issued.
+    const commitCandidate = async (c) => {
+      const point = pointFromCandidate(c);
+      if (kind === 'insert') await insertWaypoint(index, point);
+      else if (kind === 'move') await moveWaypoint(index, point);
+      else await addWaypoint(point);
+
+      // PAL is implicitly always "last" (there's only ever one point); Line
+      // only when the checkbox says so. Either way: open the Results panel
+      // and kick off the actual encode immediately — not awaited, so the
+      // popup can close right away and the panel shows the in-progress/
+      // finished result reactively instead of blocking Enter on the full
+      // encode + verify round trip.
+      if (isPal || lastWaypointCheckbox?.checked) {
+        const store = useStore.getState();
+        store.openResult();
+        if (isPal) store.runEncodePal();
+        else store.runEncode();
+      }
+    };
 
     const content = document.createElement('div');
     content.className = 'loc-pin-popup snap-picker-popup';
+
     const title = document.createElement('div');
-    title.className = 'loc-pin-coord';
-    title.textContent = 'Multiple options nearby — choose one:';
+    title.className = 'loc-pin-coord snap-picker-drag-handle';
+    title.title = 'Drag to move this popup out of the way';
+    const kindLabel = isPal ? 'Place point'
+      : kind === 'insert' ? 'Insert waypoint'
+      : kind === 'move'   ? 'Move waypoint'
+      : 'Add waypoint';
+    title.textContent = `${kindLabel} — ${lat.toFixed(6)}, ${lon.toFixed(6)}`;
     content.appendChild(title);
 
-    const list = document.createElement('div');
-    list.className = 'snap-picker-list';
-    candidates.forEach(c => {
-      const btn = document.createElement('button');
-      btn.className = 'snap-picker-option';
-      const label = c.kind === 'node'
-        ? 'Intersection'
-        : (c.stable_id || `Segment #${c.segment_id}`);
-      const detail = c.kind === 'node' ? '' : ` · FRC${c.frc}`;
-      btn.textContent = `${label}${detail} · ${c.distance_m.toFixed(0)}m`;
-      btn.addEventListener('mouseenter', () => setActiveHighlight(c));
-      btn.addEventListener('click', () => {
-        addWaypoint(c.kind === 'node'
-          ? { lon, lat, node_id: c.node_id }
-          : { lon, lat, segment_id: c.segment_id });
-        popup.remove();
+    if (candidates.length > 0) {
+      const list = document.createElement('div');
+      list.className = 'snap-picker-list';
+      const selectCandidate = (c, btn) => {
+        activeCandidate = c;
+        setActiveHighlight(c);
+        list.querySelectorAll('.snap-picker-option.selected').forEach(el => el.classList.remove('selected'));
+        btn.classList.add('selected');
+        previewFor(c);
+      };
+      candidates.forEach(c => {
+        const btn = document.createElement('button');
+        btn.className = 'snap-picker-option';
+        const label = c.kind === 'node'
+          ? 'Intersection'
+          : (c.stable_id || `Segment #${c.segment_id}`);
+        const detail = c.kind === 'node' ? '' : ` · FRC${c.frc}`;
+        btn.textContent = `${label}${detail} · ${c.distance_m.toFixed(0)}m`;
+        if (c === activeCandidate) btn.classList.add('selected');
+        // Only a click changes the selection (and its route preview) — a
+        // mere mouse-over must not, even though it's a common map-UI
+        // convention elsewhere, since here it would make the highlighted
+        // snap point (and the route preview computed for it) change
+        // without the user having committed to anything.
+        btn.addEventListener('click', () => selectCandidate(c, btn));
+        list.appendChild(btn);
       });
-      list.appendChild(btn);
+      content.appendChild(list);
+    } else {
+      const none = document.createElement('div');
+      none.className = 'snap-picker-none';
+      none.textContent = 'No roads found very close by — will snap to the nearest available road.';
+      content.appendChild(none);
+    }
+
+    // Preview whatever's selected by default (candidates[0], or the bare-
+    // point fallback) immediately, before any click — so there's something
+    // to compare the very first alternative against.
+    previewFor(activeCandidate);
+
+    if (isPal) {
+      const store = useStore.getState();
+      const options = document.createElement('div');
+      options.className = 'snap-picker-options';
+
+      const orientSelect = document.createElement('select');
+      orientSelect.className = 'encode-select';
+      for (const o of ['NoOrientation', 'FirstTowardSecond', 'SecondTowardFirst', 'BothDirections']) {
+        const opt = document.createElement('option');
+        opt.value = o; opt.textContent = o;
+        if (o === store.palOrientation) opt.selected = true;
+        orientSelect.appendChild(opt);
+      }
+      orientSelect.addEventListener('change', () => useStore.getState().setPalOrientation(orientSelect.value));
+
+      const sorSelect = document.createElement('select');
+      sorSelect.className = 'encode-select';
+      for (const s of ['DirectlyOnOrNA', 'Right', 'Left', 'Both']) {
+        const opt = document.createElement('option');
+        opt.value = s; opt.textContent = s;
+        if (s === store.palSideOfRoad) opt.selected = true;
+        sorSelect.appendChild(opt);
+      }
+      sorSelect.addEventListener('change', () => useStore.getState().setPalSideOfRoad(sorSelect.value));
+
+      const orientLabel = document.createElement('label');
+      orientLabel.className = 'encode-select-label';
+      orientLabel.textContent = 'Orientation';
+      orientLabel.appendChild(orientSelect);
+      const sorLabel = document.createElement('label');
+      sorLabel.className = 'encode-select-label';
+      sorLabel.textContent = 'Side of road';
+      sorLabel.appendChild(sorSelect);
+
+      options.appendChild(orientLabel);
+      options.appendChild(sorLabel);
+      content.appendChild(options);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'snap-picker-actions';
+
+    if (!isPal) {
+      const checkboxLabel = document.createElement('label');
+      checkboxLabel.className = 'snap-picker-last-wp';
+      lastWaypointCheckbox = document.createElement('input');
+      lastWaypointCheckbox.type = 'checkbox';
+      // A single waypoint has no route at all yet (Line needs at least 2) —
+      // marking it "last" wouldn't produce anything encodable.
+      lastWaypointCheckbox.disabled = hypotheticalCount < 2;
+      if (lastWaypointCheckbox.disabled) checkboxLabel.title = 'Need at least 2 waypoints before this route can be encoded';
+      checkboxLabel.appendChild(lastWaypointCheckbox);
+      checkboxLabel.appendChild(document.createTextNode('Last waypoint'));
+      actions.appendChild(checkboxLabel);
+    }
+
+    const enterBtn = document.createElement('button');
+    enterBtn.className = 'snap-picker-enter';
+    enterBtn.textContent = 'Enter';
+    enterBtn.addEventListener('click', async () => {
+      // Disabled for the full round trip (tile load + waypoint commit +
+      // route regeneration), not just the initial call — re-enabling only
+      // once the highlighted route geometry actually reflects the new
+      // waypoint prevents a rapid double-click from committing it twice.
+      enterBtn.disabled = true;
+      enterBtn.textContent = 'Adding…';
+      try {
+        await commitCandidate(activeCandidate);
+      } finally {
+        enterBtn.disabled = false;
+        enterBtn.textContent = 'Enter';
+      }
+      popup.remove(); // triggers the 'close' handler below, which clears the preview route too
     });
-    content.appendChild(list);
+    actions.appendChild(enterBtn);
 
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'snap-picker-cancel';
     cancelBtn.textContent = 'Cancel';
     cancelBtn.addEventListener('click', () => popup.remove());
-    content.appendChild(cancelBtn);
+    actions.appendChild(cancelBtn);
 
-    const popup = new maplibregl.Popup({ closeButton: true, offset: 12, className: 'loc-pin-popup-wrap' })
+    content.appendChild(actions);
+
+    const popup = new maplibregl.Popup({
+      closeButton: true, offset: 12, className: 'loc-pin-popup-wrap',
+      maxWidth: '320px', anchor: popupAnchor,
+    })
       .setLngLat([lon, lat])
       .setDOMContent(content)
       .addTo(map);
     popup.on('close', () => {
       clearSnapHighlights();
+      clearPreviewRoute();
+      previewToken++; // discard any still-in-flight preview request
       if (snapPickerPopupRef.current === popup) snapPickerPopupRef.current = null;
     });
     snapPickerPopupRef.current = popup;
+
+    // Auto-placement can't guarantee the geometry it's there to help you
+    // compare stays uncovered — the popup's tail is anchored right at the
+    // click point, and candidates cluster within meters of it, so *some*
+    // side will always be close to the route/candidates. Letting the user
+    // drag it out of the way directly is the reliable fix. Uses `setOffset`
+    // (not a raw CSS transform) so MapLibre's own position recomputation
+    // — e.g. on pan/zoom — keeps applying it correctly instead of
+    // overwriting it on the next re-render.
+    //
+    // MapLibre's `Popup` has `setOffset()` but, unlike `Marker`, no
+    // `getOffset()` to read the current value back — so the offset is
+    // tracked here instead of queried from the popup.
+    let currentOffset = [0, 0];
+    let dragStart = null; // { mouseX, mouseY }
+    const onDragMove = (e) => {
+      if (!dragStart) return;
+      currentOffset = [
+        dragStart.baseX + (e.clientX - dragStart.mouseX),
+        dragStart.baseY + (e.clientY - dragStart.mouseY),
+      ];
+      popup.setOffset(currentOffset);
+    };
+    const onDragEnd = () => {
+      dragStart = null;
+      document.removeEventListener('mousemove', onDragMove);
+      document.removeEventListener('mouseup', onDragEnd);
+    };
+    title.addEventListener('mousedown', (e) => {
+      e.preventDefault(); // avoid text-selection while dragging
+      dragStart = { mouseX: e.clientX, mouseY: e.clientY, baseX: currentOffset[0], baseY: currentOffset[1] };
+      document.addEventListener('mousemove', onDragMove);
+      document.addEventListener('mouseup', onDragEnd);
+    });
   }
 
   function onMapClick(e) {
@@ -1802,18 +2166,12 @@ export default function MapView({ tilesBase, ready }) {
       return;
     }
     if (encodeModeRef.current) {
+      // Left click does nothing in encode mode — waypoint editing is
+      // exclusively right-click(-drag), handled by onEncodeMouseDown/
+      // onEncodeDragUp above, so a plain left click just falls through to
+      // the ordinary deselect/close-popups behavior below (consistent with
+      // decode mode's empty-map click).
       if (suppressNextClickRef.current) { suppressNextClickRef.current = false; return; }
-      const lon = e.lngLat.lng, lat = e.lngLat.lat;
-      const candidates = getSnapCandidates(lon, lat);
-      if (candidates.length >= 2) {
-        showSnapPicker(lon, lat, candidates);
-      } else {
-        const only = candidates[0];
-        addWaypoint(only?.kind === 'node'
-          ? { lon, lat, node_id: only.node_id }
-          : { lon, lat, segment_id: only?.segment_id });
-      }
-      return;
     }
     const layerIds = [...Array.from({ length: 8 }, (_, i) => `olr-frc${i}`), 'lrp-markers-circle', 'decoded-path-line'];
     const hits = mapRef.current.queryRenderedFeatures(e.point, { layers: layerIds });
@@ -3061,6 +3419,15 @@ export default function MapView({ tilesBase, ready }) {
   // ── Encode mode: waypoint markers ────────────────────────────────────────────
   // Rebuilt in full on every change — waypoint lists are short (a handful of
   // points), so this is simpler and cheap enough compared to id-based diffing.
+  //
+  // Markers are NOT draggable via MapLibre's native `Marker.draggable` —
+  // that's built around left/primary-button drag, and this app dedicates
+  // the right button entirely to waypoint editing (see onEncodeMouseDown).
+  // Moving a marker is instead a right-mousedown on the marker's own DOM
+  // element (which starts the same ghost-drag + popup flow insert/add use,
+  // via startEncodeDragRef — the map-level mousedown handler lives in a
+  // different effect, so this ref is how the two meet). Plain left-click
+  // still removes the waypoint directly.
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -3068,41 +3435,24 @@ export default function MapView({ tilesBase, ready }) {
     waypointMarkersRef.current = [];
     if (mode !== 'encode') return;
 
-    const updateGhostForDrag = (i, cursor) => {
-      const prev = waypoints[i - 1];
-      const next = waypoints[i + 1];
-      const coords = [];
-      if (prev) coords.push([prev.lon, prev.lat]);
-      coords.push(cursor);
-      if (next) coords.push([next.lon, next.lat]);
-      map.getSource('encode-ghost')?.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: coords }, properties: {} });
-    };
-    const clearGhost = () => map.getSource('encode-ghost')?.setData({ type: 'FeatureCollection', features: [] });
-
     waypoints.forEach((wp, i) => {
       const el = document.createElement('div');
       el.className = 'encode-waypoint-marker';
       el.textContent = String(i + 1);
-      el.title = 'Drag to move · click to remove';
+      el.title = 'Right-click to move · click to remove';
 
-      const marker = new maplibregl.Marker({ element: el, draggable: true, anchor: 'center' })
+      const marker = new maplibregl.Marker({ element: el, draggable: false, anchor: 'center' })
         .setLngLat([wp.lon, wp.lat])
         .addTo(map);
 
-      let didDrag = false;
-      marker.on('dragstart', () => { didDrag = true; });
-      marker.on('drag', () => {
-        const { lng, lat } = marker.getLngLat();
-        updateGhostForDrag(i, [lng, lat]);
-      });
-      marker.on('dragend', () => {
-        clearGhost();
-        const { lng, lat } = marker.getLngLat();
-        moveWaypoint(i, { lon: lng, lat });
+      el.addEventListener('mousedown', (ev) => {
+        if (ev.button !== 2) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        startEncodeDragRef.current?.('move', i, { lngLat: marker.getLngLat() });
       });
       el.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        if (didDrag) { didDrag = false; return; }
         removeWaypoint(i);
       });
 
@@ -3323,6 +3673,15 @@ export default function MapView({ tilesBase, ready }) {
               <span>{label}</span>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* ── Encode mode: instructional banner (first-run guidance only) ────── */}
+      {mode === 'encode' && waypoints.length === 0 && (
+        <div className="encode-instruction-banner">
+          {locationType === 'PointAlongLine'
+            ? 'Right-click the map to place the point to encode.'
+            : 'Right-click the map to start adding waypoints. When you’re happy with the route, expand the Results panel on the left to review it and encode.'}
         </div>
       )}
 

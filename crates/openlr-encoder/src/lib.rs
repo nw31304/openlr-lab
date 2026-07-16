@@ -12,6 +12,7 @@
 pub mod attributes;
 pub mod expansion;
 pub mod coverage;
+pub mod diagnose;
 pub mod line;
 pub mod pal;
 
@@ -23,6 +24,13 @@ pub enum EncodeError {
     Disconnected { index: usize },
     #[error("no route exists between the requested points on this graph")]
     NoRoute,
+    /// Distinct from `NoRoute`: a route *was* found (or the un-expanded core
+    /// alone already exceeds the cap), but Rule-1 (max distance between
+    /// consecutive LRPs) rejects it. Callers that see this should suggest
+    /// raising `max_leg_m` or adding an intermediate waypoint/via-point —
+    /// not "check connectivity", which is `NoRoute`'s actual meaning.
+    #[error("leg length {length_m:.0}m exceeds the {max_leg_m:.0}m Rule-1 cap")]
+    LegTooLong { length_m: f64, max_leg_m: f64 },
     #[error("tile {0:?} required by the route search is not loaded")]
     NeedsTile(openlr_graph::TileKey),
     #[error("segment {0:?} referenced by the input path is not loaded in this graph")]

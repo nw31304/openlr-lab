@@ -274,9 +274,81 @@ function fmtRouteFail(reason) {
   return key;
 }
 
+// ── Encode-mode prompt builder ────────────────────────────────────────────────
+//
+// Encoding has no trace log the way decode does (see llm/SYSTEM_PROMPT.md's
+// "Encoding" section) — diagnosis instead happens via on-demand tool calls
+// against the encoder's own loaded graph (diagnose_waypoint_connection,
+// check_boundary_expansion, etc.), not a passive event dump. So this prompt
+// only needs to hand the model the top-level outcome and, on failure, the
+// structured node/segment context to seed those tool calls with — not a
+// blow-by-blow reconstruction.
+
+export function buildEncodeDiagnosticPrompt(ctx) {
+  const { encodeResult, verifyResult, waypoints, liveRoute, params, maxEncodeLegM, locationType } = ctx;
+  const lines = [];
+
+  lines.push(`Mode: ENCODE (${locationType ?? 'Line'})`);
+  lines.push(`Waypoints: ${waypoints?.length ?? 0}`);
+  for (const [i, w] of (waypoints ?? []).entries()) {
+    lines.push(`  ${i}: ${w.lon.toFixed(5)}, ${w.lat.toFixed(5)}`);
+  }
+  if (liveRoute) {
+    lines.push(`Live route preview: ${liveRoute.segments?.length ?? 0} segs, ${liveRoute.length_m?.toFixed(0) ?? '?'} m`);
+  }
+  lines.push('');
+
+  if (!encodeResult) {
+    lines.push('No encode attempt yet — nothing to diagnose.');
+  } else if (encodeResult.error) {
+    lines.push(`Result: FAILED — ${encodeResult.error}`);
+    if (encodeResult.error_from_node != null && encodeResult.error_to_node != null) {
+      lines.push(`  failing leg: node ${encodeResult.error_from_node} -> node ${encodeResult.error_to_node}`
+        + (encodeResult.error_from_segment_id != null ? ` (arriving via segment ${encodeResult.error_from_segment_id})` : ''));
+      lines.push(
+        "  Call diagnose_waypoint_connection with these node IDs first — it distinguishes genuine "
+        + "disconnection/wrong-direction from being blocked specifically by the turn-angle gate, and pinpoints "
+        + "the exact sharp-turn node when that is the cause."
+      );
+    } else {
+      lines.push(
+        "  No specific leg context was returned for this failure (e.g. a waypoint snapped to no nearby road, "
+        + "or the overall path is empty) — use get_waypoints / get_encode_segments_near to inspect the area "
+        + "around each waypoint."
+      );
+    }
+  } else {
+    lines.push('Result: SUCCESS');
+    lines.push(`  v3:   ${encodeResult.v3}`);
+    lines.push(`  tpeg: ${encodeResult.tpeg}`);
+    if (verifyResult) {
+      lines.push(verifyResult.ok
+        ? `  round-trip verify: ✓ passed (${verifyResult.segments?.length ?? 0} segments) — the decode-side `
+          + "tools (get_decode_summary, get_lrp_candidates, etc.) are also available and read this verify result."
+        : `  round-trip verify: ✗ FAILED — ${verifyResult.error ?? 'unknown'} — the encoder produced a `
+          + "reference its own decode logic cannot reproduce. This is an encoder/decoder disagreement, not a "
+          + "routing failure; investigate with the decode-side tools (get_decode_summary, get_lrp_candidates, "
+          + "get_leg_summary, ...) against this verify result.");
+    }
+  }
+
+  lines.push('');
+  lines.push('Active encode parameters:');
+  lines.push([
+    `  max leg (Rule-1 cap): ${maxEncodeLegM ?? '?'} m`,
+    `  turn-angle cap: ${params?.max_interior_turn_deviation_deg ?? '?'}° (180° = disabled) — the same `
+      + 'max_interior_turn_deviation_deg param decode uses, reused for both waypoint-connection A* and Rule-4 boundary expansion',
+  ].join('\n'));
+
+  return lines.join('\n');
+}
+
 // ── System context builder (for multi-turn chat) ─────────────────────────────
 
-export function buildSystemContext(decodeResult, params) {
+export function buildSystemContext(mode, decodeResult, params, encodeCtx) {
+  if (mode === 'encode') {
+    return `${SYSTEM_PROMPT}\n\nCurrent encode data:\n${buildEncodeDiagnosticPrompt(encodeCtx ?? {})}`;
+  }
   return `${SYSTEM_PROMPT}\n\nCurrent decode data:\n${buildDiagnosticPrompt(decodeResult, params)}`;
 }
 

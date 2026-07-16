@@ -3,6 +3,7 @@ import { useStore, getSegGeomCache } from '../store.js';
 import { diagnoseFailure, diagnoseSuccess } from '../diagnosis.js';
 import { renderLlmText } from '../renderLlmText.jsx';
 import { applyOffsets, computeTraversalDirections } from '../utils.js';
+import EncodeResultPanel from './EncodeResultPanel.jsx';
 
 // ── Reference panel helpers ───────────────────────────────────────────────────
 
@@ -166,13 +167,11 @@ const FOW_NAMES = ['Undef', 'Motorway', 'Dual C/W', 'Single C/W', 'Roundabout', 
 const FRC_NAMES = ['FRC0', 'FRC1', 'FRC2', 'FRC3', 'FRC4', 'FRC5', 'FRC6', 'FRC7'];
 
 export default function ResultPanel() {
-  const { decodeResult: decodeResultRaw, verifyResult, mode, highlightedSegment, setHighlightedSegment,
-          requestInfoSegment, showTrace, toggleTrace, debugDecode, debugVerify, params,
+  const { decodeResult: decodeResultRaw, mode, highlightedSegment, setHighlightedSegment,
+          requestInfoSegment, showTrace, toggleTrace, debugDecode, params,
           llmConfig, llmChatOpen, toggleLlmChat, toggleLlmSettings,
           setTraceLrpFocus, openlrString } = useStore();
-  // In encode mode, this panel shows the round-trip verify-decode of the
-  // just-encoded location rather than the (unrelated) last manual decode.
-  const decodeResult = mode === 'encode' ? verifyResult : decodeResultRaw;
+  const decodeResult = decodeResultRaw;
 
   const [refHeight, setRefHeight] = useState(280);
   const [exportFlash, setExportFlash] = useState(false);
@@ -263,6 +262,13 @@ export default function ResultPanel() {
     setTimeout(() => setExportFlash(false), 1200);
   }
 
+  // Encode mode is a different workflow entirely (drawing/reviewing
+  // waypoints and running the encode, not inspecting a decode) — it gets
+  // its own component, docked in this same side panel rather than a
+  // floating one over the map. Checked after all hooks above run
+  // unconditionally, so switching modes never changes hook-call order.
+  if (mode === 'encode') return <EncodeResultPanel />;
+
   if (!decodeResult) return (
     <div className="result-panel-empty">Decode a reference to see results.</div>
   );
@@ -279,7 +285,7 @@ export default function ResultPanel() {
                    : !isFull             ? 'Re-decode with full trace'
                    : !showTrace ? 'Open trace panel'
                    : null;
-  const debugAction = (!hasTrace || !isFull) ? (mode === 'encode' ? debugVerify : debugDecode) : toggleTrace;
+  const debugAction = (!hasTrace || !isFull) ? debugDecode : toggleTrace;
 
   return (
     <div className="result-panel">

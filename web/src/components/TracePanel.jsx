@@ -785,10 +785,12 @@ export default function TracePanel() {
     setParam('trace_level', traceLevel === 'Full' ? 'Summary' : 'Full');
   };
 
+  const isEncode = mode === 'encode';
+
   return (
     <div className="trace-panel">
       <div className="trace-panel-hdr">
-        <span className="trace-panel-title">⚡ Decode Trace</span>
+        <span className="trace-panel-title">⚡ {isEncode ? 'Encode Trace (verify)' : 'Decode Trace'}</span>
         <div className="trace-panel-actions">
           <button
             className={`tp-level-btn${traceLevel === 'Full' ? ' active' : ''}`}
@@ -799,7 +801,7 @@ export default function TracePanel() {
           >
             {traceLevel === 'Full' ? 'Full ●' : 'Summary'}
           </button>
-          <button className="tp-copy-btn" onClick={copyJson} disabled={!decodeResult} title="Copy decode result + trace JSON">
+          <button className="tp-copy-btn" onClick={copyJson} disabled={!decodeResult} title={isEncode ? 'Copy verify result + trace JSON' : 'Copy decode result + trace JSON'}>
             Copy JSON
           </button>
         </div>
@@ -807,7 +809,9 @@ export default function TracePanel() {
 
       <div className="trace-panel-body">
         {!decodeResult && (
-          <div className="tp-empty-state">Decode a reference to see trace data.</div>
+          <div className="tp-empty-state">
+            {isEncode ? 'Encode a location to see trace data from its round-trip verify.' : 'Decode a reference to see trace data.'}
+          </div>
         )}
         {decodeResult && (
           <ReferenceSummarySection
@@ -821,8 +825,8 @@ export default function TracePanel() {
         {decodeResult && !trace && (
           <div className="tp-empty-state">
             {traceLevel === 'Off'
-              ? 'Trace level is Off — set to Summary or Full and decode again for routing detail.'
-              : 'No trace data in last decode — decode again to capture routing detail.'}
+              ? `Trace level is Off — set to Summary or Full and ${isEncode ? 're-encode' : 'decode'} again for routing detail.`
+              : `No trace data in last ${isEncode ? 'verify' : 'decode'} — ${isEncode ? 're-encode' : 'decode'} again to capture routing detail.`}
           </div>
         )}
         {trace && (

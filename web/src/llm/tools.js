@@ -441,6 +441,161 @@ export const TOOL_DEFINITIONS = [
   },
 ];
 
+// ── Encode-side tool definitions ──────────────────────────────────────────────
+//
+// Encoding has no passive trace log the way decode does — sweep_coverage and
+// route_waypoints run once, synchronously, with no per-decision event log to
+// hand the model. These tools are on-demand diagnostics instead: they re-run
+// a small, targeted piece of the graph search (a connectivity probe, a
+// boundary-expansion replay, a single turn-angle check) only when the model
+// asks, spending an extra A*/walk internally to turn an opaque "no route"
+// string into a precise structured answer. See llm/SYSTEM_PROMPT.md's
+// "Encoding" section for when to reach for which one.
+//
+// `highlight_segments`/`set_map_view` from TOOL_DEFINITIONS above are reused
+// as-is here (same objects) — map control has no decode/encode distinction.
+const highlightSegmentsTool = TOOL_DEFINITIONS.find(t => t.function.name === 'highlight_segments');
+const setMapViewTool = TOOL_DEFINITIONS.find(t => t.function.name === 'set_map_view');
+
+export const ENCODE_TOOL_DEFINITIONS = [
+  {
+    type: 'function',
+    function: {
+      name: 'get_encode_summary',
+      description:
+        'Top-level encode outcome: success/failure, waypoint count, live-route preview stats, active '
+        + 'max_leg_m (Rule-1 cap) and turn-angle cap, and — on failure — the structured from_node/to_node/'
+        + 'from_segment_id of the specific waypoint-to-waypoint leg that failed (when available; feed these '
+        + 'straight into diagnose_waypoint_connection). Also reports whether a round-trip verify decode ran '
+        + 'and whether it passed. Call this first before any other encode tool.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_waypoints',
+      description: 'The ordered list of user-placed waypoints (lon, lat) that were fed to the encoder.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_encode_segment',
+      description:
+        'Full attributes and geometry for one segment by internal segment ID, from the *encoder\'s* loaded '
+        + 'graph (the drawn route\'s tiles, which may differ from the decoder\'s tile set if no round-trip '
+        + 'verify has run yet). Same shape as the decode-side get_segment.',
+      parameters: {
+        type: 'object',
+        properties: { segment_id: { type: 'integer', description: 'Internal graph segment ID.' } },
+        required: ['segment_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_encode_segments_near',
+      description:
+        'Find loaded road segments within radius_m of a coordinate, from the encoder\'s graph. Useful for '
+        + 'inspecting the area around a waypoint that failed to snap, or around a failing leg\'s endpoints.',
+      parameters: {
+        type: 'object',
+        properties: {
+          lat:      { type: 'number', description: 'Latitude in decimal degrees.' },
+          lon:      { type: 'number', description: 'Longitude in decimal degrees.' },
+          radius_m: { type: 'number', description: 'Search radius in metres (max 500). Default 100.' },
+        },
+        required: ['lat', 'lon'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_encode_segment_neighbors',
+      description:
+        'All segments connected at each endpoint of a segment in the encoder\'s graph, with can_arrive/'
+        + 'can_depart and turn-restriction flags. Same shape as the decode-side get_segment_neighbors. Use to '
+        + 'understand junction topology around a failing connection.',
+      parameters: {
+        type: 'object',
+        properties: { segment_id: { type: 'integer', description: 'Internal graph segment ID.' } },
+        required: ['segment_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'diagnose_waypoint_connection',
+      description:
+        'THE primary tool for "why can\'t the encoder connect these waypoints/LRPs". Re-runs the search '
+        + 'between from_node and to_node twice — once under the real turn-angle cap, once fully unrestricted — '
+        + 'to tell apart genuine disconnection or wrong-direction (fails both) from being blocked specifically '
+        + 'by the turn-angle gate (fails capped, succeeds unrestricted). In the latter case, returns the exact '
+        + 'node(s) along the unrestricted path where the turn exceeds the cap, with the deviation in degrees. '
+        + 'Omit from_node/to_node/from_segment_id to use the failing leg reported by get_encode_summary.',
+      parameters: {
+        type: 'object',
+        properties: {
+          from_node:  { type: 'integer', description: 'Internal node ID to search from. Defaults to the last encode failure\'s from_node.' },
+          to_node:    { type: 'integer', description: 'Internal node ID to search to. Defaults to the last encode failure\'s to_node.' },
+          from_segment_id: { type: 'integer', description: 'Optional: segment the search arrives via (seeds the first turn-angle check). Defaults to the last encode failure\'s from_segment_id, if any.' },
+          max_turn_deviation_deg: { type: 'number', description: 'Optional override of the turn-angle cap. Defaults to the active max_interior_turn_deviation_deg param.' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'check_boundary_expansion',
+      description:
+        'Replay Rule-4 boundary expansion from node_id outward along segment_id (the direction *away* from '
+        + 'the location) — the same walk encode_line/encode_pal perform internally whenever a location\'s '
+        + 'start or end node isn\'t a real junction. Reports how far it travelled and exactly why it stopped: '
+        + 'already valid, reached a valid node, ran off the loaded graph (dead end), hit max_leg_m, or was '
+        + 'blocked by a turn sharper than max_turn_deviation_deg. Use when a leg fails Rule-1 (too long) or '
+        + 'seems to anchor at an unexpected node.',
+      parameters: {
+        type: 'object',
+        properties: {
+          node_id:    { type: 'integer', description: 'Node to expand outward from (a location boundary).' },
+          segment_id: { type: 'integer', description: 'Segment leading away from the location, in the expansion direction.' },
+          max_leg_m:  { type: 'number', description: 'Optional override of the Rule-1 cap. Defaults to the active max_leg_m.' },
+          max_turn_deviation_deg: { type: 'number', description: 'Optional override of the turn-angle cap. Defaults to the active param.' },
+        },
+        required: ['node_id', 'segment_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_turn_deviation',
+      description:
+        'Turn-angle deviation in degrees when transitioning from segment_a to segment_b through node_id — the '
+        + 'same geometric check used by waypoint-connection A*, the coverage sweep, and Rule-4 boundary '
+        + 'expansion. Returns null if either segment doesn\'t actually touch node_id.',
+      parameters: {
+        type: 'object',
+        properties: {
+          segment_a: { type: 'integer', description: 'Segment being departed.' },
+          node_id:   { type: 'integer', description: 'Node where the transition happens.' },
+          segment_b: { type: 'integer', description: 'Segment being entered.' },
+        },
+        required: ['segment_a', 'node_id', 'segment_b'],
+      },
+    },
+  },
+  ...(highlightSegmentsTool ? [highlightSegmentsTool] : []),
+  ...(setMapViewTool ? [setMapViewTool] : []),
+];
+
 // ── TOON (Token-Oriented Object Notation) helpers ─────────────────────────────
 // Compact tabular format: field names appear once in a header; data rows contain
 // only values. Vendor-neutral — any capable LLM can parse it from the header.
@@ -506,10 +661,192 @@ function getTraceEvents(events, variant) {
     .map(e => e[variant]);
 }
 
+// ── Encode-side tool executor ─────────────────────────────────────────────────
+
+async function executeEncodeTool(name, args, { encoder, encodeResult, waypoints, liveRoute, params, maxEncodeLegM, zoom, storeActions }) {
+  switch (name) {
+
+    case 'highlight_segments': {
+      const { segment_ids } = args;
+      if (!storeActions) return JSON.stringify({ error: 'Store actions not available.' });
+      storeActions.highlightSegments(segment_ids?.length ? segment_ids : null);
+      return JSON.stringify({ ok: true, highlighted: segment_ids?.length ?? 0 });
+    }
+
+    case 'set_map_view': {
+      const { lat, lon, zoom: z } = args;
+      if (!storeActions) return JSON.stringify({ error: 'Store actions not available.' });
+      storeActions.flyTo(lat, lon, z);
+      return JSON.stringify({ ok: true });
+    }
+
+    case 'get_encode_summary': {
+      if (!encodeResult) return JSON.stringify({ error: 'No encode attempt yet.' });
+      return toonResponse({
+        ok: !encodeResult.error,
+        error: encodeResult.error ?? null,
+        error_from_node: encodeResult.error_from_node ?? null,
+        error_to_node: encodeResult.error_to_node ?? null,
+        error_from_segment_id: encodeResult.error_from_segment_id ?? null,
+        v3_present: !!encodeResult.v3,
+        tpeg_present: !!encodeResult.tpeg,
+        waypoint_count: waypoints?.length ?? 0,
+        live_route_segment_count: liveRoute?.segments?.length ?? null,
+        live_route_length_m: liveRoute?.length_m != null ? r1(liveRoute.length_m) : null,
+        max_leg_m: maxEncodeLegM ?? null,
+        max_turn_deviation_deg: params?.max_interior_turn_deviation_deg ?? null,
+      });
+    }
+
+    case 'get_waypoints': {
+      const rows = (waypoints ?? []).map((w, i) => ({ index: i, lon: r3(w.lon), lat: r3(w.lat) }));
+      return toonResponse({ count: rows.length }, [{ label: 'waypoints', rows, fields: ['index', 'lon', 'lat'] }]);
+    }
+
+    case 'get_encode_segment': {
+      if (!encoder) return JSON.stringify({ error: 'Encoder not available.' });
+      const raw = encoder.get_segment(args.segment_id);
+      const data = JSON.parse(raw);
+      if (data.error) return raw;
+      data.frc_label = FRC_LABELS[data.frc] ?? null;
+      data.fow_label = FOW_LABELS_FULL[data.fow] ?? null;
+      return JSON.stringify(data);
+    }
+
+    case 'get_encode_segments_near': {
+      if (!encoder) return JSON.stringify({ error: 'Encoder not available.' });
+      const { lat, lon, radius_m = 100 } = args;
+      const raw = encoder.get_segments_near(lat, lon, radius_m);
+      const data = JSON.parse(raw);
+      if (!data.segments) return raw;
+      const segRows = data.segments.map(s => ({
+        seg_id:    s.segment_id,
+        stable_id: s.stable_id ?? null,
+        frc:       s.frc,
+        fow:       s.fow,
+        direction: s.direction,
+        length_m:  r1(s.length_m),
+        dist_m:    r1(s.distance_m),
+      }));
+      return toonResponse(
+        { lat, lon, radius_m: data.query?.radius_m ?? radius_m, count: segRows.length },
+        [{ label: 'segments', rows: segRows, fields: ['seg_id', 'stable_id', 'frc', 'fow', 'direction', 'length_m', 'dist_m'] }]
+      );
+    }
+
+    case 'get_encode_segment_neighbors': {
+      if (!encoder) return JSON.stringify({ error: 'Encoder not available.' });
+      const raw = encoder.get_segment_neighbors(args.segment_id);
+      const data = JSON.parse(raw);
+      if (data.error) return raw;
+      const neighborFields = ['seg_id', 'stable_id', 'frc', 'fow', 'direction', 'length_m', 'can_arrive', 'can_depart'];
+      const mapNeighbor = s => ({
+        seg_id:     s.segment_id,
+        stable_id:  s.stable_id ?? null,
+        frc:        s.frc,
+        fow:        s.fow,
+        direction:  s.direction,
+        length_m:   r1(s.length_m),
+        can_arrive: s.can_arrive,
+        can_depart: s.can_depart,
+      });
+      return toonResponse(
+        { segment_id: args.segment_id, direction: data.direction, start_node: data.start_node?.node_id, end_node: data.end_node?.node_id },
+        [
+          { label: 'at_start_node', rows: (data.start_node?.segments ?? []).map(mapNeighbor), fields: neighborFields },
+          { label: 'at_end_node',   rows: (data.end_node?.segments   ?? []).map(mapNeighbor), fields: neighborFields },
+        ]
+      );
+    }
+
+    case 'diagnose_waypoint_connection': {
+      if (!encoder) return JSON.stringify({ error: 'Encoder not available.' });
+      const fromNode = args.from_node ?? encodeResult?.error_from_node;
+      const toNode   = args.to_node   ?? encodeResult?.error_to_node;
+      const fromSeg  = args.from_segment_id ?? encodeResult?.error_from_segment_id ?? undefined;
+      if (fromNode == null || toNode == null) {
+        return JSON.stringify({
+          error: 'from_node/to_node not provided and no failing leg is on record. '
+            + 'Call get_encode_summary first, or pass from_node/to_node explicitly.',
+        });
+      }
+      const maxTurn = args.max_turn_deviation_deg ?? params?.max_interior_turn_deviation_deg ?? 180;
+      const raw = encoder.diagnose_connection(fromNode, toNode, fromSeg, maxTurn, zoom ?? 12);
+      const diag = JSON.parse(raw);
+      const sharpRows = (diag.sharp_turns ?? []).map(t => ({
+        node: t.node, from_seg: t.from_segment, to_seg: t.to_segment, deviation_deg: r1(t.deviation_deg),
+      }));
+      return toonResponse(
+        {
+          from_node: fromNode,
+          to_node: toNode,
+          max_turn_deviation_deg: maxTurn,
+          connected_within_cap: diag.connected_within_cap,
+          length_within_cap_m: diag.length_within_cap_m != null ? r1(diag.length_within_cap_m) : null,
+          connected_unrestricted: diag.connected_unrestricted,
+          length_unrestricted_m: diag.length_unrestricted_m != null ? r1(diag.length_unrestricted_m) : null,
+          blocked_by_turn_angle: diag.blocked_by_turn_angle,
+          needs_tile: diag.needs_tile ? `${diag.needs_tile.z}/${diag.needs_tile.x}/${diag.needs_tile.y}` : null,
+        },
+        sharpRows.length ? [{ label: 'sharp_turns', rows: sharpRows, fields: ['node', 'from_seg', 'to_seg', 'deviation_deg'] }] : []
+      );
+    }
+
+    case 'check_boundary_expansion': {
+      if (!encoder) return JSON.stringify({ error: 'Encoder not available.' });
+      const maxLeg  = args.max_leg_m ?? maxEncodeLegM ?? 15000;
+      const maxTurn = args.max_turn_deviation_deg ?? params?.max_interior_turn_deviation_deg ?? 180;
+      const raw = encoder.check_boundary_expansion(args.node_id, args.segment_id, maxLeg, maxTurn);
+      const data = JSON.parse(raw);
+      const stoppedReason = typeof data.stopped === 'string' ? data.stopped : Object.keys(data.stopped ?? {})[0] ?? null;
+      const stoppedDeviation = data.stopped?.SharpTurn?.deviation_deg;
+      return toonResponse(
+        {
+          node_id: args.node_id,
+          segment_id: args.segment_id,
+          max_leg_m: maxLeg,
+          max_turn_deviation_deg: maxTurn,
+          stopped_at_node: data.node,
+          distance_m: r1(data.distance_m),
+          hops: data.hops,
+          still_invalid: data.still_invalid,
+          stopped_reason: stoppedReason,
+          stopped_deviation_deg: stoppedDeviation != null ? r1(stoppedDeviation) : null,
+        },
+        data.segments?.length
+          ? [{ label: 'segments_walked', rows: data.segments.map((s, i) => ({ step: i, seg_id: s })), fields: ['step', 'seg_id'] }]
+          : []
+      );
+    }
+
+    case 'get_turn_deviation': {
+      if (!encoder) return JSON.stringify({ error: 'Encoder not available.' });
+      const raw = encoder.get_turn_deviation(args.segment_a, args.node_id, args.segment_b);
+      const data = JSON.parse(raw);
+      return JSON.stringify({ deviation_deg: data.deviation_deg != null ? r1(data.deviation_deg) : null });
+    }
+
+    default:
+      return JSON.stringify({ error: `Encode tool "${name}" is not yet implemented in this version.` });
+  }
+}
+
 // ── Tool executor ─────────────────────────────────────────────────────────────
 
+const ENCODE_TOOL_NAMES = new Set(ENCODE_TOOL_DEFINITIONS.map(t => t.function.name));
+
 // storeActions: { setPinnedCandidates, runForcedDecodeAndGet, highlightSegments, flyTo }
-export async function executeTool(name, args, { decodeResult, params, decoder, storeActions, forcedDecodeResult }) {
+export async function executeTool(name, args, ctx) {
+  const { decodeResult, params, decoder, storeActions, forcedDecodeResult, encoder, encodeResult, waypoints, liveRoute, maxEncodeLegM, zoom } = ctx;
+
+  // Encode-side tools (including the shared highlight_segments/set_map_view)
+  // never need `decodeResult` — dispatch them before the decode-only guard
+  // below, which would otherwise reject them whenever nothing has been
+  // decoded/verified yet (the common case while an encode is still failing).
+  if (ENCODE_TOOL_NAMES.has(name)) {
+    return executeEncodeTool(name, args, { encoder, encodeResult, waypoints, liveRoute, params, maxEncodeLegM, zoom, storeActions });
+  }
+
   if (!decodeResult) return JSON.stringify({ error: 'No decode result available.' });
 
   // When a forced decode is active, routing tools (leg summary, route segments, skipped edges)

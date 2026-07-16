@@ -6,7 +6,13 @@ use openlr_graph::{Graph, NodeId, SegmentId, NO_PRIOR_SEG};
 
 use crate::{attributes, coverage, expansion, EncodeError};
 
-/// Rule-1: maximum distance between two consecutive LRPs, meters.
+/// Rule-1: the OpenLR architecture's own absolute ceiling on the distance
+/// between two consecutive LRPs, meters — not a default, a hard maximum.
+/// A caller's own `max_leg_m` (e.g. a head-unit wanting a smaller tile
+/// footprint per leg) is clamped to this; it can only ever be tightened,
+/// never loosened, since exceeding it isn't representable in the wire
+/// format at all (DNP's byte encoding is a fixed 256-bucket span over
+/// exactly this range — see `openlr_codec`'s `DNP_BUCKET_M`).
 pub const MAX_LEG_M: f64 = 15_000.0;
 
 /// A concrete path on the road network — e.g. Layer 1's waypoint-routing
@@ -25,27 +31,31 @@ pub struct LineLocationInput {
     /// marking where each user-drawn waypoint-to-waypoint leg ends within
     /// `path`. Empty for a simple two-waypoint route (a single leg).
     ///
-    /// Required so a user-forced via-point that isn't on the true shortest
-    /// path between the location's overall start and end doesn't get
-    /// silently routed around: the coverage sweep has no notion of
-    /// "waypoints" and searches straight to the fixed final end every
-    /// round, so a shorter route bypassing the via-point entirely can win
-    /// outright — with zero agreement against the drawn path from the very
-    /// first segment, leaving nowhere valid to insert an intermediate LRP
-    /// and failing with `NoRoute` even though a perfectly good route (via
-    /// the point the user actually drew) exists. Sweeping each waypoint leg
-    /// independently keeps every sweep's target the next waypoint Layer 1
-    /// already reached via a genuine shortest-path search, so re-deriving it
-    /// can never disagree (Dijkstra's optimal-substructure property) — this
-    /// also always places a real LRP at each via-point, which is required
-    /// for the decoder to reproduce the same non-shortcut route.
+    /// Waypoints only select *which segments* the location covers (Layer 1's
+    /// job) — they never dictate where LRPs get placed. `encode_line` sweeps
+    /// the whole path in one pass, always targeting the overall final end, so
+    /// an LRP is only ever inserted where that search genuinely diverges
+    /// from the drawn route; an "overly specified" waypoint sequence along an
+    /// already-optimal path costs nothing extra. These boundaries are passed
+    /// down purely as a recovery mechanism for the one case a plain sweep
+    /// can't resolve on its own — see `sweep_coverage`'s doc comment for
+    /// exactly when and why they get consulted.
     pub via_split_points: Vec<usize>,
 }
 
 /// `max_turn_deviation_deg` is the same turn-angle cap decode-side A* uses —
 /// see `coverage::sweep_coverage`'s doc comment for why the encoder needs it
 /// too (its name is decode-only by historical accident, not by scope).
-pub fn encode_line(graph: &Graph, input: &LineLocationInput, max_turn_deviation_deg: f64, zoom: u8) -> Result<LocationReference, EncodeError> {
+///
+/// `max_leg_m` is an encoder-only policy knob — nothing on the decode side
+/// depends on it (tile prefetch and A*'s search radius are already sized
+/// from the *actual* per-leg DNP the wire data carries, not from any assumed
+/// maximum), so a caller can shrink it purely to keep its own encoded
+/// references leg-sized for e.g. a constrained decoder's tile budget, with
+/// no coordination needed beyond both sides reading the same v3/TPEG bytes.
+/// Clamped to `MAX_LEG_M`, the architecture's own absolute ceiling.
+pub fn encode_line(graph: &Graph, input: &LineLocationInput, max_turn_deviation_deg: f64, max_leg_m: f64, zoom: u8) -> Result<LocationReference, EncodeError> {
+    let max_leg_m = max_leg_m.min(MAX_LEG_M);
     if input.path.is_empty() {
         return Err(EncodeError::EmptyPath);
     }
@@ -57,8 +67,36 @@ pub fn encode_line(graph: &Graph, input: &LineLocationInput, max_turn_deviation_
 
     // Step 2: expand both ends outward to valid nodes (Rule-4), tracking the
     // segments walked so they can be spliced into the full path.
-    let start_exp = expansion::expand_to_valid_node(graph, input.start_node, first_seg_id, MAX_LEG_M);
-    let end_exp = expansion::expand_to_valid_node(graph, end_node, last_seg_id, MAX_LEG_M);
+    //
+    // Budget for each expansion depends on whether the start and end
+    // boundary share a leg. With via-points splitting the route, the first
+    // leg's own core length (before any expansion) only ever competes with
+    // the *start* expansion for `max_leg_m`, and the last leg's core only
+    // competes with the *end* expansion — independent budgets. With no
+    // via-points at all (a single leg spanning the whole location), both
+    // expansions compete for the exact same budget, so they're resolved
+    // sequentially instead — start first (using the full remaining slack),
+    // then end (using whatever start didn't use) — rather than each
+    // independently assuming the full cap and silently walking straight
+    // past it in combination (see `pal::encode_pal`, which always hits this
+    // case since PAL can never have via-points).
+    let segs_len_m = |ids: &[SegmentId]| -> f64 {
+        ids.iter().filter_map(|id| graph.segments.get(id)).map(|s| s.length_m).sum()
+    };
+    let first_leg_core_end = input.via_split_points.first().copied().unwrap_or(input.path.len());
+    let last_leg_core_start = input.via_split_points.last().copied().unwrap_or(0);
+    let first_leg_core_m = segs_len_m(&input.path[..first_leg_core_end]);
+    let last_leg_core_m = segs_len_m(&input.path[last_leg_core_start..]);
+
+    let start_budget = (max_leg_m - first_leg_core_m).max(0.0);
+    let start_exp = expansion::expand_to_valid_node(graph, input.start_node, first_seg_id, start_budget, max_turn_deviation_deg);
+    let end_budget = if input.via_split_points.is_empty() {
+        // Same leg as the start boundary — only what start didn't use is left.
+        (max_leg_m - last_leg_core_m - start_exp.distance_m).max(0.0)
+    } else {
+        (max_leg_m - last_leg_core_m).max(0.0)
+    };
+    let end_exp = expansion::expand_to_valid_node(graph, end_node, last_seg_id, end_budget, max_turn_deviation_deg);
 
     let mut full_path = Vec::with_capacity(start_exp.segments.len() + input.path.len() + end_exp.segments.len());
     full_path.extend(start_exp.segments.iter().rev().copied());
@@ -72,39 +110,21 @@ pub fn encode_line(graph: &Graph, input: &LineLocationInput, max_turn_deviation_
     let pos_offset_m = input.start_offset_m + start_exp.distance_m;
     let neg_offset_m = input.end_offset_m + end_exp.distance_m;
 
-    // Steps 3-6: sweep the expanded path into legs, one waypoint-leg chunk at
-    // a time (see `via_split_points`'s doc comment for why this can't just be
-    // one sweep over the whole path). Expansion only ever prepends/appends
-    // segments, so the caller's split points shift by the prepended count.
+    // Steps 3-6: sweep the expanded path into legs in one pass. Waypoints
+    // exist to pin down *which segments* the location covers, not where LRPs
+    // get placed — `sweep_coverage` always targets the overall
+    // `expanded_end_node`, so an LRP only ever gets inserted where the
+    // search genuinely diverges from the drawn path; a declared via-point is
+    // consulted only as a last-resort recovery target when that divergence
+    // check finds nowhere valid to split (see `sweep_coverage`'s doc comment
+    // for exactly when and why). Expansion only ever prepends segments to
+    // the front, so the caller's split points shift by that prefix count.
     let prefix_len = start_exp.segments.len();
-    let mut boundaries: Vec<usize> = input.via_split_points.iter().map(|&p| p + prefix_len).collect();
-    boundaries.push(full_path.len());
-
-    let mut legs = Vec::new();
-    let mut chunk_start_node = expanded_start_node;
-    // The segment leading into `chunk_start_node`, for turn-angle purposes —
-    // `NO_PRIOR_SEG` for the very first chunk (the location's own overall
-    // start, with no "before" to compare against), then whichever segment
-    // the *previous* chunk's last leg actually ended on. Without this, each
-    // chunk's own `sweep_coverage` call would start fresh with no incoming-
-    // segment bias, silently admitting an arbitrarily sharp turn right at
-    // the via-point boundary between two waypoint legs.
-    let mut chunk_start_seg = NO_PRIOR_SEG;
-    let mut chunk_start_idx = 0usize;
-    for boundary in boundaries {
-        let chunk = &full_path[chunk_start_idx..boundary];
-        let chunk_end_node = if boundary == full_path.len() {
-            expanded_end_node
-        } else {
-            coverage::trace_end_node(graph, chunk_start_node, chunk)
-                .ok_or(EncodeError::Disconnected { index: chunk_start_idx })?
-        };
-        let mut chunk_legs = coverage::sweep_coverage(graph, chunk, chunk_start_node, chunk_start_seg, chunk_end_node, MAX_LEG_M, max_turn_deviation_deg, zoom)?;
-        chunk_start_seg = *chunk_legs.last().and_then(|l| l.segments.last()).unwrap_or(&chunk_start_seg);
-        legs.append(&mut chunk_legs);
-        chunk_start_node = chunk_end_node;
-        chunk_start_idx = boundary;
-    }
+    let waypoint_boundaries: Vec<usize> = input.via_split_points.iter().map(|&p| p + prefix_len).collect();
+    let legs = coverage::sweep_coverage(
+        graph, &full_path, expanded_start_node, NO_PRIOR_SEG, expanded_end_node,
+        max_leg_m, max_turn_deviation_deg, zoom, &waypoint_boundaries,
+    )?;
     if legs.is_empty() {
         return Err(EncodeError::EmptyPath);
     }
@@ -215,13 +235,94 @@ mod tests {
             end_offset_m: 0.0,
             via_split_points: vec![],
         };
-        let loc = encode_line(&g, &input, 180.0, 12).unwrap();
+        let loc = encode_line(&g, &input, 180.0, 15_000.0, 12).unwrap();
         let lrps = loc.lrps().unwrap();
         assert_eq!(lrps.len(), 2);
         assert!(lrps[0].dnp.is_some());
         assert!(lrps[1].dnp.is_none());
         assert!(lrps[0].pos_offset.is_none());
         assert!(lrps[1].neg_offset.is_none());
+    }
+
+    /// Same straight line as above, but with a via-point declared at node 1
+    /// (as if the user had inserted a third waypoint sitting exactly on the
+    /// already-drawn route). Since no shortcut around node 1 exists, the
+    /// unconstrained sweep reproduces the whole route in one leg — the
+    /// via-point should NOT force an intermediate LRP. Waypoints pin down
+    /// which segments the location covers, not where LRPs get placed.
+    #[test]
+    fn via_point_on_the_shortest_path_does_not_force_an_extra_lrp() {
+        let mut g = Graph::new();
+        for i in 0..=2u32 { g.add_node(node(i, i as f64 * 0.001, 0.0)); }
+        g.add_segment(seg(1, 0, 1, 0.001));
+        g.add_segment(seg(2, 1, 2, 0.001));
+
+        let input = LineLocationInput {
+            path: vec![SegmentId(1), SegmentId(2)],
+            start_node: NodeId(0),
+            start_offset_m: 0.0,
+            end_offset_m: 0.0,
+            via_split_points: vec![1], // declares a via-point at node 1
+        };
+        let loc = encode_line(&g, &input, 180.0, 15_000.0, 12).unwrap();
+        let lrps = loc.lrps().unwrap();
+        assert_eq!(lrps.len(), 2, "no shortcut exists around the via-point, so it should not force an extra LRP");
+    }
+
+    /// node 0 --60m-- node 1 (A, pass-through) --100m(core)-- node 2 (B,
+    /// pass-through) --60m-- node 3. Nodes 0 and 3 are dead ends (already
+    /// valid); 1 and 2 need Rule-4 expansion. With no via-points, start and
+    /// end share the location's one and only leg, so both expansions
+    /// compete for the same `max_leg_m` budget — same shape as PAL's
+    /// `pal_sequential_budget_prevents_combined_expansion_overrun`, since a
+    /// via-point-free Line location hits exactly the same "always one
+    /// shared leg" case PAL is permanently stuck with.
+    #[test]
+    fn no_via_points_shares_one_leg_budget_sequentially() {
+        let mut g = Graph::new();
+        g.add_node(node(0, 0.0, 0.0));
+        g.add_node(node(1, 60.0 / 111_000.0, 0.0));
+        g.add_node(node(2, 160.0 / 111_000.0, 0.0));
+        g.add_node(node(3, 220.0 / 111_000.0, 0.0));
+        g.add_segment(seg(10, 0, 1, 60.0 / 111_000.0));
+        g.add_segment(seg(1, 1, 2, 100.0 / 111_000.0)); // the drawn/core path
+        g.add_segment(seg(11, 2, 3, 60.0 / 111_000.0));
+
+        let input = LineLocationInput {
+            path: vec![SegmentId(1)],
+            start_node: NodeId(1),
+            start_offset_m: 0.0,
+            end_offset_m: 0.0,
+            via_split_points: vec![],
+        };
+
+        // Unrestricted: both expansions fully succeed (60 + 100 + 60 = 220m).
+        let loc = encode_line(&g, &input, 180.0, 15_000.0, 12).unwrap();
+        let dnp = loc.lrps().unwrap()[0].dnp.unwrap().lb;
+        assert!((dnp - 220.0).abs() < 1.0, "dnp={dnp}");
+
+        // 150m: only 50m left after the 100m core — neither side's 60m hop
+        // fits, so both expansions stay at the original (invalid) nodes.
+        let loc = encode_line(&g, &input, 180.0, 150.0, 12).unwrap();
+        let dnp = loc.lrps().unwrap()[0].dnp.unwrap().lb;
+        assert!((dnp - 100.0).abs() < 1.0, "dnp={dnp}");
+
+        // 175m: start gets first crack at the 75m slack (its 60m hop fits),
+        // leaving only 15m for end (whose 60m hop doesn't fit).
+        let loc = encode_line(&g, &input, 180.0, 175.0, 12).unwrap();
+        let dnp = loc.lrps().unwrap()[0].dnp.unwrap().lb;
+        assert!((dnp - 160.0).abs() < 1.0, "dnp={dnp}");
+
+        // 50m: less than the core alone — both budgets clamp to zero, and
+        // the pre-existing Rule-1 check (now reachable on the "no divergence"
+        // success path too) must reject the still-oversized leg.
+        match encode_line(&g, &input, 180.0, 50.0, 12) {
+            Err(EncodeError::LegTooLong { length_m, max_leg_m }) => {
+                assert!((length_m - 100.0).abs() < 1.0, "length_m={length_m}");
+                assert_eq!(max_leg_m, 50.0);
+            }
+            other => panic!("expected LegTooLong when the 100m core alone exceeds a 50m cap, got {other:?}"),
+        }
     }
 
     #[test]
@@ -238,7 +339,7 @@ mod tests {
             end_offset_m: 15.0,
             via_split_points: vec![],
         };
-        let loc = encode_line(&g, &input, 180.0, 12).unwrap();
+        let loc = encode_line(&g, &input, 180.0, 15_000.0, 12).unwrap();
         let lrps = loc.lrps().unwrap();
         assert!((lrps[0].pos_offset.unwrap().lb - 20.0).abs() < 1e-6);
         assert!((lrps[1].neg_offset.unwrap().lb - 15.0).abs() < 1e-6);
@@ -260,7 +361,7 @@ mod tests {
             end_offset_m: 0.0,
             via_split_points: vec![],
         };
-        let loc = encode_line(&g, &input, 180.0, 12).unwrap();
+        let loc = encode_line(&g, &input, 180.0, 15_000.0, 12).unwrap();
 
         let v3 = openlr_codec::encode_v3_base64(&loc).unwrap();
         let redecoded_v3 = openlr_codec::decode_v3_base64(&v3).unwrap();
@@ -310,7 +411,7 @@ mod tests {
             end_offset_m: 0.0,
             via_split_points: vec![],
         };
-        assert!(matches!(encode_line(&g, &input_no_via, 180.0, 12), Err(EncodeError::NoRoute)));
+        assert!(matches!(encode_line(&g, &input_no_via, 180.0, 15_000.0, 12), Err(EncodeError::NoRoute)));
 
         // With the via-point boundary declared, it succeeds and forces an
         // LRP exactly at node 1.
@@ -321,7 +422,7 @@ mod tests {
             end_offset_m: 0.0,
             via_split_points: vec![1],
         };
-        let loc = encode_line(&g, &input_with_via, 180.0, 12).unwrap();
+        let loc = encode_line(&g, &input_with_via, 180.0, 15_000.0, 12).unwrap();
         let lrps = loc.lrps().unwrap();
         assert_eq!(lrps.len(), 3, "start + via + end");
         let via_lrp = &lrps[1];
@@ -369,12 +470,16 @@ mod tests {
             via_split_points: vec![1],
         };
 
-        let err = encode_line(&g, &input, 150.0, 12)
+        let err = encode_line(&g, &input, 150.0, 15_000.0, 12)
             .expect_err("a 165° boundary turn must be rejected under the default-style 150° cap");
         assert!(matches!(err, EncodeError::NoRoute), "err={err:?}");
 
-        let loc = encode_line(&g, &input, 180.0, 12)
+        let loc = encode_line(&g, &input, 180.0, 15_000.0, 12)
             .expect("with the turn-angle gate disabled, the same route should encode successfully");
-        assert_eq!(loc.lrps().unwrap().len(), 3, "start + via + end");
+        // With the gate disabled this graph has exactly one possible path from
+        // node 1 to node 3 — no shortcut exists for the via-point to protect
+        // against, so the unconstrained sweep reproduces it in a single leg
+        // and the declared via-point does not force an extra LRP.
+        assert_eq!(loc.lrps().unwrap().len(), 2, "start + end, no via needed");
     }
 }

@@ -24,10 +24,24 @@ const SUGGESTED_OK = [
   'Why was this route chosen over alternatives?',
 ];
 
+const SUGGESTED_ENCODE_FAIL = [
+  'Why did this fail to encode?',
+  'Is this a turn-angle problem or a genuine disconnection?',
+  'What is the minimum parameter change to fix this?',
+];
+
+const SUGGESTED_ENCODE_OK = [
+  'Summarise this encode',
+  'Did the round-trip verify catch any issues?',
+  'Why did the encoder choose this path?',
+];
+
 // Prompts that get the structured format hint appended before sending to the API
 const STRUCTURED_PROMPTS = new Set([
   ...SUGGESTED_FAIL,
   ...SUGGESTED_OK,
+  ...SUGGESTED_ENCODE_FAIL,
+  ...SUGGESTED_ENCODE_OK,
 ]);
 
 function fmtBytes(n) {
@@ -38,7 +52,7 @@ function fmtBytes(n) {
 
 export default function LlmChatPanel() {
   const { llmChatOpen, toggleLlmChat, llmMessages, llmLoading,
-          sendLlmMessage, clearLlmChat, llmConfig, decodeResult,
+          sendLlmMessage, clearLlmChat, llmConfig, decodeResult, mode, encodeResult,
           llmLastToolActivity, llmStreamingContent } = useStore();
   const [draft, setDraft] = useState('');
   const bottomRef = useRef(null);
@@ -52,7 +66,10 @@ export default function LlmChatPanel() {
 
   if (!llmChatOpen) return null;
 
-  const suggestions = decodeResult?.ok ? SUGGESTED_OK : SUGGESTED_FAIL;
+  const isEncode = mode === 'encode';
+  const suggestions = isEncode
+    ? (encodeResult && !encodeResult.error ? SUGGESTED_ENCODE_OK : SUGGESTED_ENCODE_FAIL)
+    : (decodeResult?.ok ? SUGGESTED_OK : SUGGESTED_FAIL);
   const isEmpty = llmMessages.length === 0 && !llmLoading;
   const modelLabel = llmConfig?.model ?? '';
 

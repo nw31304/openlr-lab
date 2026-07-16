@@ -54,7 +54,10 @@ html, body, #root, .app {
   display: flex;
   border: 1px solid #252535;
   border-radius: 6px;
-  overflow: hidden;
+  /* No overflow:hidden here — the Encode button's location-type dropdown
+     is nested inside this row (see .menu-tile-wrap below) and needs to
+     render below it, not be clipped to this pill's bounds. Corners are
+     rounded explicitly on the first/last buttons instead. */
   flex-shrink: 0;
 }
 .mode-toggle-btn {
@@ -66,7 +69,9 @@ html, body, #root, .app {
   cursor: pointer;
   transition: color 0.12s, background 0.12s;
 }
+.mode-toggle-btn:first-child { border-radius: 5px 0 0 5px; }
 .mode-toggle-btn + .mode-toggle-btn { border-left: 1px solid #252535; }
+.mode-toggle > .menu-tile-wrap > .mode-toggle-btn { border-left: 1px solid #252535; border-radius: 0 5px 5px 0; }
 .mode-toggle-btn:hover { color: #e8e8f0; }
 .mode-toggle-btn.active {
   color: #33ddaa;
@@ -122,6 +127,11 @@ html, body, #root, .app {
   flex-direction: column;
   gap: 8px;
 }
+/* The location-type dropdown lives near the far left of the menu bar (inside
+   .mode-toggle) — right:0 (correct for the tile-source/trace-level dropdowns
+   near the right edge) would hang it mostly off-screen to the left instead. */
+.mode-toggle .menu-tile-dropdown { left: 0; right: auto; }
+
 .menu-tile-label { font-size: 11px; color: #888; }
 .menu-tile-row { display: flex; gap: 6px; }
 .menu-tile-input {
@@ -1672,6 +1682,11 @@ html, body, #root, .app {
   color: #c8d8ff;
 }
 
+.snap-picker-drag-handle {
+  cursor: move;
+  user-select: none;
+}
+
 .loc-pin-btns {
   display: flex;
   gap: 6px;
@@ -1720,16 +1735,62 @@ html, body, #root, .app {
   background: rgba(51,221,170,0.15);
   border-color: rgba(51,221,170,0.4);
 }
+.snap-picker-option.selected {
+  background: rgba(51,221,170,0.28);
+  border-color: #33ddaa;
+}
 
+.snap-picker-none {
+  font-size: 11px;
+  color: rgba(255,255,255,0.5);
+  margin-bottom: 8px;
+}
+
+.snap-picker-options {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.snap-picker-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.snap-picker-last-wp {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: rgba(255,255,255,0.7);
+  margin-right: auto;
+  cursor: pointer;
+}
+
+.snap-picker-enter,
 .snap-picker-cancel {
-  width: 100%;
-  padding: 4px 8px;
+  padding: 4px 10px;
   border-radius: 4px;
   border: 1px solid rgba(255,255,255,0.2);
-  background: rgba(255,255,255,0.08);
-  color: #aaa;
   font-size: 11px;
   cursor: pointer;
+}
+.snap-picker-enter {
+  background: rgba(51,221,170,0.18);
+  border-color: rgba(51,221,170,0.4);
+  color: #7fe0c0;
+  font-weight: 600;
+}
+.snap-picker-enter:hover:not(:disabled) { background: rgba(51,221,170,0.3); }
+.snap-picker-enter:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.snap-picker-cancel {
+  background: rgba(255,255,255,0.08);
+  color: #aaa;
 }
 .snap-picker-cancel:hover { background: rgba(255,255,255,0.18); color: #e8e8f0; }
 
@@ -3401,41 +3462,15 @@ html, body, #root, .app {
   word-break: break-word;
 }
 
-/* ── Encode panel (debug) ─────────────────────────────────────────────────── */
+/* ── Encode panel (docked in the left/Results side panel) ────────────────── */
 
-.encode-panel {
-  position: absolute;
-  top: 72px;
-  right: 352px;
-  width: 340px;
-  max-height: calc(100vh - 88px);
-  display: flex;
-  flex-direction: column;
-  background: rgba(10, 10, 20, 0.95);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border: 1px solid rgba(100, 220, 150, 0.25);
-  border-radius: 10px;
-  z-index: 11;
-  color: #e8e8f0;
-  font-size: 13px;
-  overflow: hidden;
-}
-
-.encode-panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px 10px 14px;
-  border-bottom: 1px solid rgba(255,255,255,0.08);
-  flex-shrink: 0;
-  cursor: move;
-}
-
-.encode-panel-title {
+.encode-result-title {
   font-size: 12px;
   font-weight: 600;
   color: #77dd99;
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  flex-shrink: 0;
 }
 
 .encode-panel-body {
@@ -3647,4 +3682,21 @@ html, body, #root, .app {
   z-index: 8;
   display: flex;
   gap: 6px;
+}
+
+.encode-instruction-banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 9;
+  padding: 7px 16px;
+  text-align: center;
+  font-size: 12px;
+  color: #d8fff0;
+  background: rgba(20, 50, 40, 0.85);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border-bottom: 1px solid rgba(100, 220, 150, 0.3);
+  pointer-events: none;
 }

@@ -4,7 +4,7 @@ import { decodeTile } from './tileDecoder.js';
 import { buildReplaySteps } from './replayEngine.js';
 import { loadLlmConfig, saveLlmConfig, clearLlmConfig as clearLlmStorage, chatComplete } from './llmClient.js';
 import { buildSystemContext } from './llmDiagnosis.js';
-import { TOOL_DEFINITIONS, executeTool } from './llm/tools.js';
+import { TOOL_DEFINITIONS, ENCODE_TOOL_DEFINITIONS, executeTool } from './llm/tools.js';
 
 let _pmtiles = null;
 let _decoder = null;
@@ -30,6 +30,20 @@ function clientDecodeFailure(message) {
   } catch { /* decoder unavailable or reference_summary() missing — use fallback */ }
   return { ok: false, error: message, segments: [], ...summary };
 }
+/** Build an `encodeResult` failure object from a raw `_encoder.encode_line`/
+ *  `encode_pal` JSON result, carrying through the optional structured leg
+ *  context (`error_from_node`/`error_to_node`/`error_from_segment_id`) that
+ *  `Encoder::diagnose_connection` needs — only set on waypoint-to-waypoint
+ *  connection failures, null otherwise. */
+function encodeErrorResult(out) {
+  return {
+    v3: null, tpeg: null, error: out.error,
+    error_from_node: out.error_from_node ?? null,
+    error_to_node: out.error_to_node ?? null,
+    error_from_segment_id: out.error_from_segment_id ?? null,
+  };
+}
+
 /** segment_id → { tile_key, local_index } — rebuilt after every decode */
 let _segIdToTile = new Map();
 /** tile_key → GeoJSON features[] — built from tile bytes during decode */
@@ -46,7 +60,7 @@ export function setZoom(z)    { _zoom = z; }
  *  Best-effort prefetch — runLiveRoute()/runEncode()'s own needs_tile retry
  *  loop covers anything this misses (e.g. a route leg passing through tiles
  *  far from either endpoint). */
-async function loadEncoderTilesNear(lon, lat) {
+export async function loadEncoderTilesNear(lon, lat) {
   if (!_encoder || !_pmtiles) return;
   const { tiles } = JSON.parse(_encoder.tiles_near_point(lon, lat, _zoom));
   await Promise.all(tiles.map(async ([z, x, y]) => {
@@ -68,6 +82,43 @@ export function getSnapCandidates(lon, lat) {
   } catch {
     return [];
   }
+}
+
+/** Stateless route preview — same underlying call `runLiveRoute` uses, but
+ *  touches nothing in the store (`waypoints`/`liveRoute`/`waypointHistory`
+ *  are all untouched). Used by the encode popup to show what the route
+ *  would look like for a candidate choice *before* committing to it, so
+ *  clicking through several candidates never pollutes undo history the way
+ *  calling the real add/insert/move actions repeatedly would. Returns null
+ *  on error or if a needed tile still isn't loaded after one retry (a
+ *  preview silently not appearing is fine; committing via Enter still goes
+ *  through the real, fully-retrying code path). */
+export async function previewRouteBetween(waypointsList, maxTurnDeviationDeg) {
+  if (!_encoder) return null;
+  const tryOnce = () => {
+    try { return JSON.parse(_encoder.route_between(JSON.stringify(waypointsList), maxTurnDeviationDeg, _zoom)); }
+    catch { return null; }
+  };
+  let out = tryOnce();
+  if (out?.needs_tile && _pmtiles) {
+    const [z, x, y] = out.needs_tile;
+    try {
+      const res = await _pmtiles.getZxy(z, x, y);
+      _encoder.load_tile(z, x, y, tileBytes(res) ?? new Uint8Array(0));
+      out = tryOnce();
+    } catch { return null; }
+  }
+  if (!out || out.error || out.needs_tile) return null;
+  return out;
+}
+
+/** Full attributes + geometry for one segment from the *encoder's* loaded
+ *  graph, by internal segment ID — used to build the live per-segment table
+ *  in the encode-mode Results panel while the route is still just a
+ *  preview (no verify-decode has run yet to populate the usual caches). */
+export function getEncoderSegment(segId) {
+  if (!_encoder) return null;
+  try { return JSON.parse(_encoder.get_segment(segId)); } catch { return null; }
 }
 
 export function getSegIdToTile()   { return _segIdToTile; }
@@ -238,6 +289,17 @@ export const useStore = create(persist(
   // types are listed in the UI (disabled) for discoverability but have no
   // encoder support yet.
   locationType: 'Line',
+  // PointAlongLine-only encode options — set from either the map's
+  // right-click popup or the Results panel, both read/write the same store
+  // fields so whichever one you touch last is what encode() actually uses.
+  palOrientation: 'NoOrientation',
+  palSideOfRoad:  'DirectlyOnOrNA',
+  // Rule-1 cap, meters — encoder-only (nothing on decode depends on it; tile
+  // prefetch and A*'s search radius are already sized from the real per-leg
+  // DNP the wire data carries). Lower it to keep encoded references leg-sized
+  // for e.g. a memory-constrained decoder's smaller per-leg tile budget.
+  // Clamped server-side to the architecture's own 15km ceiling.
+  maxEncodeLegM: 15_000,
   waypoints: [],            // ordered [{lon,lat}], user-drawn
   waypointHistory: [],      // undo stack: prior `waypoints` snapshots
   liveRoute: null,          // { segments, geometry, length_m } from route_between()
@@ -299,14 +361,34 @@ export const useStore = create(persist(
   // content = text sent to the API (may include appended format hints)
   // display = text shown in the chat bubble (the user's original words)
   sendLlmMessage: async (content, display) => {
-    const { llmMessages, llmApiHistory, decodeResult, params, llmConfig } = get();
-    if (!llmConfig || !decodeResult) return;
+    const {
+      llmMessages, llmApiHistory, decodeResult, params, llmConfig, mode,
+      encodeResult, verifyResult, waypoints, liveRoute, maxEncodeLegM, locationType,
+    } = get();
+    const isEncode = mode === 'encode';
+    if (!llmConfig || (isEncode ? !encodeResult : !decodeResult)) return;
+
+    // In encode mode the "decode result" the chat and its tools reason about
+    // is the round-trip verify decode (a real DecodeResult from a real
+    // decode), not the raw encodeResult — this is what lets every existing
+    // decode-side tool (get_decode_summary, get_lrp_candidates, ...) work
+    // unmodified once an encode succeeds and gets verified.
+    const activeDecodeResult = isEncode ? verifyResult : decodeResult;
 
     const userDisplayMsg = { role: 'user', content, display: display ?? content };
     set({ llmMessages: [...llmMessages, userDisplayMsg], llmLastToolActivity: null, llmLoading: true });
 
     // Rebuild system context each turn so parameter changes are reflected immediately
-    const systemContext = buildSystemContext(decodeResult, params);
+    const systemContext = buildSystemContext(mode, decodeResult, params, {
+      encodeResult, verifyResult, waypoints, liveRoute, params, maxEncodeLegM, locationType,
+    });
+
+    // Decode tools only make sense once there's something to decode — skip
+    // advertising all 22 of them while an encode is still failing (token
+    // economy: an unused tool schema is still prompt tokens every turn).
+    const tools = isEncode
+      ? [...ENCODE_TOOL_DEFINITIONS, ...(verifyResult ? TOOL_DEFINITIONS : [])]
+      : TOOL_DEFINITIONS;
 
     // Cap history at 20 entries (~10 exchange pairs) to bound context window growth.
     // The model can re-call tools if it needs data that has aged out.
@@ -346,7 +428,7 @@ export const useStore = create(persist(
     const MAX_STEPS = 20;
     for (let step = 0; step < MAX_STEPS; step++) {
       set({ llmStreamingContent: null }); // typing dots until first text chunk
-      const resp = await chatComplete(llmConfig, apiHistory, TOOL_DEFINITIONS, onDelta);
+      const resp = await chatComplete(llmConfig, apiHistory, tools, onDelta);
 
       if (!resp.ok) {
         set(s => ({
@@ -408,7 +490,10 @@ export const useStore = create(persist(
         try {
           const args = JSON.parse(tc.function.arguments);
           const forcedDecodeResult = get().forcedDecodeResult;
-          toolResult = await executeTool(tc.function.name, args, { decodeResult, params, decoder: _decoder, storeActions, forcedDecodeResult });
+          toolResult = await executeTool(tc.function.name, args, {
+            decodeResult: activeDecodeResult, params, decoder: _decoder, storeActions, forcedDecodeResult,
+            encoder: _encoder, encodeResult, waypoints, liveRoute, maxEncodeLegM, zoom: _zoom,
+          });
           toolCalls.push({
             label: toolCallLabel(tc.function.name, args),
             args_bytes: tc.function.arguments.length,
@@ -469,6 +554,7 @@ export const useStore = create(persist(
   },
 
   hideResult:    () => set({ showResult: false }),
+  openResult:    () => set({ showResult: true }),
   toggleResult:  () => set(state => ({ showResult: !state.showResult })),
   clearDecodeToast: () => set({ decodeToast: null }),
   // "Clear" button next to Decode — wipes the input and everything a decode
@@ -841,20 +927,52 @@ export const useStore = create(persist(
   // ── Encode mode ───────────────────────────────────────────────────────────
 
   setMode: (mode) => set({ mode }),
-  setLocationType: (locationType) => set({ locationType }),
+  // Switching to a *different* location type invalidates whatever's already
+  // drawn for the old one (e.g. a multi-waypoint Line route makes no sense
+  // once switched to PointAlongLine's single point) — clear all encode
+  // artifacts rather than leave stale, mismatched-type state on the map.
+  // Not pushed onto waypointHistory: undoing back into a route built for a
+  // different location type wouldn't make sense either, so the old history
+  // is dropped along with the waypoints themselves.
+  setLocationType: (locationType) => set(state => {
+    if (locationType === state.locationType) return { locationType };
+    return {
+      locationType,
+      waypoints: [],
+      waypointHistory: [],
+      liveRoute: null,
+      liveRouteError: null,
+      encodeResult: null,
+      verifyResult: null,
+      verifyToast: null,
+      verifyReplaySteps: [],
+      verifyReplayStats: null,
+      verifyReplayStep: 0,
+    };
+  }),
+  setPalOrientation: (palOrientation) => set({ palOrientation }),
+  setPalSideOfRoad:  (palSideOfRoad) => set({ palSideOfRoad }),
+  setMaxEncodeLegM: (maxEncodeLegM) => set({ maxEncodeLegM }),
 
   // Bulk-replace all waypoints at once (e.g. from the debug textarea input
   // before map-based drawing exists). Prefetches tiles for every point.
   setWaypoints: async (list) => {
-    const { waypoints } = get();
-    set(state => ({ waypointHistory: [...state.waypointHistory, waypoints], waypoints: list }));
-    await Promise.all(list.map(w => loadEncoderTilesNear(w.lon, w.lat)));
+    const { waypoints, locationType } = get();
+    // PointAlongLine has exactly one point — pasting a multi-line list only
+    // ever keeps the first, matching addWaypoint's replace-not-append rule.
+    const next = locationType === 'PointAlongLine' ? list.slice(0, 1) : list;
+    set(state => ({ waypointHistory: [...state.waypointHistory, waypoints], waypoints: next }));
+    await Promise.all(next.map(w => loadEncoderTilesNear(w.lon, w.lat)));
     await get().runLiveRoute();
   },
 
   addWaypoint: async (lonLat) => {
-    const { waypoints } = get();
-    set(state => ({ waypointHistory: [...state.waypointHistory, waypoints], waypoints: [...waypoints, lonLat] }));
+    const { waypoints, locationType } = get();
+    // PointAlongLine has exactly one point, never a waypoint list — placing
+    // a new one replaces it rather than appending, so there's never an
+    // ambiguous "only the first is used" list to reason about.
+    const next = locationType === 'PointAlongLine' ? [lonLat] : [...waypoints, lonLat];
+    set(state => ({ waypointHistory: [...state.waypointHistory, waypoints], waypoints: next }));
     await loadEncoderTilesNear(lonLat.lon, lonLat.lat);
     await get().runLiveRoute();
   },
@@ -883,7 +1001,7 @@ export const useStore = create(persist(
   },
 
   // Swap waypoint `index` with its neighbor in `direction` (-1 or +1) —
-  // reordering via the EncodePanel's waypoint list.
+  // reordering via the waypoint list in the Results panel's encode view.
   moveWaypointIndex: async (index, direction) => {
     const { waypoints } = get();
     const j = index + direction;
@@ -915,6 +1033,10 @@ export const useStore = create(persist(
       verifyReplaySteps: [],
       verifyReplayStats: null,
       verifyReplayStep: 0,
+      // Clearing is a decisive "start over" — with nothing left to review or
+      // encode, the panel would just show empty-state placeholders; closing
+      // it returns to the same collapsed posture the encode flow starts in.
+      showResult: false,
     }));
   },
 
@@ -922,7 +1044,7 @@ export const useStore = create(persist(
   // between consecutive points, loading any tile the search discovers it
   // needs along the way. Mirrors runDecode's needs_tile retry loop.
   runLiveRoute: async () => {
-    const { waypoints } = get();
+    const { waypoints, params } = get();
     if (waypoints.length < 2 || !_encoder || !_pmtiles) {
       set({ liveRoute: null, liveRouteError: null });
       return;
@@ -934,7 +1056,7 @@ export const useStore = create(persist(
       let dynamicLoads = 0;
       let out = null;
       while (true) {
-        out = JSON.parse(_encoder.route_between(JSON.stringify(waypoints), _zoom));
+        out = JSON.parse(_encoder.route_between(JSON.stringify(waypoints), params.max_interior_turn_deviation_deg, _zoom));
         if (!out.needs_tile) break;
         if (dynamicLoads >= MAX_DYNAMIC_LOADS) {
           out = { error: `Route search exceeded the maximum of ${MAX_DYNAMIC_LOADS} dynamically-loaded tiles.` };
@@ -971,7 +1093,7 @@ export const useStore = create(persist(
   // immediately decode the v3 string back via the existing _decoder so
   // Results/Trace/Replay can show a real round-trip verification.
   runEncode: async () => {
-    const { waypoints, params } = get();
+    const { waypoints, params, maxEncodeLegM } = get();
     if (waypoints.length < 2 || !_encoder || !_pmtiles) return;
     set({
       encoding: true, encodeResult: null,
@@ -985,7 +1107,7 @@ export const useStore = create(persist(
       // max_interior_turn_deviation_deg applies to encoding too, despite the
       // decode-only-sounding name — see openlr-encoder::coverage::sweep_coverage.
       while (true) {
-        out = JSON.parse(_encoder.encode_line(JSON.stringify(waypoints), params.max_interior_turn_deviation_deg, _zoom));
+        out = JSON.parse(_encoder.encode_line(JSON.stringify(waypoints), params.max_interior_turn_deviation_deg, maxEncodeLegM, _zoom));
         if (!out.needs_tile) break;
         if (dynamicLoads >= MAX_DYNAMIC_LOADS) {
           out = { error: `Encode exceeded the maximum of ${MAX_DYNAMIC_LOADS} dynamically-loaded tiles.` };
@@ -1010,7 +1132,7 @@ export const useStore = create(persist(
       }
 
       if (out.error) {
-        set({ encoding: false, encodeResult: { v3: null, tpeg: null, error: out.error } });
+        set({ encoding: false, encodeResult: encodeErrorResult(out) });
         return;
       }
 
@@ -1024,9 +1146,12 @@ export const useStore = create(persist(
   },
 
   // Encode the first waypoint as a PointAlongLine location, then verify via
-  // round-trip decode exactly like runEncode does for Line.
-  runEncodePal: async (orientation, sideOfRoad) => {
-    const { waypoints } = get();
+  // round-trip decode exactly like runEncode does for Line. Orientation/
+  // side-of-road are read from the store (not passed in) so the map's
+  // right-click popup and the Results panel's selects share one source of
+  // truth regardless of which one was touched last.
+  runEncodePal: async () => {
+    const { waypoints, params, maxEncodeLegM, palOrientation: orientation, palSideOfRoad: sideOfRoad } = get();
     if (waypoints.length < 1 || !_encoder) return;
     set({
       encoding: true, encodeResult: null,
@@ -1034,9 +1159,9 @@ export const useStore = create(persist(
     });
     try {
       const { lon, lat, segment_id, node_id } = waypoints[0];
-      const out = JSON.parse(_encoder.encode_pal(lon, lat, segment_id, node_id, orientation, sideOfRoad));
+      const out = JSON.parse(_encoder.encode_pal(lon, lat, segment_id, node_id, orientation, sideOfRoad, params.max_interior_turn_deviation_deg, maxEncodeLegM));
       if (out.error) {
-        set({ encodeResult: { v3: null, tpeg: null, error: out.error } });
+        set({ encodeResult: encodeErrorResult(out) });
         return;
       }
       set({ encodeResult: { v3: out.v3, tpeg: out.tpeg, error: null } });
@@ -1149,6 +1274,7 @@ export const useStore = create(persist(
      tileUrl: state.tileUrl,
      params: state.params,
      savedParamSets: state.savedParamSets,
+     maxEncodeLegM: state.maxEncodeLegM,
    }),
    // Deep-merge params so new fields added to PRESETS.Default survive across
    // localStorage upgrades — persisted values win, but missing fields fall back

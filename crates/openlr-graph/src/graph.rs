@@ -255,6 +255,19 @@ impl Graph {
         self.topology.get(&node).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Segments that can actually be *departed* from `node` in their permitted
+    /// travel direction (`node == seg.start_node` for `Forward`/`Both`, or
+    /// `node == seg.end_node` for `Backward`/`Both`) — unlike
+    /// `topology_neighbors`, which ignores `Direction` entirely. Needed
+    /// wherever a caller anchors a *travel direction* at this node with
+    /// nothing downstream to catch a wrong-direction pick the way A* routing
+    /// would (e.g. snapping a PointAlongLine point directly onto a node: its
+    /// line *is* the path, verbatim, with no coverage-sweep search to reject
+    /// an illegal direction afterward).
+    pub fn outgoing_segments(&self, node: NodeId) -> &[SegmentId] {
+        self.outgoing.get(&node).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
     /// v1 approximation of "a U-turn is possible at this node": true iff there are
     /// multiple distinct segments connecting it to the *same* neighbor (e.g. two
     /// parallel one-way carriageways forming a real turnaround point). Does not
@@ -472,6 +485,30 @@ mod tests {
         let mut g = Graph::new();
         g.add_segment(make_seg(1, 0, 1, 3, Direction::Both));
         assert!(g.is_valid_node(NodeId(1)), "node 1 has only one neighbor — a dead end");
+    }
+
+    /// Regression: `snap_point`'s node-hint path (openlr-wasm) used to pick
+    /// from `topology_neighbors`, which ignores `Direction` — anchoring a
+    /// PointAlongLine reference on a segment in the *prohibited* direction
+    /// when a one-way road happened to be first in the adjacency list, with
+    /// nothing downstream to catch it (PAL has no A*/coverage-sweep step).
+    /// `outgoing_segments` must exclude a segment that can't actually be
+    /// departed from this node, even though it's a real topological neighbor.
+    #[test]
+    fn outgoing_segments_excludes_wrong_direction_departures() {
+        let mut g = Graph::new();
+        // seg 1: node 0 -> node 1, one-way Forward — cannot be departed *from*
+        // node 1 (only entered there), even though it's a real topology neighbor.
+        g.add_segment(make_seg(1, 0, 1, 3, Direction::Forward));
+        // seg 2: node 1 -> node 2, one-way Forward — can be departed from node 1.
+        g.add_segment(make_seg(2, 1, 2, 3, Direction::Forward));
+
+        let topo: Vec<_> = g.topology_neighbors(NodeId(1)).iter().map(|(_, s)| s.0).collect();
+        assert!(topo.contains(&1) && topo.contains(&2), "both are real topology neighbors of node 1");
+
+        let outgoing: Vec<_> = g.outgoing_segments(NodeId(1)).iter().map(|s| s.0).collect();
+        assert!(!outgoing.contains(&1), "seg 1 can only be entered at node 1, not departed — must be excluded");
+        assert!(outgoing.contains(&2), "seg 2 can be departed from node 1 — must be included");
     }
 
     #[test]

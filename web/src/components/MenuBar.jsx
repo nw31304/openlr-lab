@@ -95,11 +95,33 @@ export default function MenuBar() {
           onClick={() => setMode('decode')}
           title="Decode mode"
         >Decode</button>
-        <button
-          className={`mode-toggle-btn${mode === 'encode' ? ' active' : ''}`}
-          onClick={() => setMode('encode')}
-          title="Encode mode"
-        >Encode</button>
+
+        {/* Encode is a dropdown-trigger, not a plain toggle: picking a
+            location type both selects it and switches to encode mode in one
+            click, and clicking it again while already in encode mode reopens
+            the dropdown to switch types without leaving encode mode. */}
+        <div className="menu-tile-wrap" ref={locTypeMenuRef}>
+          <button
+            className={`mode-toggle-btn${mode === 'encode' ? ' active' : ''}`}
+            onClick={() => setShowLocTypeMenu(v => !v)}
+            title="Encode mode — choose a location type"
+          >Encode ▾ {LOCATION_TYPES.find(t => t.id === locationType)?.label ?? locationType}</button>
+
+          {showLocTypeMenu && (
+            <div className="menu-tile-dropdown">
+              <div className="menu-tile-label">Location type</div>
+              {LOCATION_TYPES.map(t => (
+                <button
+                  key={t.id}
+                  className={`menu-trace-opt${locationType === t.id ? ' active' : ''}${!t.enabled ? ' disabled' : ''}`}
+                  disabled={!t.enabled}
+                  title={t.enabled ? '' : 'Not implemented yet'}
+                  onClick={() => { setLocationType(t.id); setMode('encode'); setShowLocTypeMenu(false); }}
+                >{t.label}</button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="menu-divider" />
@@ -110,7 +132,7 @@ export default function MenuBar() {
         title="Toggle road segment layer"
       >Segments</button>
 
-      {mode !== 'encode' ? (
+      {mode !== 'encode' && (
         <>
           <button
             className={`menu-btn${showTrace ? ' active' : ''}`}
@@ -137,29 +159,6 @@ export default function MenuBar() {
             </button>
           )}
         </>
-      ) : (
-        <div className="menu-tile-wrap" ref={locTypeMenuRef}>
-          <button
-            className={`menu-btn${showLocTypeMenu ? ' active' : ''}`}
-            onClick={() => setShowLocTypeMenu(v => !v)}
-            title="Location type to encode"
-          >Location: {LOCATION_TYPES.find(t => t.id === locationType)?.label ?? locationType}</button>
-
-          {showLocTypeMenu && (
-            <div className="menu-tile-dropdown">
-              <div className="menu-tile-label">Location type</div>
-              {LOCATION_TYPES.map(t => (
-                <button
-                  key={t.id}
-                  className={`menu-trace-opt${locationType === t.id ? ' active' : ''}${!t.enabled ? ' disabled' : ''}`}
-                  disabled={!t.enabled}
-                  title={t.enabled ? '' : 'Not implemented yet'}
-                  onClick={() => { setLocationType(t.id); setShowLocTypeMenu(false); }}
-                >{t.label}</button>
-              ))}
-            </div>
-          )}
-        </div>
       )}
 
       <div className="menu-spacer" />

@@ -138,7 +138,7 @@ fn encode_then_decode_real_path_round_trips() {
         end_offset_m: 0.0,
         via_split_points: vec![],
     };
-    let loc_ref = encode_line(graph, &input, 150.0, 12).expect("encoding failed");
+    let loc_ref = encode_line(graph, &input, 150.0, 15_000.0, 12).expect("encoding failed");
     for (i, lrp) in loc_ref.lrps().unwrap().iter().enumerate() {
         eprintln!(
             "LRP{i}: coord={:?} frc={} fow={} lfrcnp={:?} dnp={:?} pos_off={:?} neg_off={:?}",
@@ -246,7 +246,7 @@ fn scan_for_edge_cases() {
             let path = sp.segments;
 
             let input = LineLocationInput { path: path.clone(), start_node, start_offset_m: 0.0, end_offset_m: 0.0, via_split_points: vec![] };
-            match encode_line(graph, &input, 180.0, 12) {
+            match encode_line(graph, &input, 180.0, 15_000.0, 12) {
                 Err(openlr_encoder::EncodeError::NoRoute) => { no_route += 1; continue; }
                 Err(e) => { other_encode_err += 1; eprintln!("OTHER ENCODE ERR seed=({start_seg_id:?},{hops}): {e}"); continue; }
                 Ok(loc_ref) => {

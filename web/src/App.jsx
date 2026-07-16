@@ -9,7 +9,6 @@ import TracePanel   from './components/TracePanel.jsx';
 import ParamsPanel  from './components/ParamsPanel.jsx';
 import LlmSettingsPanel from './components/LlmSettingsPanel.jsx';
 import LlmChatPanel     from './components/LlmChatPanel.jsx';
-import EncodePanel      from './components/EncodePanel.jsx';
 import { setPmtiles, setDecoder, setEncoder, setZoom, useStore } from './store.js';
 import DecodeToast from './components/DecodeToast.jsx';
 import { initWasm } from './wasm.js';
@@ -122,13 +121,12 @@ export default function App() {
       {/* ── Full-width replay timeline ──────────────────────────────── */}
       {showReplay && replaySteps?.length > 0 && <ReplayPanel />}
 
-      <BottomBar />
+      {mode !== 'encode' && <BottomBar />}
 
       {/* ── Modals (remain floating over everything) ─────── */}
       <ParamsPanel />
       <LlmSettingsPanel />
       <LlmChatPanel />
-      <EncodePanel />
 
       <DecodeToast />
     </div>

@@ -674,75 +674,13 @@ impl Decoder {
     /// Return full attributes + geometry for one segment by its graph segment ID.
     /// Returns `{"error": "..."}` if the segment is not in the loaded tile set.
     pub fn get_segment(&self, segment_id: u32) -> String {
-        let seg_id = SegmentId(segment_id);
-        match self.loader.graph.segments.get(&seg_id) {
-            None => serde_json::json!({
-                "error": format!("segment {} not found in loaded tiles", segment_id)
-            }).to_string(),
-            Some(seg) => {
-                let (tile, local_index) = self.loader.seg_tile.get(&seg_id)
-                    .map(|&(z, x, y, li)| (format!("{z}/{x}/{y}"), li))
-                    .unwrap_or_else(|| ("unknown".to_string(), 0));
-                serde_json::json!({
-                    "segment_id": segment_id,
-                    "stable_id":  seg.stable_id,
-                    "frc": seg.frc,
-                    "fow": seg.fow,
-                    "direction": match seg.direction {
-                        Direction::Both     => "Both",
-                        Direction::Forward  => "Forward",
-                        Direction::Backward => "Backward",
-                    },
-                    "length_m":     (seg.length_m * 10.0).round() / 10.0,
-                    "start_node":   seg.start_node.0,
-                    "end_node":     seg.end_node.0,
-                    "tile":         tile,
-                    "local_index":  local_index,
-                    "vertex_count": seg.geometry.len(),
-                    "geometry":     seg.geometry.iter().map(|&(lon, lat)| [lon, lat]).collect::<Vec<_>>(),
-                }).to_string()
-            }
-        }
+        segment_info_json(&self.loader, segment_id)
     }
 
     /// Find segments in the loaded graph whose geometry comes within `radius_m` of (lat, lon).
     /// Results are sorted by distance and capped at 20.  Caps radius at 500 m.
     pub fn get_segments_near(&self, lat: f64, lon: f64, radius_m: f64) -> String {
-        let cap = radius_m.min(500.0);
-        let mut hits: Vec<(f64, u32, u8, u8, &'static str, f64, String)> = self.loader.graph.segments.iter()
-            .filter_map(|(seg_id, seg)| {
-                let min_dist = seg.geometry.iter()
-                    .map(|&(slon, slat)| haversine_m(slon, slat, lon, lat))
-                    .fold(f64::INFINITY, f64::min);
-                if min_dist <= cap {
-                    let dir_str: &'static str = match seg.direction {
-                        Direction::Both     => "Both",
-                        Direction::Forward  => "Forward",
-                        Direction::Backward => "Backward",
-                    };
-                    Some((min_dist, seg_id.0, seg.frc, seg.fow, dir_str, seg.length_m, seg.stable_id.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let segments: Vec<serde_json::Value> = hits.iter().take(20).map(|(dist, id, frc, fow, dir, len, stable_id)| {
-            serde_json::json!({
-                "segment_id":  id,
-                "stable_id":   stable_id,
-                "frc":         frc,
-                "fow":         fow,
-                "direction":   dir,
-                "length_m":    (len * 10.0).round() / 10.0,
-                "distance_m":  (dist * 10.0).round() / 10.0,
-            })
-        }).collect();
-        serde_json::json!({
-            "query": { "lat": lat, "lon": lon, "radius_m": cap },
-            "count": segments.len(),
-            "segments": segments,
-        }).to_string()
+        segments_near_json(&self.loader, lat, lon, radius_m)
     }
 
     /// Return all segments connected at each endpoint of `segment_id`.
@@ -755,81 +693,7 @@ impl Decoder {
     /// This is direction-neutral and correct for bidirectional segments: a `Both` segment has
     /// two valid traversal directions, so each endpoint is simultaneously an entry and an exit.
     pub fn get_segment_neighbors(&self, segment_id: u32) -> String {
-        let seg_id = SegmentId(segment_id);
-        let seg = match self.loader.graph.segments.get(&seg_id) {
-            Some(s) => s,
-            None => return serde_json::json!({
-                "error": format!("Segment {segment_id} not found in loaded graph.")
-            }).to_string(),
-        };
-
-        let start_node = seg.start_node;
-        let end_node   = seg.end_node;
-
-        // Build neighbour entries for a given node id.
-        // `can_arrive`  = other's traversal can end at `node`
-        // `can_depart`  = other's traversal can begin at `node`
-        // Both are true for Direction::Both.
-        let mut build_entries = |node: NodeId| -> Vec<serde_json::Value> {
-            let mut entries = Vec::new();
-            for (&other_id, other) in &self.loader.graph.segments {
-                if other_id == seg_id { continue; }
-                let touches_node = other.start_node == node || other.end_node == node;
-                if !touches_node { continue; }
-
-                let dir_str: &'static str = match other.direction {
-                    Direction::Both     => "Both",
-                    Direction::Forward  => "Forward",
-                    Direction::Backward => "Backward",
-                };
-                // Forward/Both traversal: start_node→end_node.  Departs from start_node, arrives at end_node.
-                // Backward/Both traversal: end_node→start_node. Departs from end_node, arrives at start_node.
-                let can_arrive = (matches!(other.direction, Direction::Forward  | Direction::Both) && other.end_node   == node)
-                              || (matches!(other.direction, Direction::Backward | Direction::Both) && other.start_node == node);
-                let can_depart = (matches!(other.direction, Direction::Forward  | Direction::Both) && other.start_node == node)
-                              || (matches!(other.direction, Direction::Backward | Direction::Both) && other.end_node   == node);
-
-                // Turn restrictions in both directions through this node.
-                let restricted_into_self  = can_arrive  && self.loader.graph.is_restricted(other_id, node, seg_id);
-                let restricted_from_self  = can_depart  && self.loader.graph.is_restricted(seg_id,   node, other_id);
-
-                entries.push(serde_json::json!({
-                    "segment_id":            other_id.0,
-                    "stable_id":             other.stable_id,
-                    "frc":                   other.frc,
-                    "fow":                   other.fow,
-                    "direction":             dir_str,
-                    "length_m":              (other.length_m * 10.0).round() / 10.0,
-                    "can_arrive":            can_arrive,
-                    "can_depart":            can_depart,
-                    "restricted_into_self":  restricted_into_self,
-                    "restricted_from_self":  restricted_from_self,
-                }));
-            }
-            entries
-        };
-
-        let at_start = build_entries(start_node);
-        let at_end   = build_entries(end_node);
-
-        serde_json::json!({
-            "segment_id":  segment_id,
-            "direction":   match seg.direction {
-                Direction::Both     => "Both",
-                Direction::Forward  => "Forward",
-                Direction::Backward => "Backward",
-            },
-            "start_node": {
-                "node_id":  start_node.0,
-                "count":    at_start.len(),
-                "segments": at_start,
-            },
-            "end_node": {
-                "node_id":  end_node.0,
-                "count":    at_end.len(),
-                "segments": at_end,
-            },
-        }).to_string()
+        segment_neighbors_json(&self.loader, segment_id)
     }
 
     /// Re-run the decode with `params_override` merged over the current params.
@@ -875,6 +739,168 @@ impl Decoder {
             "params_applied": merged,
         }).to_string()
     }
+}
+
+// ── Shared graph-inspection helpers (Decoder + Encoder) ────────────────────────
+//
+// Both `Decoder` and `Encoder` wrap their own independent `TileLoader`/`Graph`,
+// but the LLM diagnostic tools need to inspect either one identically — a
+// segment, its neighbors, or nearby segments don't mean anything different
+// depending on which direction is being diagnosed. Factored out here so
+// neither impl block duplicates the logic.
+
+/// Return full attributes + geometry for one segment by its graph segment ID.
+/// Returns `{"error": "..."}` if the segment is not in the loaded tile set.
+fn segment_info_json(loader: &TileLoader, segment_id: u32) -> String {
+    let seg_id = SegmentId(segment_id);
+    match loader.graph.segments.get(&seg_id) {
+        None => serde_json::json!({
+            "error": format!("segment {} not found in loaded tiles", segment_id)
+        }).to_string(),
+        Some(seg) => {
+            let (tile, local_index) = loader.seg_tile.get(&seg_id)
+                .map(|&(z, x, y, li)| (format!("{z}/{x}/{y}"), li))
+                .unwrap_or_else(|| ("unknown".to_string(), 0));
+            serde_json::json!({
+                "segment_id": segment_id,
+                "stable_id":  seg.stable_id,
+                "frc": seg.frc,
+                "fow": seg.fow,
+                "direction": match seg.direction {
+                    Direction::Both     => "Both",
+                    Direction::Forward  => "Forward",
+                    Direction::Backward => "Backward",
+                },
+                "length_m":     (seg.length_m * 10.0).round() / 10.0,
+                "start_node":   seg.start_node.0,
+                "end_node":     seg.end_node.0,
+                "tile":         tile,
+                "local_index":  local_index,
+                "vertex_count": seg.geometry.len(),
+                "geometry":     seg.geometry.iter().map(|&(lon, lat)| [lon, lat]).collect::<Vec<_>>(),
+            }).to_string()
+        }
+    }
+}
+
+/// Find segments in the loaded graph whose geometry comes within `radius_m` of (lat, lon).
+/// Results are sorted by distance and capped at 20.  Caps radius at 500 m.
+fn segments_near_json(loader: &TileLoader, lat: f64, lon: f64, radius_m: f64) -> String {
+    let cap = radius_m.min(500.0);
+    let mut hits: Vec<(f64, u32, u8, u8, &'static str, f64, String)> = loader.graph.segments.iter()
+        .filter_map(|(seg_id, seg)| {
+            let min_dist = seg.geometry.iter()
+                .map(|&(slon, slat)| haversine_m(slon, slat, lon, lat))
+                .fold(f64::INFINITY, f64::min);
+            if min_dist <= cap {
+                let dir_str: &'static str = match seg.direction {
+                    Direction::Both     => "Both",
+                    Direction::Forward  => "Forward",
+                    Direction::Backward => "Backward",
+                };
+                Some((min_dist, seg_id.0, seg.frc, seg.fow, dir_str, seg.length_m, seg.stable_id.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let segments: Vec<serde_json::Value> = hits.iter().take(20).map(|(dist, id, frc, fow, dir, len, stable_id)| {
+        serde_json::json!({
+            "segment_id":  id,
+            "stable_id":   stable_id,
+            "frc":         frc,
+            "fow":         fow,
+            "direction":   dir,
+            "length_m":    (len * 10.0).round() / 10.0,
+            "distance_m":  (dist * 10.0).round() / 10.0,
+        })
+    }).collect();
+    serde_json::json!({
+        "query": { "lat": lat, "lon": lon, "radius_m": cap },
+        "count": segments.len(),
+        "segments": segments,
+    }).to_string()
+}
+
+/// Return all segments connected at each endpoint of `segment_id`. See
+/// `Decoder::get_segment_neighbors`'s doc comment for the field semantics.
+fn segment_neighbors_json(loader: &TileLoader, segment_id: u32) -> String {
+    let seg_id = SegmentId(segment_id);
+    let seg = match loader.graph.segments.get(&seg_id) {
+        Some(s) => s,
+        None => return serde_json::json!({
+            "error": format!("Segment {segment_id} not found in loaded graph.")
+        }).to_string(),
+    };
+
+    let start_node = seg.start_node;
+    let end_node   = seg.end_node;
+
+    // Build neighbour entries for a given node id.
+    // `can_arrive`  = other's traversal can end at `node`
+    // `can_depart`  = other's traversal can begin at `node`
+    // Both are true for Direction::Both.
+    let build_entries = |node: NodeId| -> Vec<serde_json::Value> {
+        let mut entries = Vec::new();
+        for (&other_id, other) in &loader.graph.segments {
+            if other_id == seg_id { continue; }
+            let touches_node = other.start_node == node || other.end_node == node;
+            if !touches_node { continue; }
+
+            let dir_str: &'static str = match other.direction {
+                Direction::Both     => "Both",
+                Direction::Forward  => "Forward",
+                Direction::Backward => "Backward",
+            };
+            // Forward/Both traversal: start_node→end_node.  Departs from start_node, arrives at end_node.
+            // Backward/Both traversal: end_node→start_node. Departs from end_node, arrives at start_node.
+            let can_arrive = (matches!(other.direction, Direction::Forward  | Direction::Both) && other.end_node   == node)
+                          || (matches!(other.direction, Direction::Backward | Direction::Both) && other.start_node == node);
+            let can_depart = (matches!(other.direction, Direction::Forward  | Direction::Both) && other.start_node == node)
+                          || (matches!(other.direction, Direction::Backward | Direction::Both) && other.end_node   == node);
+
+            // Turn restrictions in both directions through this node.
+            let restricted_into_self  = can_arrive  && loader.graph.is_restricted(other_id, node, seg_id);
+            let restricted_from_self  = can_depart  && loader.graph.is_restricted(seg_id,   node, other_id);
+
+            entries.push(serde_json::json!({
+                "segment_id":            other_id.0,
+                "stable_id":             other.stable_id,
+                "frc":                   other.frc,
+                "fow":                   other.fow,
+                "direction":             dir_str,
+                "length_m":              (other.length_m * 10.0).round() / 10.0,
+                "can_arrive":            can_arrive,
+                "can_depart":            can_depart,
+                "restricted_into_self":  restricted_into_self,
+                "restricted_from_self":  restricted_from_self,
+            }));
+        }
+        entries
+    };
+
+    let at_start = build_entries(start_node);
+    let at_end   = build_entries(end_node);
+
+    serde_json::json!({
+        "segment_id":  segment_id,
+        "direction":   match seg.direction {
+            Direction::Both     => "Both",
+            Direction::Forward  => "Forward",
+            Direction::Backward => "Backward",
+        },
+        "start_node": {
+            "node_id":  start_node.0,
+            "count":    at_start.len(),
+            "segments": at_start,
+        },
+        "end_node": {
+            "node_id":  end_node.0,
+            "count":    at_end.len(),
+            "segments": at_end,
+        },
+    }).to_string()
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -1105,12 +1131,16 @@ impl Decoder {
 //     if (bytes) enc.load_tile(z, x, y, new Uint8Array(bytes));
 // }
 //
-// // 2. Live preview: route between waypoints as they're edited.
-// const preview = JSON.parse(enc.route_between(JSON.stringify(waypoints), 12));
+// // 2. Live preview: route between waypoints as they're edited. Pass the
+// //    same turn-angle cap encode_line will use, so a route shown here as
+// //    connected is guaranteed not to fail encoding over turn angle.
+// const preview = JSON.parse(enc.route_between(JSON.stringify(waypoints), 150.0, 12));
 // if (preview.needs_tile) { /* load that tile too, retry */ }
 //
-// // 3. Once satisfied, encode.
-// const result = JSON.parse(enc.encode_line(JSON.stringify(waypoints), 150.0, 12));
+// // 3. Once satisfied, encode. max_leg_m (Rule-1) defaults to the
+// //    architecture's own 15km ceiling — lower it for e.g. a
+// //    memory-constrained decoder's smaller per-leg tile budget.
+// const result = JSON.parse(enc.encode_line(JSON.stringify(waypoints), 150.0, 15000.0, 12));
 // // result: { v3, tpeg } or { needs_tile: [z,x,y] } or { error }
 // ```
 
@@ -1171,14 +1201,35 @@ struct EncodeOutResult {
     needs_tile: Option<[u32; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Set only when `error` is a specific waypoint-to-waypoint connection
+    /// failure — feed straight into `Encoder::diagnose_connection` to find
+    /// out whether it's genuine disconnection or the turn-angle gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_from_node: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_to_node: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_from_segment_id: Option<u32>,
 }
 
 impl EncodeOutResult {
     fn err(msg: impl Into<String>) -> Self {
-        EncodeOutResult { v3: None, tpeg: None, needs_tile: None, error: Some(msg.into()) }
+        EncodeOutResult {
+            v3: None, tpeg: None, needs_tile: None, error: Some(msg.into()),
+            error_from_node: None, error_to_node: None, error_from_segment_id: None,
+        }
+    }
+    fn err_route(f: RouteFailure) -> Self {
+        EncodeOutResult {
+            v3: None, tpeg: None, needs_tile: None, error: Some(f.message),
+            error_from_node: f.from_node, error_to_node: f.to_node, error_from_segment_id: f.from_segment_id,
+        }
     }
     fn needs_tile(tk: TileKey) -> Self {
-        EncodeOutResult { v3: None, tpeg: None, needs_tile: Some([tk.z as u32, tk.x, tk.y]), error: None }
+        EncodeOutResult {
+            v3: None, tpeg: None, needs_tile: Some([tk.z as u32, tk.x, tk.y]), error: None,
+            error_from_node: None, error_to_node: None, error_from_segment_id: None,
+        }
     }
 }
 
@@ -1201,14 +1252,33 @@ struct RoutePreviewResult {
     needs_tile: Option<[u32; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// See `EncodeOutResult`'s fields of the same name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_from_node: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_to_node: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_from_segment_id: Option<u32>,
 }
 
 impl RoutePreviewResult {
     fn err(msg: impl Into<String>) -> Self {
-        RoutePreviewResult { segments: None, geometry: None, length_m: None, snapped: None, needs_tile: None, error: Some(msg.into()) }
+        RoutePreviewResult {
+            segments: None, geometry: None, length_m: None, snapped: None, needs_tile: None, error: Some(msg.into()),
+            error_from_node: None, error_to_node: None, error_from_segment_id: None,
+        }
+    }
+    fn err_route(f: RouteFailure) -> Self {
+        RoutePreviewResult {
+            segments: None, geometry: None, length_m: None, snapped: None, needs_tile: None, error: Some(f.message),
+            error_from_node: f.from_node, error_to_node: f.to_node, error_from_segment_id: f.from_segment_id,
+        }
     }
     fn needs_tile(tk: TileKey) -> Self {
-        RoutePreviewResult { segments: None, geometry: None, length_m: None, snapped: None, needs_tile: Some([tk.z as u32, tk.x, tk.y]), error: None }
+        RoutePreviewResult {
+            segments: None, geometry: None, length_m: None, snapped: None, needs_tile: Some([tk.z as u32, tk.x, tk.y]), error: None,
+            error_from_node: None, error_to_node: None, error_from_segment_id: None,
+        }
     }
 }
 
@@ -1323,6 +1393,7 @@ fn resolve_boundary_leg(
     graph: &Graph,
     candidates: &[BoundaryCandidate],
     target: NodeId,
+    max_turn_deviation_deg: f64,
     zoom: u8,
 ) -> Result<(usize, PathResult), RouteOutcome> {
     let mut best: Option<(usize, PathResult, f64)> = None;
@@ -1330,7 +1401,7 @@ fn resolve_boundary_leg(
         let (result, extra_len) = if c.continuation == target {
             (PathResult { segments: vec![], length_m: 0.0 }, 0.0)
         } else {
-            match shortest_path(graph, c.continuation, c.bias_seg(), target, 7, 180.0, 0, zoom) {
+            match shortest_path(graph, c.continuation, c.bias_seg(), target, 7, max_turn_deviation_deg, 0, zoom) {
                 PathOutcome::Found(r) => { let l = r.length_m; (r, l) }
                 PathOutcome::NeedsTile(tk) => return Err(RouteOutcome::NeedsTile(tk)),
                 PathOutcome::NoPath => continue,
@@ -1342,7 +1413,7 @@ fn resolve_boundary_leg(
         }
     }
     best.map(|(idx, r, _)| (idx, r))
-        .ok_or_else(|| RouteOutcome::Error("no route found for a boundary waypoint".to_string()))
+        .ok_or_else(|| RouteOutcome::Error(RouteFailure::plain("no route found for a boundary waypoint")))
 }
 
 /// Mirror of `resolve_boundary_leg` for the *last* boundary: the fixed node
@@ -1353,6 +1424,7 @@ fn resolve_boundary_leg_from(
     source: NodeId,
     source_bias_seg: SegmentId,
     candidates: &[BoundaryCandidate],
+    max_turn_deviation_deg: f64,
     zoom: u8,
 ) -> Result<(usize, PathResult), RouteOutcome> {
     let mut best: Option<(usize, PathResult, f64)> = None;
@@ -1360,7 +1432,7 @@ fn resolve_boundary_leg_from(
         let (result, extra_len) = if source == c.continuation {
             (PathResult { segments: vec![], length_m: 0.0 }, 0.0)
         } else {
-            match shortest_path(graph, source, source_bias_seg, c.continuation, 7, 180.0, 0, zoom) {
+            match shortest_path(graph, source, source_bias_seg, c.continuation, 7, max_turn_deviation_deg, 0, zoom) {
                 PathOutcome::Found(r) => { let l = r.length_m; (r, l) }
                 PathOutcome::NeedsTile(tk) => return Err(RouteOutcome::NeedsTile(tk)),
                 PathOutcome::NoPath => continue,
@@ -1372,7 +1444,7 @@ fn resolve_boundary_leg_from(
         }
     }
     best.map(|(idx, r, _)| (idx, r))
-        .ok_or_else(|| RouteOutcome::Error("no route found for a boundary waypoint".to_string()))
+        .ok_or_else(|| RouteOutcome::Error(RouteFailure::plain("no route found for a boundary waypoint")))
 }
 
 /// Snap `(lon, lat)` onto the road network per `hint` — see `SnapHint`. Used
@@ -1383,10 +1455,15 @@ fn resolve_boundary_leg_from(
 fn snap_point(graph: &Graph, lon: f64, lat: f64, hint: SnapHint) -> Option<SnappedWaypoint> {
     if let SnapHint::Node(node_id) = hint {
         if graph.nodes.contains_key(&node_id) {
-            // Any touching segment works — it's never read back out except by
-            // PAL, which is fine with an arbitrary-but-valid anchor line when
-            // the user explicitly chose the junction itself, not a road.
-            let seg_id = graph.topology_neighbors(node_id).first().map(|(_, s)| *s)?;
+            // Must be departable *from* this node in its permitted direction —
+            // PAL reads this segment back out directly as its own line, with
+            // no coverage-sweep/A* step afterward to reject an illegal
+            // direction the way routing would. `topology_neighbors` ignores
+            // `Direction` entirely (right for Rule-4's structural walk, wrong
+            // here): picking an arbitrary touching segment could anchor PAL
+            // on a one-way road in the prohibited direction, producing a
+            // reference no decoder could ever route.
+            let seg_id = graph.outgoing_segments(node_id).first().copied()?;
             return Some(SnappedWaypoint { seg_id, node: node_id, offset_m: 0.0 });
         }
         // Hinted node no longer loaded — fall through to nearest-segment search.
@@ -1402,10 +1479,22 @@ fn snap_point(graph: &Graph, lon: f64, lat: f64, hint: SnapHint) -> Option<Snapp
     let seg = graph.segments.get(&seg_id)?;
     let proj = project_onto_polyline(lon, lat, &seg.geometry)?;
     let total = seg.length_m;
-    if proj.arc_offset_m <= total - proj.arc_offset_m {
-        Some(SnappedWaypoint { seg_id, node: seg.start_node, offset_m: proj.arc_offset_m })
-    } else {
-        Some(SnappedWaypoint { seg_id, node: seg.end_node, offset_m: total - proj.arc_offset_m })
+    // Nearest-endpoint is only a free choice on a `Both`-direction segment.
+    // A one-way segment can only be *anchored* at the end its direction
+    // permits departing from — PAL reads this straight back out as its own
+    // line with no coverage-sweep/A* step to reject the wrong choice
+    // afterward (same root cause as the node-hint fix above, different
+    // path: picking the geometrically nearer endpoint regardless of
+    // direction could anchor PAL on the end that requires travelling the
+    // prohibited way).
+    match seg.direction {
+        Direction::Forward  => Some(SnappedWaypoint { seg_id, node: seg.start_node, offset_m: proj.arc_offset_m }),
+        Direction::Backward => Some(SnappedWaypoint { seg_id, node: seg.end_node, offset_m: total - proj.arc_offset_m }),
+        Direction::Both => if proj.arc_offset_m <= total - proj.arc_offset_m {
+            Some(SnappedWaypoint { seg_id, node: seg.start_node, offset_m: proj.arc_offset_m })
+        } else {
+            Some(SnappedWaypoint { seg_id, node: seg.end_node, offset_m: total - proj.arc_offset_m })
+        },
     }
 }
 
@@ -1425,7 +1514,33 @@ enum RouteOutcome {
         snapped_coords: Vec<(f64, f64)>,
     },
     NeedsTile(TileKey),
-    Error(String),
+    Error(RouteFailure),
+}
+
+/// A `route_waypoints` failure, with structured leg context when the failure
+/// is a specific waypoint-to-waypoint connection (as opposed to e.g. "no road
+/// near this waypoint at all", which has no leg to report). When present,
+/// `from_node`/`to_node`/`from_segment_id` can be fed directly into
+/// `Encoder::diagnose_connection` without the caller having to look them up.
+struct RouteFailure {
+    message: String,
+    from_node: Option<u32>,
+    to_node: Option<u32>,
+    from_segment_id: Option<u32>,
+}
+
+impl RouteFailure {
+    fn plain(msg: impl Into<String>) -> Self {
+        RouteFailure { message: msg.into(), from_node: None, to_node: None, from_segment_id: None }
+    }
+    fn leg(msg: impl Into<String>, from_node: NodeId, from_seg: SegmentId, to_node: NodeId) -> Self {
+        RouteFailure {
+            message: msg.into(),
+            from_node: Some(from_node.0),
+            to_node: Some(to_node.0),
+            from_segment_id: if from_seg == NO_PRIOR_SEG { None } else { Some(from_seg.0) },
+        }
+    }
 }
 
 /// Snap every waypoint, then chain `shortest_path` leg-by-leg between
@@ -1443,23 +1558,31 @@ enum RouteOutcome {
 /// against, and the decoder reconstructs a bogus start/end point. Interior
 /// waypoints don't have this problem — the Line format has no offset field
 /// on interior LRPs, so nearest-endpoint snapping loses nothing extra.
-fn route_waypoints(graph: &Graph, waypoints: &[WaypointIn], zoom: u8) -> RouteOutcome {
+///
+/// `max_turn_deviation_deg` is the same cap `encode_line`'s `sweep_coverage`
+/// step will enforce (see its own doc comment). Passing the real value here
+/// — rather than a permissive `180.0` — means any path this preview finds is
+/// already turn-angle-compliant, so `sweep_coverage`'s independent
+/// re-derivation of that same path can't diverge over a turn this search
+/// was allowed to take but that one wasn't: a route the preview shows as
+/// connected is then guaranteed not to fail encoding for that reason.
+fn route_waypoints(graph: &Graph, waypoints: &[WaypointIn], max_turn_deviation_deg: f64, zoom: u8) -> RouteOutcome {
     if waypoints.len() < 2 {
-        return RouteOutcome::Error("need at least 2 waypoints".to_string());
+        return RouteOutcome::Error(RouteFailure::plain("need at least 2 waypoints"));
     }
 
     let first_candidates = match boundary_candidates(graph, &waypoints[0]) {
         Some(c) => c,
-        None => return RouteOutcome::Error(format!(
+        None => return RouteOutcome::Error(RouteFailure::plain(format!(
             "no road found within {WAYPOINT_SNAP_RADIUS_M}m of waypoint 0 — load more tiles or move it closer to a road"
-        )),
+        ))),
     };
     let last_idx = waypoints.len() - 1;
     let last_candidates = match boundary_candidates(graph, &waypoints[last_idx]) {
         Some(c) => c,
-        None => return RouteOutcome::Error(format!(
+        None => return RouteOutcome::Error(RouteFailure::plain(format!(
             "no road found within {WAYPOINT_SNAP_RADIUS_M}m of waypoint {last_idx} — load more tiles or move it closer to a road"
-        )),
+        ))),
     };
 
     if waypoints.len() == 2 {
@@ -1472,7 +1595,7 @@ fn route_waypoints(graph: &Graph, waypoints: &[WaypointIn], zoom: u8) -> RouteOu
                 let (result, extra_len) = if fc.continuation == lc.continuation {
                     (PathResult { segments: vec![], length_m: 0.0 }, 0.0)
                 } else {
-                    match shortest_path(graph, fc.continuation, fc.bias_seg(), lc.continuation, 7, 180.0, 0, zoom) {
+                    match shortest_path(graph, fc.continuation, fc.bias_seg(), lc.continuation, 7, max_turn_deviation_deg, 0, zoom) {
                         PathOutcome::Found(r) => { let l = r.length_m; (r, l) }
                         PathOutcome::NeedsTile(tk) => return RouteOutcome::NeedsTile(tk),
                         PathOutcome::NoPath => continue,
@@ -1486,7 +1609,7 @@ fn route_waypoints(graph: &Graph, waypoints: &[WaypointIn], zoom: u8) -> RouteOu
         }
         let (fi, li, core, total) = match best {
             Some(b) => b,
-            None => return RouteOutcome::Error("no route found between waypoint 0 and 1".to_string()),
+            None => return RouteOutcome::Error(RouteFailure::plain("no route found between waypoint 0 and 1")),
         };
         let fc = &first_candidates[fi];
         let lc = &last_candidates[li];
@@ -1519,13 +1642,13 @@ fn route_waypoints(graph: &Graph, waypoints: &[WaypointIn], zoom: u8) -> RouteOu
     for (i, w) in waypoints[1..last_idx].iter().enumerate() {
         match snap_point(graph, w.lon, w.lat, w.snap_hint()) {
             Some(s) => mid_nodes.push(s.node),
-            None => return RouteOutcome::Error(format!(
+            None => return RouteOutcome::Error(RouteFailure::plain(format!(
                 "no road found within {WAYPOINT_SNAP_RADIUS_M}m of waypoint {} — load more tiles or move it closer to a road", i + 1
-            )),
+            ))),
         }
     }
 
-    let (fi, first_leg) = match resolve_boundary_leg(graph, &first_candidates, mid_nodes[0], zoom) {
+    let (fi, first_leg) = match resolve_boundary_leg(graph, &first_candidates, mid_nodes[0], max_turn_deviation_deg, zoom) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1549,22 +1672,23 @@ fn route_waypoints(graph: &Graph, waypoints: &[WaypointIn], zoom: u8) -> RouteOu
     // one of these ends at another interior waypoint, so each gets a split
     // point too.
     for i in 0..mid_nodes.len() - 1 {
-        match shortest_path(graph, mid_nodes[i], current_seg, mid_nodes[i + 1], 7, 180.0, 0, zoom) {
+        match shortest_path(graph, mid_nodes[i], current_seg, mid_nodes[i + 1], 7, max_turn_deviation_deg, 0, zoom) {
             PathOutcome::Found(r) => {
                 length_m += r.length_m;
                 if let Some(&last) = r.segments.last() { current_seg = last; }
                 full_path.extend(r.segments);
                 via_split_points.push(full_path.len());
             }
-            PathOutcome::NoPath => return RouteOutcome::Error(format!(
-                "no route found between waypoint {} and {}", i + 1, i + 2
+            PathOutcome::NoPath => return RouteOutcome::Error(RouteFailure::leg(
+                format!("no route found between waypoint {} and {}", i + 1, i + 2),
+                mid_nodes[i], current_seg, mid_nodes[i + 1],
             )),
             PathOutcome::NeedsTile(tk) => return RouteOutcome::NeedsTile(tk),
         }
     }
 
     let last_mid = *mid_nodes.last().unwrap();
-    let (li, last_leg) = match resolve_boundary_leg_from(graph, last_mid, current_seg, &last_candidates, zoom) {
+    let (li, last_leg) = match resolve_boundary_leg_from(graph, last_mid, current_seg, &last_candidates, max_turn_deviation_deg, zoom) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1633,16 +1757,22 @@ impl Encoder {
     /// between consecutive points. `waypoints_json`:
     /// `[{"lon":...,"lat":...,"segment_id":optional}, ...]`.
     ///
+    /// `max_turn_deviation_deg` should be the same value passed to
+    /// `encode_line`/`params.max_interior_turn_deviation_deg` — using the real
+    /// cap here (not a permissive one) means a route this preview shows as
+    /// connected is guaranteed not to then fail encoding over a turn this
+    /// search allowed but the encoder's own turn-angle check wouldn't have.
+    ///
     /// Returns `{ "segments": [...], "geometry": [[lon,lat],...], "snapped": [[lon,lat],...], "length_m": ... }`
     /// on success, `{ "needs_tile": [z,x,y] }` if the search needs an unloaded
     /// tile (load it and retry), or `{ "error": "..." }`.
-    pub fn route_between(&self, waypoints_json: &str, zoom: u8) -> String {
+    pub fn route_between(&self, waypoints_json: &str, max_turn_deviation_deg: f64, zoom: u8) -> String {
         let waypoints: Vec<WaypointIn> = match serde_json::from_str(waypoints_json) {
             Ok(w) => w,
             Err(e) => return serde_json::to_string(&RoutePreviewResult::err(format!("invalid waypoints: {e}"))).unwrap(),
         };
-        let result = match route_waypoints(&self.loader.graph, &waypoints, zoom) {
-            RouteOutcome::Error(msg) => RoutePreviewResult::err(msg),
+        let result = match route_waypoints(&self.loader.graph, &waypoints, max_turn_deviation_deg, zoom) {
+            RouteOutcome::Error(f) => RoutePreviewResult::err_route(f),
             RouteOutcome::NeedsTile(tk) => RoutePreviewResult::needs_tile(tk),
             RouteOutcome::Found { path, start_node, length_m, snapped_coords, .. } => {
                 // Each segment's geometry is stored start_node→end_node regardless
@@ -1668,6 +1798,7 @@ impl Encoder {
                     snapped: Some(snapped_coords.into_iter().map(|(lon, lat)| [lon, lat]).collect()),
                     needs_tile: None,
                     error: None,
+                    error_from_node: None, error_to_node: None, error_from_segment_id: None,
                 }
             }
         };
@@ -1761,22 +1892,29 @@ impl Encoder {
     /// dead end) is rejected as `NoRoute` rather than silently encoded as a
     /// reference no real navigation system could reproduce sensibly.
     ///
+    /// `max_leg_m` is an encoder-only Rule-1 policy knob (see
+    /// `openlr_encoder::line::encode_line`'s doc comment) — nothing on the
+    /// decode side needs to agree on it beyond reading the resulting v3/TPEG
+    /// bytes, so a caller wanting a smaller per-leg tile footprint (e.g. a
+    /// memory-constrained head unit) can lower it independent of any other
+    /// parameter. Clamped to the architecture's own 15km ceiling.
+    ///
     /// Returns `{ "v3": "...", "tpeg": "..." }`, `{ "needs_tile": [z,x,y] }`,
     /// or `{ "error": "..." }`.
-    pub fn encode_line(&self, waypoints_json: &str, max_turn_deviation_deg: f64, zoom: u8) -> String {
+    pub fn encode_line(&self, waypoints_json: &str, max_turn_deviation_deg: f64, max_leg_m: f64, zoom: u8) -> String {
         let waypoints: Vec<WaypointIn> = match serde_json::from_str(waypoints_json) {
             Ok(w) => w,
             Err(e) => return serde_json::to_string(&EncodeOutResult::err(format!("invalid waypoints: {e}"))).unwrap(),
         };
-        let (path, start_node, start_offset_m, end_offset_m, via_split_points) = match route_waypoints(&self.loader.graph, &waypoints, zoom) {
-            RouteOutcome::Error(msg) => return serde_json::to_string(&EncodeOutResult::err(msg)).unwrap(),
+        let (path, start_node, start_offset_m, end_offset_m, via_split_points) = match route_waypoints(&self.loader.graph, &waypoints, max_turn_deviation_deg, zoom) {
+            RouteOutcome::Error(f) => return serde_json::to_string(&EncodeOutResult::err_route(f)).unwrap(),
             RouteOutcome::NeedsTile(tk) => return serde_json::to_string(&EncodeOutResult::needs_tile(tk)).unwrap(),
             RouteOutcome::Found { path, start_node, start_offset_m, end_offset_m, via_split_points, .. } =>
                 (path, start_node, start_offset_m, end_offset_m, via_split_points),
         };
 
         let input = LineLocationInput { path, start_node, start_offset_m, end_offset_m, via_split_points };
-        let loc_ref = match enc_line(&self.loader.graph, &input, max_turn_deviation_deg, zoom) {
+        let loc_ref = match enc_line(&self.loader.graph, &input, max_turn_deviation_deg, max_leg_m, zoom) {
             Ok(r) => r,
             Err(openlr_encoder::EncodeError::NeedsTile(tk)) => return serde_json::to_string(&EncodeOutResult::needs_tile(tk)).unwrap(),
             Err(e) => return serde_json::to_string(&EncodeOutResult::err(e.to_string())).unwrap(),
@@ -1790,8 +1928,12 @@ impl Encoder {
     /// (`node_id` wins if both are set). `orientation`/`side_of_road`: same
     /// string values `Decoder`'s `JsDecodeResult` uses ("NoOrientation" |
     /// "FirstTowardSecond" | "SecondTowardFirst" | "BothDirections";
-    /// "DirectlyOnOrNA" | "Right" | "Left" | "Both").
-    pub fn encode_pal(&self, lon: f64, lat: f64, segment_id: Option<u32>, node_id: Option<u32>, orientation: &str, side_of_road: &str) -> String {
+    /// "DirectlyOnOrNA" | "Right" | "Left" | "Both"). `max_turn_deviation_deg`
+    /// is the same cap `encode_line` uses — PAL's own boundary expansion
+    /// needs it too (see `expansion::expand_to_valid_node`'s doc comment).
+    /// `max_leg_m` is the same encoder-only Rule-1 policy knob `encode_line`
+    /// takes — see its doc comment.
+    pub fn encode_pal(&self, lon: f64, lat: f64, segment_id: Option<u32>, node_id: Option<u32>, orientation: &str, side_of_road: &str, max_turn_deviation_deg: f64, max_leg_m: f64) -> String {
         let hint = match node_id {
             Some(id) => SnapHint::Node(NodeId(id)),
             None => match segment_id {
@@ -1824,11 +1966,98 @@ impl Encoder {
             orientation,
             side_of_road,
         };
-        let loc_ref = match enc_pal(&self.loader.graph, &input) {
+        let loc_ref = match enc_pal(&self.loader.graph, &input, max_turn_deviation_deg, max_leg_m) {
             Ok(r) => r,
             Err(e) => return serde_json::to_string(&EncodeOutResult::err(e.to_string())).unwrap(),
         };
         serialize_encoded(&loc_ref)
+    }
+
+    // ── LLM diagnostic tool methods ───────────────────────────────────────────
+    //
+    // Mirror of `Decoder`'s diagnostic methods (same underlying graph
+    // inspection, same JSON shapes — see the shared free functions above),
+    // plus encode-specific ones for probing routing failures that have no
+    // decode-side analogue: waypoint-connection A* and Rule-4 boundary
+    // expansion. None of these run during a normal encode — they're called
+    // on demand, after `route_between`/`encode_line`/`encode_pal` already
+    // reported a failure, to turn an opaque error string into a precise
+    // structured answer.
+
+    /// See `Decoder::get_segment`.
+    pub fn get_segment(&self, segment_id: u32) -> String {
+        segment_info_json(&self.loader, segment_id)
+    }
+
+    /// See `Decoder::get_segments_near`.
+    pub fn get_segments_near(&self, lat: f64, lon: f64, radius_m: f64) -> String {
+        segments_near_json(&self.loader, lat, lon, radius_m)
+    }
+
+    /// See `Decoder::get_segment_neighbors`.
+    pub fn get_segment_neighbors(&self, segment_id: u32) -> String {
+        segment_neighbors_json(&self.loader, segment_id)
+    }
+
+    /// Diagnose why `from_node`/`to_node` didn't connect under
+    /// `max_turn_deviation_deg` (the same cap `route_between`/`encode_line`/
+    /// `encode_pal` use). Re-runs the search once with that cap and once
+    /// fully unrestricted (180°) to distinguish genuine disconnection/wrong-
+    /// direction from being blocked specifically by the turn-angle gate —
+    /// and when it's the latter, pinpoints exactly which node the turn
+    /// exceeds the cap at, so there's no need to walk the path by hand.
+    ///
+    /// `from_node`/`to_node`/`from_segment_id` come straight off a prior
+    /// `route_between`/`encode_line` failure's `error_from_node`/
+    /// `error_to_node`/`error_from_segment_id` fields (when present — only
+    /// waypoint-to-waypoint connection failures carry them; pass
+    /// `from_segment_id: None` if the failure didn't).
+    ///
+    /// Returns a `ConnectionDiagnosis` as JSON — see that struct's doc
+    /// comment in `openlr_encoder::diagnose` for field semantics.
+    pub fn diagnose_connection(&self, from_node: u32, to_node: u32, from_segment_id: Option<u32>, max_turn_deviation_deg: f64, zoom: u8) -> String {
+        let from_seg = from_segment_id.map(SegmentId).unwrap_or(NO_PRIOR_SEG);
+        let diag = openlr_encoder::diagnose::diagnose_connection(
+            &self.loader.graph, NodeId(from_node), from_seg, NodeId(to_node), max_turn_deviation_deg, zoom,
+        );
+        serde_json::to_string(&diag).unwrap()
+    }
+
+    /// Inspect Rule-4 boundary expansion from `node_id` outward along
+    /// `segment_id` — the exact walk `encode_line`/`encode_pal` perform
+    /// internally when a location's start or end node is invalid (a
+    /// pass-through, not a real junction or dead end). Use to see how far
+    /// expansion actually travelled and why it stopped: already valid,
+    /// reached a valid node, ran off the edge of the loaded graph, hit
+    /// `max_leg_m`, or was blocked by a turn sharper than
+    /// `max_turn_deviation_deg`.
+    ///
+    /// `segment_id` must be the segment leading *away* from the location
+    /// (the direction expansion walks), matching `expand_to_valid_node`'s
+    /// `skip_seg` parameter.
+    pub fn check_boundary_expansion(&self, node_id: u32, segment_id: u32, max_leg_m: f64, max_turn_deviation_deg: f64) -> String {
+        let exp = openlr_encoder::expansion::expand_to_valid_node(
+            &self.loader.graph, NodeId(node_id), SegmentId(segment_id), max_leg_m, max_turn_deviation_deg,
+        );
+        serde_json::json!({
+            "node": exp.node.0,
+            "distance_m": (exp.distance_m * 10.0).round() / 10.0,
+            "hops": exp.segments.len(),
+            "segments": exp.segments.iter().map(|s| s.0).collect::<Vec<_>>(),
+            "stopped": exp.stopped,
+            "still_invalid": !self.loader.graph.is_valid_node(exp.node),
+        }).to_string()
+    }
+
+    /// Turn-angle deviation (degrees) when transitioning from `segment_a` to
+    /// `segment_b` through `node_id` — the same geometric check
+    /// `route_between`/`encode_line`'s coverage sweep and Rule-4 boundary
+    /// expansion use internally against `max_turn_deviation_deg`. Returns
+    /// `{"deviation_deg": null}` if either segment doesn't actually touch
+    /// `node_id` with usable geometry (e.g. too few vertices).
+    pub fn get_turn_deviation(&self, segment_a: u32, node_id: u32, segment_b: u32) -> String {
+        let dev = self.loader.graph.turn_deviation_deg(SegmentId(segment_a), NodeId(node_id), SegmentId(segment_b));
+        serde_json::json!({ "deviation_deg": dev }).to_string()
     }
 }
 
@@ -1845,7 +2074,10 @@ fn serialize_encoded(loc_ref: &LocationReference) -> String {
         Ok(s) => s,
         Err(e) => return serde_json::to_string(&EncodeOutResult::err(format!("tpeg encode failed: {e}"))).unwrap(),
     };
-    serde_json::to_string(&EncodeOutResult { v3: Some(v3), tpeg: Some(tpeg), needs_tile: None, error: None }).unwrap()
+    serde_json::to_string(&EncodeOutResult {
+        v3: Some(v3), tpeg: Some(tpeg), needs_tile: None, error: None,
+        error_from_node: None, error_to_node: None, error_from_segment_id: None,
+    }).unwrap()
 }
 
 // ── Segment source-key helper ─────────────────────────────────────────────────

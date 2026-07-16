@@ -95,6 +95,11 @@ const PARAM_DOCS = {
     increase: 'Tolerates sharper turns along the route, up to and including near-U-turns at 180°. Needed for legitimate tight maneuvers (cul-de-sacs, service-road loops, some diamond interchange ramps) that this gate would otherwise block. Set to 180 to fully disable.',
     decrease: 'Rejects implausibly sharp turns (e.g. a route that doubles back on itself at a roundabout exit due to a missing OSM turn restriction). Risk: may block a legitimate route that genuinely requires a tight turn.',
   },
+  max_leg_m: {
+    what: 'Encoder-only: Rule-1 cap on the distance between consecutive LRPs. Not part of the OpenLR wire format itself — it only controls how the encoder chooses to split a location into legs. Clamped to the architecture\'s 15 km ceiling.',
+    increase: 'Fewer intermediate LRPs for long routes. Rarely needed above the 15 km default.',
+    decrease: 'Forces more frequent intermediate LRPs, keeping each leg small enough for a constrained decoder tile budget (e.g. a memory-limited head unit).',
+  },
 };
 
 // ── Field definitions ─────────────────────────────────────────────────────────
@@ -119,6 +124,13 @@ const SCALAR_FIELDS = [
   { key: 'lfrcnp_tolerance',             label: 'LFRCNP tolerance',        unit: 'steps', step: 1,     min: 0,     max: 7,     int: true },
   { key: 'max_interior_turn_deviation_deg', label: 'Max turn deviation',   unit: '°',     step: 5,     min: 0,     max: 180    },
 ];
+
+// Fields whose value lives outside `params` (their own store slice, own
+// setter) — not part of SCALAR_FIELDS' generic params[key]/setParam loop,
+// but still documented/titled the same way via ParamDocPopout.
+const EXTRA_FIELDS = {
+  max_leg_m: { label: 'Max inter-LRP dist.', unit: 'm' },
+};
 
 const FRC_LABELS = ['FRC0', 'FRC1', 'FRC2', 'FRC3', 'FRC4', 'FRC5', 'FRC6', 'FRC7'];
 const FOW_LABELS = ['Undef', 'Mway', 'MultiC', 'SingleC', 'Roundbt', 'TrafSq', 'Slip', 'Other'];
@@ -214,7 +226,7 @@ function ParamDocPopout({ docKey, pos, onClose }) {
 
   if (!docKey || !doc) return null;
 
-  const field = SCALAR_FIELDS.find(f => f.key === docKey);
+  const field = SCALAR_FIELDS.find(f => f.key === docKey) ?? EXTRA_FIELDS[docKey];
   const title = field ? `${field.label}${field.unit ? ` (${field.unit})` : ''}` : docKey;
 
   const style = {
@@ -289,7 +301,7 @@ export default function ParamsPanel() {
   const {
     params, showParams, setParam, toggleParams,
     loadPreset, saveParamSet, deleteParamSet, loadParamSet, savedParamSets,
-    resetToDefaults,
+    resetToDefaults, maxEncodeLegM, setMaxEncodeLegM,
   } = useStore();
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activeDoc, setActiveDoc] = useState(null);
@@ -397,6 +409,26 @@ export default function ParamsPanel() {
               />
             </label>
           ))}
+
+          <label className="param-row">
+            <span className="param-label-group">
+              <span className="param-label">Max inter-LRP dist.<em> m</em></span>
+              <button
+                type="button"
+                className={`param-doc-btn${activeDoc === 'max_leg_m' ? ' active' : ''}`}
+                onClick={e => { e.preventDefault(); openDoc('max_leg_m', e); }}
+                title="What does this parameter do?"
+              >?</button>
+            </span>
+            <SpinInput
+              value={maxEncodeLegM}
+              step={100}
+              min={1}
+              max={15000}
+              isInt={true}
+              onChange={setMaxEncodeLegM}
+            />
+          </label>
         </div>
 
         <button className="advanced-toggle" onClick={() => setShowAdvanced(s => !s)}>
