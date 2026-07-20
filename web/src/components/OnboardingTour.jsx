@@ -1,6 +1,12 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { useStore } from '../store.js';
-import { TOUR_SAMPLE_DECODE_RESULT, TOUR_SAMPLE_OPENLR_STRING } from '../tourSampleData.js';
+import { useStore, getSegGeomCache } from '../store.js';
+import { buildReplaySteps } from '../replayEngine.js';
+import { TOUR_SAMPLE_DECODE_RESULT, TOUR_SAMPLE_OPENLR_STRING, TOUR_SAMPLE_TRACE, tourSampleGeomEntries } from '../tourSampleData.js';
+
+// Cadence for the live A* replay demo (`replayDemo` step) -- one node
+// expansion revealed per tick, looping through just the A* portion of the
+// sample trace (RouteSearchStarted..RouteFound) rather than the whole decode.
+const REPLAY_DEMO_TICK_MS = 700;
 
 // Content only -- which live DOM region(s) each step points at (matched via
 // data-tour attributes added in MenuBar.jsx, or existing stable classNames
@@ -42,7 +48,13 @@ const STEPS = [
   {
     target: '[data-tour-solo="replay-btn"]',
     title: 'Replay: watch it happen',
-    body: 'The standout feature — step through every phase of a decode (or an encode\'s verify) one at a time: candidate search, A* routing, offset trimming, all animated live on the map exactly as the engine experienced it. Step forward, back, or auto-play the whole sequence.',
+    body: 'The standout feature — step through every phase of a decode (or an encode\'s verify) one at a time: candidate search, A* routing, offset trimming, all animated live on the map exactly as the engine experienced it. Step forward, back, or scrub the timeline directly.',
+  },
+  {
+    target: '.map-area, .replay-panel',
+    title: 'A* routing, live',
+    body: 'A live slice of a real decode\'s A* search, playing automatically: the router expands the road graph node by node — g = distance travelled so far, h = straight-line estimate to the target — honoring one-way streets and turn restrictions until it finds the shortest legal path.',
+    ensure: 'replayDemo',
   },
   {
     target: '.params-panel',
@@ -171,6 +183,46 @@ export default function OnboardingTour() {
     if (step.ensure === 'tileSourceMenu') {
       openTileSourceMenu();
       return () => closeTileSourceMenu();
+    }
+    if (step.ensure === 'replayDemo') {
+      // Seed the real segment-geometry cache with the sample segments' own
+      // geometry (keyed by their real segment_id, matching the trace's own
+      // references) so Map.jsx's existing, tile-agnostic replay-visualization
+      // pipeline can render this off static data -- snapshot whatever was
+      // there first (almost certainly nothing, but a real segment_id
+      // collision with the loaded tileset is possible) so it can be restored
+      // rather than permanently overwritten.
+      const cache = getSegGeomCache();
+      const geomEntries = tourSampleGeomEntries();
+      const priorGeom = geomEntries.map(([id]) => [id, cache.get(id)]);
+      geomEntries.forEach(([id, feat]) => cache.set(id, feat));
+
+      const { steps, stats } = buildReplaySteps(TOUR_SAMPLE_TRACE.events);
+      const loSlice = Math.max(0, steps.findIndex(s => s.type === 'route_search_started'));
+      const hiFound = steps.findIndex(s => s.type === 'route_found');
+      const hiSlice = hiFound >= 0 ? hiFound : steps.length - 1;
+
+      const priorReplay = {
+        replaySteps: useStore.getState().replaySteps,
+        replayStats: useStore.getState().replayStats,
+        replayStep:  useStore.getState().replayStep,
+        showReplay:  useStore.getState().showReplay,
+      };
+      useStore.setState({ replaySteps: steps, replayStats: stats, replayStep: loSlice, showReplay: true });
+
+      let cur = loSlice;
+      const timer = setInterval(() => {
+        cur = cur >= hiSlice ? loSlice : cur + 1;
+        useStore.setState({ replayStep: cur });
+      }, REPLAY_DEMO_TICK_MS);
+
+      return () => {
+        clearInterval(timer);
+        useStore.setState(priorReplay);
+        priorGeom.forEach(([id, feat]) => {
+          if (feat === undefined) cache.delete(id); else cache.set(id, feat);
+        });
+      };
     }
   }, [tourStep]); // eslint-disable-line react-hooks/exhaustive-deps
 
