@@ -28,14 +28,14 @@ const STEPS = [
   {
     target: '.side-panel-left',
     title: 'Results panel',
-    body: 'The at-a-glance answer: what the reference decoded to, and its constituent road segments. (Sample data shown — nothing has actually been decoded yet.)',
+    body: 'The at-a-glance answer: what the reference decoded to, and its constituent road segments. Notice bearing, DNP, and offsets show as ranges (e.g. 191°–203°) — a v3 reference encodes a tolerance bucket, not one exact value, and this tool always keeps both bounds rather than collapsing them to a midpoint. (Sample data shown — nothing has actually been decoded yet.)',
     ensure: 'result',
     showSample: true,
   },
   {
     target: '.side-panel-right',
     title: 'Trace panel',
-    body: 'The deep-dive: why the decoder chose these segments — candidates considered, routing, and offsets. (Same sample decode as the Results panel.)',
+    body: 'The deep-dive: why the decoder chose these segments — candidates considered, routing, and offsets, every one of them the same [min, max] interval end to end, never averaged down to a single guess. (Same sample decode as the Results panel.)',
     ensure: 'trace',
     showSample: true,
   },

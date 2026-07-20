@@ -477,6 +477,8 @@ export default function MapView({ tilesBase, ready }) {
   const archiveBounds = useStore(s => s.archiveBounds);
   const mapContainer    = useRef(null);
   const mapRef          = useRef(null);
+  const tourCameraRef      = useRef(null);
+  const tourWasRunningRef  = useRef(false);
   const tileCacheRef    = useRef(new Map());
   const nodesCacheRef   = useRef(new Map());
   const pendingCountRef = useRef(0);
@@ -547,6 +549,7 @@ export default function MapView({ tilesBase, ready }) {
   const { pos: candPos, onMouseDown: candMouseDown, resetPos: candResetPos } = useDraggable(candPanelRef);
 
   const decodeResult               = useStore(s => s.decodeResult);
+  const tourStep                   = useStore(s => s.tourStep);
   const highlightedSegment         = useStore(s => s.highlightedSegment);
   const setHighlightedSegment      = useStore(s => s.setHighlightedSegment);
   const requestedInfoSegment       = useStore(s => s.requestedInfoSegment);
@@ -1578,6 +1581,34 @@ export default function MapView({ tilesBase, ready }) {
     }
     mapRef.current?.fitBounds(archiveBounds, { padding: 40, duration: 0 });
   }, [archiveBounds]);
+
+  // ── Onboarding tour: restore the camera on exit ─────────────────────────────
+  // The tour's Results/Trace steps swap in a fake decode result (see
+  // OnboardingTour.jsx) purely to populate those panels, but the ordinary
+  // decode-visualization effect above reacts to it exactly like a real decode
+  // and re-fits the camera to the sample path — leaving the user looking at
+  // wherever that sample happens to be instead of where they were. Snapshot
+  // the camera the moment the tour starts (before any sample data is ever
+  // swapped in) and ease back to it once the tour ends.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const running = tourStep != null;
+    const wasRunning = tourWasRunningRef.current;
+    if (running && !wasRunning) {
+      tourCameraRef.current = {
+        center: map.getCenter(),
+        zoom: map.getZoom(),
+        bearing: map.getBearing(),
+        pitch: map.getPitch(),
+      };
+    } else if (!running && wasRunning) {
+      const snap = tourCameraRef.current;
+      if (snap) map.easeTo({ ...snap, duration: 500 });
+      tourCameraRef.current = null;
+    }
+    tourWasRunningRef.current = running;
+  }, [tourStep]);
 
   // ── Basemap switch ───────────────────────────────────────────────────────────
 
