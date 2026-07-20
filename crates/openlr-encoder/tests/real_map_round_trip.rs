@@ -38,15 +38,15 @@ fn workspace_root() -> PathBuf {
 
 fn any_archive() -> Option<PathBuf> {
     // Full-scale Europe archive used for real-map testing (see project notes).
-    let absolute = PathBuf::from("/Users/dave/projects/maps/pmtiles/eur-osm/openlrlens-world-europe-latest.pmtiles");
+    let absolute = PathBuf::from("/Users/dave/projects/maps/pmtiles/eur-osm/openlrlab-world-europe-latest.pmtiles");
     if absolute.exists() {
         return Some(absolute);
     }
     let candidates = [
-        "out/nz-osm/openlrlens-nz-new-zealand-latest.pmtiles",
-        "out/de-osm/openlrlens-de-germany-latest.pmtiles",
-        "out/openlrlens-de-germany-latest.pmtiles",
-        "out/qatar/openlrlens-qatar-generic.pmtiles",
+        "out/nz-osm/openlrlab-nz-new-zealand-latest.pmtiles",
+        "out/de-osm/openlrlab-de-germany-latest.pmtiles",
+        "out/openlrlab-de-germany-latest.pmtiles",
+        "out/qatar/openlrlab-qatar-generic.pmtiles",
     ];
     let ws = workspace_root();
     candidates.iter().map(|c| ws.join(c)).find(|p| p.exists())

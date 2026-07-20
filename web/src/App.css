@@ -591,6 +591,30 @@ html, body, #root, .app {
 .lrp-dot-last  { background: #ff4455; }
 .lrp-dot-mid   { background: #4488ff; }
 
+.lrp-card-toggle {
+  background: none;
+  border: none;
+  color: #555570;
+  font-size: 18px;
+  cursor: pointer;
+  padding: 2px 6px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.lrp-card-title { flex-shrink: 0; }
+
+.lrp-card-summary {
+  color: #52527a;
+  font-weight: normal;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lrp-card-body { padding-bottom: 2px; }
+
 /* ── Decode result area ───────────────────────────────────────────────────── */
 
 .result-header {
@@ -700,6 +724,19 @@ html, body, #root, .app {
 
 .seg-row-btn:hover {
   color: #ffffff;
+}
+
+.seg-uncovered-mark {
+  color: #666680;
+  cursor: help;
+  margin-left: 2px;
+}
+
+.seg-uncovered-note {
+  font-size: 10px;
+  color: #7777aa;
+  font-style: italic;
+  padding: 3px 8px 0;
 }
 
 .result-error {
@@ -2858,12 +2895,19 @@ html, body, #root, .app {
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
 
+.tp-section-hdr-row {
+  display: flex;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.03);
+}
+
 .tp-section-hdr {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
-  background: rgba(255, 255, 255, 0.03);
+  background: none;
   border: none;
   color: #ccc;
   font-size: 11px;
@@ -2873,6 +2917,18 @@ html, body, #root, .app {
   padding: 6px 10px;
   cursor: pointer;
   text-align: left;
+}
+
+.tp-section-actions {
+  display: flex;
+  gap: 4px;
+  padding-right: 8px;
+  flex-shrink: 0;
+}
+
+.tp-section-actions .tp-copy-btn {
+  padding: 2px 6px;
+  font-size: 10px;
 }
 
 .tp-section-hdr:hover { background: rgba(255, 255, 255, 0.06); }
@@ -2918,22 +2974,63 @@ html, body, #root, .app {
   margin-bottom: 6px;
 }
 
-.tp-ref-json {
-  font-family: monospace;
-  font-size: 10.5px;
-  line-height: 1.55;
-  color: #b0c4de;
-  background: rgba(255, 255, 255, 0.04);
-  border-radius: 4px;
-  padding: 8px 10px;
+.tp-ref-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   margin-bottom: 8px;
-  white-space: pre;
-  overflow-x: auto;
-  word-break: normal;
 }
 
-.tp-lrp-table {
+.tp-ref-field {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.tp-ref-field-label {
+  flex: 0 0 96px;
+}
+
+.tp-lrp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   margin-top: 4px;
+}
+
+.tp-lrp-item {
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.tp-lrp-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  padding: 3px 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tp-lrp-summary:hover { background: rgba(255, 255, 255, 0.05); }
+
+.tp-lrp-toggle {
+  background: none;
+  border: none;
+  color: #666;
+  font-size: 18px;
+  cursor: pointer;
+  padding: 2px 6px;
+  line-height: 1;
+}
+
+.tp-lrp-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 4px 6px 26px;
 }
 
 .tp-empty { color: #666; font-size: 11px; padding: 4px 0; }
@@ -3108,16 +3205,6 @@ html, body, #root, .app {
 
 .draggable-header:active {
   cursor: grabbing;
-}
-
-/* ── Trace LRP rows (clickable) ──────────────────────────────────────────────── */
-
-.tp-lrp-row {
-  cursor: pointer;
-}
-
-.tp-lrp-row:hover td {
-  background: rgba(170, 0, 255, 0.08);
 }
 
 /* ── Replay button (TopBar) ──────────────────────────────────────────────────── */

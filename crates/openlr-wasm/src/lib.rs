@@ -40,7 +40,7 @@ extern "C" {
 use openlr_codec::{decode_v3_base64, decode_tpeg_hex, decode_tpeg_base64};
 use openlr_codec::lrp::{LocationReference, Orientation, SideOfRoad};
 use openlr_engine::DecodeResult as EngineDecodeResult;
-use openlr_engine::{decode as engine_decode, decode_forced as engine_decode_forced, DecodeError, DecodeParams, Preset, prefetch_tile_keys, path_to_wkt, path_band_wkt};
+use openlr_engine::{decode as engine_decode, decode_forced as engine_decode_forced, DecodeError, DecodeParams, Preset, prefetch_tile_keys, path_to_wkt, path_band_wkt, coverage_range};
 use openlr_engine::{ScoredCandidate, ProjectionResult, CandidateScore};
 use openlr_graph::{SegmentId, NodeId};
 use openlr_graph::{polyline_length_m, haversine_m, Direction};
@@ -165,6 +165,28 @@ struct JsDecodeResult {
     /// [LB, UB] of the negative offset interval. Both 0 when no neg offset.
     neg_offset_lb: f64,
     neg_offset_ub: f64,
+    /// Index into `segments` of the first/last segment at least partially
+    /// covered by the conservative (LB-trimmed) location -- segments outside
+    /// this range are entirely bypassed by the offsets. Absent when the
+    /// coverage range couldn't be computed (e.g. PointAlongLine, or a
+    /// collapsed/degenerate path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covered_start_idx: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covered_end_idx: Option<usize>,
+    /// [LB, UB] pos/neg offset re-expressed relative to the covered segment's
+    /// own start/end (rather than the original LRP position) -- meaningful
+    /// once segments outside `covered_start_idx..=covered_end_idx` are
+    /// dropped, since the original LRP-relative offset no longer lines up
+    /// with the pruned segment list's own boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covered_pos_offset_lb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covered_pos_offset_ub: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covered_neg_offset_lb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covered_neg_offset_ub: Option<f64>,
     /// True when offset bounds were estimated from DNP sum (decode failed, path length unknown).
     /// False when exact (decode succeeded and actual path length was used).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -222,6 +244,12 @@ impl JsDecodeResult {
             pos_offset_ub: 0.0,
             neg_offset_lb: 0.0,
             neg_offset_ub: 0.0,
+            covered_start_idx: None,
+            covered_end_idx: None,
+            covered_pos_offset_lb: None,
+            covered_pos_offset_ub: None,
+            covered_neg_offset_lb: None,
+            covered_neg_offset_ub: None,
             offsets_approximate: false,
             conservative_wkt: None,
             pos_uncertainty_wkt: None,
@@ -998,6 +1026,25 @@ impl Decoder {
             &self.loader.graph,
         );
 
+        let cov = coverage_range(
+            &result.path,
+            pos_offset_lb, pos_offset_ub,
+            neg_offset_lb, neg_offset_ub,
+            result.first_lrp_arc_m,
+            result.last_lrp_arc_m,
+            &self.loader.graph,
+        );
+        let (covered_start_idx, covered_end_idx,
+             covered_pos_offset_lb, covered_pos_offset_ub,
+             covered_neg_offset_lb, covered_neg_offset_ub) = match cov {
+            Some(c) => (
+                Some(c.first_segment_idx), Some(c.last_segment_idx),
+                Some(c.pos_residual_lb), Some(c.pos_residual_ub),
+                Some(c.neg_residual_lb), Some(c.neg_residual_ub),
+            ),
+            None => (None, None, None, None, None, None),
+        };
+
         let n_path = result.path.len();
         let segments: Vec<SegmentInfo> = result.path.iter().enumerate().filter_map(|(i, seg_id)| {
             self.loader.graph.segments.get(seg_id).map(|seg| {
@@ -1096,6 +1143,12 @@ impl Decoder {
             pos_offset_ub,
             neg_offset_lb,
             neg_offset_ub,
+            covered_start_idx,
+            covered_end_idx,
+            covered_pos_offset_lb,
+            covered_pos_offset_ub,
+            covered_neg_offset_lb,
+            covered_neg_offset_ub,
             offsets_approximate: false,
             conservative_wkt: None,
             pos_uncertainty_wkt,

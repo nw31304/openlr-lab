@@ -7,37 +7,6 @@ export function haversineM(lon1, lat1, lon2, lat2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-export function applyOffsets(coords, posM, negM) {
-  let pts = [...coords];
-  if (posM > 0) {
-    let remaining = posM;
-    while (pts.length > 2) {
-      const d = haversineM(pts[0][0], pts[0][1], pts[1][0], pts[1][1]);
-      if (remaining <= d) {
-        const t = remaining / d;
-        pts[0] = [pts[0][0] + t * (pts[1][0] - pts[0][0]), pts[0][1] + t * (pts[1][1] - pts[0][1])];
-        break;
-      }
-      remaining -= d;
-      pts.shift();
-    }
-  }
-  if (negM > 0) {
-    let remaining = negM;
-    while (pts.length > 2) {
-      const last = pts.length - 1;
-      const d = haversineM(pts[last-1][0], pts[last-1][1], pts[last][0], pts[last][1]);
-      if (remaining <= d) {
-        const t = remaining / d;
-        pts[last] = [pts[last][0] + t * (pts[last-1][0] - pts[last][0]), pts[last][1] + t * (pts[last-1][1] - pts[last][1])];
-        break;
-      }
-      remaining -= d;
-      pts.pop();
-    }
-  }
-  return pts;
-}
 
 export function computeTraversalDirections(segments, cache) {
   const n = segments.length;

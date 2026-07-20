@@ -134,10 +134,10 @@ mod integration {
 
     fn nz_archive() -> Option<PathBuf> {
         let candidates = [
-            "out/nz-osm/openlrlens-nz-new-zealand-latest.pmtiles",
-            "out/openlrlens-nz-2026-05-20-0.pmtiles",
-            "out/openlrlens-166.0000,-47.5000,178.5000,-34.0000-2026-05-20-0.pmtiles",
-            "out/openlrlens-nz-2026-05-20.pmtiles",
+            "out/nz-osm/openlrlab-nz-new-zealand-latest.pmtiles",
+            "out/openlrlab-nz-2026-05-20-0.pmtiles",
+            "out/openlrlab-166.0000,-47.5000,178.5000,-34.0000-2026-05-20-0.pmtiles",
+            "out/openlrlab-nz-2026-05-20.pmtiles",
         ];
         let ws = workspace_root();
         candidates.iter().map(|c| ws.join(c)).find(|p| p.exists())
@@ -145,8 +145,8 @@ mod integration {
 
     fn de_archive() -> Option<PathBuf> {
         let candidates = [
-            "out/de-osm/openlrlens-de-germany-latest.pmtiles",
-            "out/openlrlens-de-germany-latest.pmtiles",
+            "out/de-osm/openlrlab-de-germany-latest.pmtiles",
+            "out/openlrlab-de-germany-latest.pmtiles",
         ];
         let ws = workspace_root();
         candidates.iter().map(|c| ws.join(c)).find(|p| p.exists())

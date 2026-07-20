@@ -13,7 +13,7 @@ pub use route_generator::RouteGenerator;
 pub use tile_prefetch::prefetch_tile_keys;
 pub use trace::{DecodeEvent, DecodeOutcome, DecodeTrace, TraceLevel};
 pub use trace::{ScoredCandidate, ProjectionResult, CandidateScore};
-pub use wkt::{path_to_wkt, path_band_wkt};
+pub use wkt::{path_to_wkt, path_band_wkt, coverage_range, CoverageRange};
 
 use std::collections::HashMap;
 

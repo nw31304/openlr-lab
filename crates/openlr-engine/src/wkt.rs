@@ -53,47 +53,8 @@ pub fn path_to_wkt(
         .map(|seg| polyline_length_m(&seg.geometry))
         .collect();
 
-    // ── Positive-offset cut: walk forward from (first_lrp_arc_m + pos_offset_m) ──
-    // Finds the segment index and within-segment start where the location begins.
-    let (pos_seg, pos_start_m) = {
-        let mut rem = (first_lrp_arc_m + pos_offset_m).max(0.0);
-        let mut result = (0usize, 0.0f64);
-        for i in 0..n {
-            if rem <= actual_lens[i] {
-                result = (i, rem);
-                break;
-            }
-            rem -= actual_lens[i];
-        }
-        result
-    };
-
-    // ── Negative-offset cut: walk backward from last LRP position ──
-    // Finds the segment index and within-segment end where the location ends.
-    let (neg_seg, neg_end_m) = {
-        let lrp_arc = last_lrp_arc_m.min(actual_lens[n - 1]);
-        let mut rem = neg_offset_m;
-        if rem <= lrp_arc {
-            // Trim lands within the last segment.
-            (n - 1, lrp_arc - rem)
-        } else {
-            rem -= lrp_arc;
-            let mut result = (0usize, 0.0f64); // fallback: entire path consumed
-            'neg_cut: for i in (0..n - 1).rev() {
-                let avail = actual_lens[i];
-                if rem <= avail {
-                    result = (i, avail - rem);
-                    break 'neg_cut;
-                }
-                rem -= avail;
-            }
-            result
-        }
-    };
-
-    // If the trim window is empty or inverted, the location has collapsed.
-    if pos_seg > neg_seg { return None; }
-    if pos_seg == neg_seg && pos_start_m >= neg_end_m { return None; }
+    let (pos_seg, pos_start_m, neg_seg, neg_end_m) =
+        find_coverage_bounds(&actual_lens, pos_offset_m, neg_offset_m, first_lrp_arc_m, last_lrp_arc_m)?;
 
     let mut pts: Vec<(f64, f64)> = Vec::new();
 
@@ -138,6 +99,125 @@ pub fn path_to_wkt(
         .collect::<Vec<_>>()
         .join(",");
     Some(format!("LINESTRING ({coords})"))
+}
+
+/// Find which segment index the offset-adjusted location starts/ends at, and
+/// the arc-length position within that segment where coverage begins/ends.
+/// Shared by `path_to_wkt` and `coverage_range` so the two stay consistent.
+///
+/// Returns `None` if the trim window is empty or inverted (location collapsed).
+fn find_coverage_bounds(
+    actual_lens: &[f64],
+    pos_offset_m: f64,
+    neg_offset_m: f64,
+    first_lrp_arc_m: f64,
+    last_lrp_arc_m: f64,
+) -> Option<(usize, f64, usize, f64)> {
+    let n = actual_lens.len();
+
+    // ── Positive-offset cut: walk forward from (first_lrp_arc_m + pos_offset_m) ──
+    // Finds the segment index and within-segment start where the location begins.
+    let (pos_seg, pos_start_m) = {
+        let mut rem = (first_lrp_arc_m + pos_offset_m).max(0.0);
+        let mut result = (0usize, 0.0f64);
+        for i in 0..n {
+            if rem <= actual_lens[i] {
+                result = (i, rem);
+                break;
+            }
+            rem -= actual_lens[i];
+        }
+        result
+    };
+
+    // ── Negative-offset cut: walk backward from last LRP position ──
+    // Finds the segment index and within-segment end where the location ends.
+    let (neg_seg, neg_end_m) = {
+        let lrp_arc = last_lrp_arc_m.min(actual_lens[n - 1]);
+        let mut rem = neg_offset_m;
+        if rem <= lrp_arc {
+            // Trim lands within the last segment.
+            (n - 1, lrp_arc - rem)
+        } else {
+            rem -= lrp_arc;
+            let mut result = (0usize, 0.0f64); // fallback: entire path consumed
+            'neg_cut: for i in (0..n - 1).rev() {
+                let avail = actual_lens[i];
+                if rem <= avail {
+                    result = (i, avail - rem);
+                    break 'neg_cut;
+                }
+                rem -= avail;
+            }
+            result
+        }
+    };
+
+    // If the trim window is empty or inverted, the location has collapsed.
+    if pos_seg > neg_seg { return None; }
+    if pos_seg == neg_seg && pos_start_m >= neg_end_m { return None; }
+
+    Some((pos_seg, pos_start_m, neg_seg, neg_end_m))
+}
+
+/// Segment-index range that's at least partially covered by the conservative
+/// (LB-trimmed) location, plus the residual pos/neg offset -- in meters, as a
+/// [lb, ub] interval -- measured from that first/last covered segment's own
+/// start/end (rather than from the original LRP position). For callers that
+/// want a segment-pruned view of the location: e.g. exporting GeoJSON
+/// features only for segments the location actually touches, while still
+/// reporting a meaningful offset relative to *those* segments' boundaries.
+///
+/// Segment *selection* (which index is first/last covered) is fixed using
+/// the LB bound, matching `path_to_wkt`'s own "conservative, maximal
+/// coverage" semantics -- the UB residual is derived by shifting the LB
+/// residual by the original offset interval's width, since dropping the same
+/// whole segments shifts both bounds of an interval by the same constant (no
+/// midpoint/estimate anywhere, both bounds are exact given that shared
+/// segment selection).
+///
+/// Returns `None` if any segment is missing from the graph, or the (LB-based)
+/// trim window is empty/inverted (location collapsed).
+pub struct CoverageRange {
+    pub first_segment_idx: usize,
+    pub last_segment_idx: usize,
+    pub pos_residual_lb: f64,
+    pub pos_residual_ub: f64,
+    pub neg_residual_lb: f64,
+    pub neg_residual_ub: f64,
+}
+
+pub fn coverage_range(
+    path: &[SegmentId],
+    pos_offset_lb: f64,
+    pos_offset_ub: f64,
+    neg_offset_lb: f64,
+    neg_offset_ub: f64,
+    first_lrp_arc_m: f64,
+    last_lrp_arc_m: f64,
+    graph: &Graph,
+) -> Option<CoverageRange> {
+    if path.is_empty() {
+        return None;
+    }
+    let segs: Vec<_> = path.iter().map(|id| graph.segments.get(id)).collect::<Option<Vec<_>>>()?;
+    let actual_lens: Vec<f64> = segs.iter().map(|seg| polyline_length_m(&seg.geometry)).collect();
+
+    let (pos_seg, pos_start_m, neg_seg, neg_end_m) =
+        find_coverage_bounds(&actual_lens, pos_offset_lb, neg_offset_lb, first_lrp_arc_m, last_lrp_arc_m)?;
+
+    let pos_width = pos_offset_ub - pos_offset_lb;
+    let neg_width = neg_offset_ub - neg_offset_lb;
+    let neg_residual_lb = actual_lens[neg_seg] - neg_end_m;
+
+    Some(CoverageRange {
+        first_segment_idx: pos_seg,
+        last_segment_idx: neg_seg,
+        pos_residual_lb: pos_start_m,
+        pos_residual_ub: pos_start_m + pos_width,
+        neg_residual_lb,
+        neg_residual_ub: neg_residual_lb + neg_width,
+    })
 }
 
 /// Extract vertices from a polyline between [start_m, end_m] arc-length offsets.
@@ -307,5 +387,77 @@ mod tests {
     fn empty_path_returns_none() {
         let g = Graph::new();
         assert!(path_to_wkt(&[], 0.0, 0.0, 0.0, 0.0, TraversalDir::Forward, TraversalDir::Forward, &g).is_none());
+    }
+
+    fn three_segment_graph() -> (Graph, f64, f64, f64) {
+        let mut g = Graph::new();
+        g.add_node(node(0, 0.0, 0.0));
+        g.add_node(node(1, 0.001, 0.0));
+        g.add_node(node(2, 0.002, 0.0));
+        g.add_node(node(3, 0.003, 0.0));
+        g.add_segment(seg_g(1, 0, 1, vec![(0.0, 0.0), (0.001, 0.0)]));
+        g.add_segment(seg_g(2, 1, 2, vec![(0.001, 0.0), (0.002, 0.0)]));
+        g.add_segment(seg_g(3, 2, 3, vec![(0.002, 0.0), (0.003, 0.0)]));
+        let len1 = polyline_length_m(&[(0.0_f64, 0.0_f64), (0.001, 0.0)]);
+        let len2 = polyline_length_m(&[(0.001_f64, 0.0_f64), (0.002, 0.0)]);
+        let len3 = polyline_length_m(&[(0.002_f64, 0.0_f64), (0.003, 0.0)]);
+        (g, len1, len2, len3)
+    }
+
+    #[test]
+    fn coverage_range_no_offsets_covers_whole_path() {
+        let (g, _len1, _len2, len3) = three_segment_graph();
+        let path = [SegmentId(1), SegmentId(2), SegmentId(3)];
+        let cr = coverage_range(&path, 0.0, 0.0, 0.0, 0.0, 0.0, len3, &g).unwrap();
+        assert_eq!(cr.first_segment_idx, 0);
+        assert_eq!(cr.last_segment_idx, 2);
+        assert_eq!(cr.pos_residual_lb, 0.0);
+        assert_eq!(cr.pos_residual_ub, 0.0);
+        assert_eq!(cr.neg_residual_lb, 0.0);
+        assert_eq!(cr.neg_residual_ub, 0.0);
+    }
+
+    #[test]
+    fn coverage_range_pos_offset_skips_fully_consumed_leading_segment() {
+        let (g, len1, _len2, len3) = three_segment_graph();
+        let path = [SegmentId(1), SegmentId(2), SegmentId(3)];
+        // Positive offset fully consumes segment 1 (index 0) and reaches 20 m
+        // into segment 2 (index 1) at the LB, 30 m in at the UB.
+        let pos_lb = len1 + 20.0;
+        let pos_ub = len1 + 30.0;
+        let cr = coverage_range(&path, pos_lb, pos_ub, 0.0, 0.0, 0.0, len3, &g).unwrap();
+        assert_eq!(cr.first_segment_idx, 1, "segment 1 (fully consumed) must be excluded");
+        assert_eq!(cr.last_segment_idx, 2);
+        assert!((cr.pos_residual_lb - 20.0).abs() < 1e-6, "{}", cr.pos_residual_lb);
+        assert!((cr.pos_residual_ub - 30.0).abs() < 1e-6, "{}", cr.pos_residual_ub);
+        // UB residual must be exactly LB residual + interval width -- no midpoint anywhere.
+        assert!((cr.pos_residual_ub - cr.pos_residual_lb - (pos_ub - pos_lb)).abs() < 1e-9);
+        assert_eq!(cr.neg_residual_lb, 0.0);
+        assert_eq!(cr.neg_residual_ub, 0.0);
+    }
+
+    #[test]
+    fn coverage_range_neg_offset_skips_fully_consumed_trailing_segment() {
+        let (g, _len1, len2, len3) = three_segment_graph();
+        let path = [SegmentId(1), SegmentId(2), SegmentId(3)];
+        // Negative offset fully consumes segment 3 (index 2) and reaches 15 m
+        // back into segment 2 (index 1) at the LB, 25 m back at the UB.
+        let neg_lb = len3 + 15.0;
+        let neg_ub = len3 + 25.0;
+        let cr = coverage_range(&path, 0.0, 0.0, neg_lb, neg_ub, 0.0, len3, &g).unwrap();
+        assert_eq!(cr.first_segment_idx, 0);
+        assert_eq!(cr.last_segment_idx, 1, "segment 3 (fully consumed) must be excluded");
+        assert_eq!(cr.pos_residual_lb, 0.0);
+        assert_eq!(cr.pos_residual_ub, 0.0);
+        assert!((cr.neg_residual_lb - 15.0).abs() < 1e-6, "{}", cr.neg_residual_lb);
+        assert!((cr.neg_residual_ub - 25.0).abs() < 1e-6, "{}", cr.neg_residual_ub);
+        assert!((cr.neg_residual_ub - cr.neg_residual_lb - (neg_ub - neg_lb)).abs() < 1e-9);
+        let _ = len2;
+    }
+
+    #[test]
+    fn coverage_range_empty_path_returns_none() {
+        let g = Graph::new();
+        assert!(coverage_range(&[], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, &g).is_none());
     }
 }

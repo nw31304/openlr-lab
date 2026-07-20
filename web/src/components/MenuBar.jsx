@@ -42,7 +42,7 @@ export default function MenuBar() {
 
   // Sync urlDraft with the active tile URL whenever the menu opens.
   useEffect(() => {
-    if (showTileMenu) setUrlDraft(tileUrl || 'http://localhost:5176');
+    if (showTileMenu) setUrlDraft(tileUrl || import.meta.env.VITE_TILE_BASE_URL || 'http://localhost:5176');
   }, [showTileMenu, tileUrl]);
 
   // Close tile menu on outside click.

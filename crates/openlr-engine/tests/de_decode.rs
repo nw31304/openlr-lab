@@ -7,7 +7,7 @@ use openlr_provider::TileLoader;
 
 const DE_TILES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../../out/de-osm/openlrlens-de-germany-latest.pmtiles"
+    "/../../../../out/de-osm/openlrlab-de-germany-latest.pmtiles"
 );
 
 fn read_tile(pmtiles_path: &str, z: u8, x: u32, y: u32) -> Option<Vec<u8>> {

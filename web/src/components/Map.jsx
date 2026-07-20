@@ -114,7 +114,7 @@ const BASEMAPS = [
 
 // Custom sources/layers to preserve across basemap switches via transformStyle.
 const CUSTOM_SOURCES = new Set([
-  'olr-segments', 'olr-nodes', 'decoded-path', 'lrp-markers',
+  'olr-segments', 'olr-nodes', 'decoded-path', 'decoded-path-boundaries', 'lrp-markers',
   'lrp-snap', 'lrp-displacement',
   'offset-uncertainty', 'lrp-bearing', 'highlighted-segment', 'trace-segment',
   'replay-radius', 'replay-route', 'replay-traversed', 'replay-candidates', 'replay-cloud', 'replay-frontier', 'replay-leg', 'replay-flash',
@@ -123,7 +123,7 @@ const CUSTOM_SOURCES = new Set([
 ]);
 const CUSTOM_LAYER_IDS = new Set([
   'olr-frc0','olr-frc1','olr-frc2','olr-frc3','olr-frc4','olr-frc5','olr-frc6','olr-frc7',
-  'olr-highlight', 'olr-nodes-circle', 'decoded-path-line', 'lrp-markers-circle',
+  'olr-highlight', 'olr-nodes-circle', 'decoded-path-line', 'decoded-path-boundary-circles', 'lrp-markers-circle',
   'lrp-displacement-line', 'lrp-displacement-arrow',
   'offset-uncertainty-line',
   'lrp-bearing-fill', 'lrp-bearing-outline',
@@ -909,6 +909,27 @@ export default function MapView({ tilesBase, ready }) {
           'line-color':   '#00d4ff',
           'line-width':   5,
           'line-opacity': 0.9,
+        },
+      });
+
+      // Small, static (non-pulsing) markers at the junction between one
+      // covered segment and the next, so the line visibly reads as several
+      // segments rather than one continuous stroke. Deliberately discreet:
+      // small radius, no animation, drawn on top of the path line.
+      map.addSource('decoded-path-boundaries', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      });
+      map.addLayer({
+        id:     'decoded-path-boundary-circles',
+        type:   'circle',
+        source: 'decoded-path-boundaries',
+        paint: {
+          'circle-radius':       3,
+          'circle-color':        '#ffffff',
+          'circle-opacity':      0.9,
+          'circle-stroke-width': 1,
+          'circle-stroke-color': '#0077aa',
         },
       });
       // Direction on the decoded path is conveyed by the numbered LRP markers (1 → N).
@@ -2556,6 +2577,9 @@ export default function MapView({ tilesBase, ready }) {
     if (map.getLayer('decoded-path-line')) {
       map.setLayoutProperty('decoded-path-line', 'visibility', vis === 'visible' ? 'none' : 'visible');
     }
+    if (map.getLayer('decoded-path-boundary-circles')) {
+      map.setLayoutProperty('decoded-path-boundary-circles', 'visibility', vis === 'visible' ? 'none' : 'visible');
+    }
 
     if (!showReplay || !replaySteps.length) {
       replaySources.forEach(s => { map.getSource(s)?.setData(emptyFC); });
@@ -2925,6 +2949,7 @@ export default function MapView({ tilesBase, ready }) {
     if (!map) return;
 
     const pathSource        = map.getSource('decoded-path');
+    const pathBoundarySource = map.getSource('decoded-path-boundaries');
     const lrpSource         = map.getSource('lrp-markers');
     const snapSource        = map.getSource('lrp-snap');
     const displSource       = map.getSource('lrp-displacement');
@@ -2948,6 +2973,7 @@ export default function MapView({ tilesBase, ready }) {
     // re-run without `mode` in its own right.
     if (!decodeResult || mode !== 'decode') {
       pathSource?.setData(emptyFC);
+      pathBoundarySource?.setData(emptyFC);
       lrpSource?.setData(emptyFC);
       snapSource?.setData(emptyFC);
       displSource?.setData(emptyFC);
@@ -3014,6 +3040,29 @@ export default function MapView({ tilesBase, ready }) {
       ? [{ type: 'Feature', geometry: { type: 'LineString', coordinates: wktCoords }, properties: {} }]
       : [];
     pathSource?.setData({ type: 'FeatureCollection', features: pathFeatures });
+
+    // ── Segment-boundary markers along the decoded path ───────────────────────
+    // One marker per junction between two *covered* segments (i.e. segments[i]'s
+    // own last vertex, which coincides with segments[i+1]'s first vertex) --
+    // covered_start_idx/covered_end_idx exclude segments the offsets bypass
+    // entirely, matching the same trimmed extent the path line itself shows.
+    const boundaryFeatures = [];
+    if (decodeResult.ok && !isPalResult && pathFeatures.length > 0) {
+      const segs = decodeResult.segments ?? [];
+      const startIdx = decodeResult.covered_start_idx ?? 0;
+      const endIdx   = decodeResult.covered_end_idx   ?? segs.length - 1;
+      for (let i = startIdx; i < endIdx; i++) {
+        const geom = segs[i]?.geometry;
+        if (geom?.length) {
+          boundaryFeatures.push({
+            type: 'Feature',
+            geometry: { type: 'Point', coordinates: geom[geom.length - 1] },
+            properties: {},
+          });
+        }
+      }
+    }
+    pathBoundarySource?.setData({ type: 'FeatureCollection', features: boundaryFeatures });
 
     // ── Offset uncertainty bands ──────────────────────────────────────────────
     // Shown only when the offset is a v3 bucket interval (lb < ub).

@@ -23,11 +23,12 @@ export default function App() {
   const replaySteps = mode === 'encode' ? verifyReplaySteps : decodeReplaySteps;
 
   function resolveBase() {
+    const defaultBase = import.meta.env.VITE_TILE_BASE_URL || 'http://localhost:5176';
     const tilesParam = new URLSearchParams(window.location.search).get('tiles') ?? '';
-    const storedUrl  = useStore.getState().tileUrl || 'http://localhost:5176';
+    const storedUrl  = useStore.getState().tileUrl || defaultBase;
     if (tilesParam) {
       const isAbsolute = tilesParam.startsWith('http://') || tilesParam.startsWith('https://');
-      return isAbsolute ? tilesParam : `http://localhost:5176/${tilesParam}`;
+      return isAbsolute ? tilesParam : `${defaultBase}/${tilesParam}`;
     }
     return storedUrl;
   }

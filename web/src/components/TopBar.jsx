@@ -17,10 +17,11 @@ export default function TopBar() {
   const hasTraceData = !!decodeResult?.trace && !showTrace;
 
   // Tile URL input — initialise from URL param if active, else from stored value
+  const defaultTileBase = import.meta.env.VITE_TILE_BASE_URL || 'http://localhost:5176';
   const urlParam = new URLSearchParams(window.location.search).get('tiles') ?? '';
   const effectiveUrl = urlParam
-    ? (urlParam.startsWith('http') ? urlParam : `http://localhost:5176/${urlParam}`)
-    : (tileUrl || 'http://localhost:5176');
+    ? (urlParam.startsWith('http') ? urlParam : `${defaultTileBase}/${urlParam}`)
+    : (tileUrl || defaultTileBase);
   const [urlDraft, setUrlDraft] = useState(effectiveUrl);
 
   const applyTileUrl = () => {

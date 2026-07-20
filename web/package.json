@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
-    "build": "vite build"
+    "build": "vite build",
+    "deploy": "cd ../crates/openlr-wasm && wasm-pack build --target web --out-dir ../../web/src/wasm && cd ../../web && vite build && wrangler pages deploy dist --project-name=openlr-lab"
   },
   "dependencies": {
     "maplibre-gl": "^4",
@@ -17,7 +18,8 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4",
-    "vite": "^5"
+    "vite": "^5",
+    "wrangler": "^4.112.0"
   },
   "allowScripts": {
     "esbuild@0.21.5": true,

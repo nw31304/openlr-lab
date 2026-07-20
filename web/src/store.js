@@ -250,7 +250,7 @@ function buildToolActivity(calls) {
 export const useStore = create(persist(
  (set, get) => ({
   openlrString: '',
-  tileUrl: 'http://localhost:5176',
+  tileUrl: import.meta.env.VITE_TILE_BASE_URL || 'http://localhost:5176',
   // [[minLon,minLat],[maxLon,maxLat]] | null — the configured PMTiles
   // archive's own coverage, from its header (see App.jsx's startup effect).
   // null if that lookup failed/returned a degenerate box; callers must treat

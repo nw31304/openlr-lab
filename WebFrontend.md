@@ -804,3 +804,51 @@ anchor/travel-direction somewhere with no subsequent A*/routing step to catch a
 wrong-direction pick. `Graph::outgoing_segments()` is the direction-aware
 alternative. See `CLAUDE.md` Invariant 10 before adding new anchor-selection logic
 anywhere in the encode path.
+
+## 21. Deployment (Cloudflare Pages + R2)
+
+Production hosting is Cloudflare Pages for the static SPA, with the (multi-GB)
+`world.pmtiles` archive in an R2 bucket instead of local disk — R2 has no egress
+fees, which matters given how many range-read requests a single session makes
+against a large archive. A Pages Function proxies tile requests to R2 rather than
+exposing the bucket directly, so it's same-origin with the SPA (no CORS needed) and
+shares the Pages project's deploy lifecycle.
+
+**Pieces:**
+- `web/functions/tiles/[[path]].js` — catch-all route for `GET /tiles/*`. Reads the
+  object from the `TILES_BUCKET` R2 binding, forwarding the browser's `Range` header
+  and returning a real `206`/`Content-Range` when `object.range` comes back populated
+  (not just a flat `200` with an ignored range — pmtiles-js and MapLibre both depend
+  on genuine partial-content responses to avoid pulling the whole multi-GB archive).
+- `web/wrangler.toml` — declares the Pages project name, `pages_build_output_dir =
+  "dist"`, and the `TILES_BUCKET` R2 binding (bucket name `openlr-lab-tiles`).
+- `web/.env.production` — sets `VITE_TILE_BASE_URL=/tiles`, so a production build's
+  default tile base is the same-origin Pages Function instead of the local dev
+  server. Local dev is unaffected (falls back to `http://localhost:5176`, matching
+  `vite.config.js`'s dev-only tile server — see §1). This env var is read in four
+  places that used to hardcode the localhost default: `store.js`'s `tileUrl` initial
+  state, `App.jsx`'s `resolveBase()`, `MenuBar.jsx`'s tile-menu sync effect, and
+  `TopBar.jsx`'s `effectiveUrl` derivation.
+
+**One-time setup:**
+1. `npx wrangler login` (OAuth against the Cloudflare account).
+2. Enable R2 once via the dashboard (R2 Object Storage → enable) — not scriptable,
+   the API rejects bucket creation until this has been clicked through once per
+   account.
+3. `npx wrangler r2 bucket create openlr-lab-tiles`
+4. `npx wrangler pages project create openlr-lab --production-branch=main`
+
+**Getting tiles into R2** (manual, tied to whenever `openlr-pmtiles`'s `build-world`
+finishes a fresh archive — not automated, a completely separate tool/schedule):
+```
+wrangler r2 object put openlr-lab-tiles/world.pmtiles --file=/path/to/world.pmtiles
+wrangler r2 object put openlr-lab-tiles/manifest.json --file=/path/to/manifest.json
+```
+
+**Day-to-day deploy** (no CI — built and deployed locally):
+```
+cd web && npm run deploy
+```
+which runs `wasm-pack build` (crates/openlr-wasm → web/src/wasm, gitignored, must be
+fresh locally before every deploy since it's never committed), `vite build`, then
+`wrangler pages deploy dist --project-name=openlr-lab`.

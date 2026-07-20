@@ -1,0 +1,6 @@
+name = "openlr-lab"
+pages_build_output_dir = "dist"
+
+[[r2_buckets]]
+binding = "TILES_BUCKET"
+bucket_name = "openlr-lab-tiles"

@@ -1,13 +1,12 @@
 import React, { useState, useMemo } from 'react';
 import { useStore, getSegGeomCache } from '../store.js';
 import { verdictType } from '../replayEngine.js';
+import {
+  isPointAlongLine, formatOpenlrFormat, frcLabel, fowLabel, fmtBearing, fmtInterval,
+  offsetRowValue, lfrcnpCompact, lfrcnpFull, ORIENTATION_LABEL, SIDE_OF_ROAD_LABEL,
+} from '../refFormat.js';
 
 const ASTAR_DISPLAY_CAP = 200;
-
-const FRC_NAME = ['FRC0 Motorway', 'FRC1 Trunk', 'FRC2 Secondary', 'FRC3 Tertiary',
-                  'FRC4 Unclassified', 'FRC5 Residential', 'FRC6 Service', 'FRC7 Other'];
-const FOW_NAME = ['Undefined', 'Motorway', 'Dual C/W', 'Single C/W',
-                  'Roundabout', 'Traffic Sq', 'Slip Road', 'Other'];
 
 // ── Event parsing ─────────────────────────────────────────────────────────────
 
@@ -125,19 +124,22 @@ function fmtRouteFailReason(reason) {
 
 // ── Section wrapper ───────────────────────────────────────────────────────────
 
-function Section({ title, badge, badgeOk, defaultOpen = true, children }) {
+function Section({ title, badge, badgeOk, defaultOpen = true, actions, children }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <div className="tp-section">
-      <button className="tp-section-hdr" onClick={() => setOpen(o => !o)}>
-        <span className="tp-section-arrow">{open ? '▾' : '▸'}</span>
-        <span className="tp-section-title">{title}</span>
-        {badge != null && (
-          <span className={`tp-badge ${badgeOk === false ? 'tp-badge-err' : badgeOk === true ? 'tp-badge-ok' : ''}`}>
-            {badge}
-          </span>
-        )}
-      </button>
+      <div className="tp-section-hdr-row">
+        <button className="tp-section-hdr" onClick={() => setOpen(o => !o)}>
+          <span className="tp-section-arrow">{open ? '▾' : '▸'}</span>
+          <span className="tp-section-title">{title}</span>
+          {badge != null && (
+            <span className={`tp-badge ${badgeOk === false ? 'tp-badge-err' : badgeOk === true ? 'tp-badge-ok' : ''}`}>
+              {badge}
+            </span>
+          )}
+        </button>
+        {actions && <div className="tp-section-actions" onClick={e => e.stopPropagation()}>{actions}</div>}
+      </div>
       {open && <div className="tp-section-body">{children}</div>}
     </div>
   );
@@ -203,102 +205,88 @@ function buildCandPopup(segId, lrpIdx, traversal, ctype, winner, snapPt, project
 
 // ── Reference summary ─────────────────────────────────────────────────────────
 
-function fmtBearing(lb, ub) {
-  return Math.abs(ub - lb) < 0.1 ? `${lb.toFixed(1)}°` : `[${lb.toFixed(1)}°, ${ub.toFixed(1)}°]`;
+function RefField({ label, value, mono }) {
+  if (value == null) return null;
+  return (
+    <div className="tp-ref-field">
+      <span className="tp-ref-field-label tp-dim">{label}</span>
+      <span className={mono ? 'tp-monospace' : undefined}>{value}</span>
+    </div>
+  );
 }
 
-function fmtDnp(lb, ub) {
-  if (lb == null) return null;
-  return Math.abs(ub - lb) < 0.1 ? `${lb.toFixed(1)} m` : `[${lb.toFixed(1)}, ${ub.toFixed(1)}] m`;
-}
-
-function fmtOffset(lb, ub, approximate) {
-  if (!lb && !ub) return null;
-  const str = Math.abs(ub - lb) < 0.1 ? `${lb.toFixed(1)} m` : `[${lb.toFixed(1)}, ${ub.toFixed(1)}] m`;
-  return approximate ? `${str} *` : str;
-}
-
-function buildRefSummary(openlrString, lrps, decodeResult) {
-  const fmtLabel = decodeResult?.format === 'TomTomV3' ? 'TomTom v3'
-                 : decodeResult?.format === 'Tpeg'     ? 'TPEG-OLR'
-                 : '(unknown)';
-  const approx = decodeResult?.offsets_approximate;
-  const isPal = decodeResult?.location_type === 'PointAlongLine' ||
-                decodeResult?.location_type === 'PoiWithAccessPoint';
-  const lines = ['{'];
-  lines.push(`  "format": "${fmtLabel}",`);
-  lines.push(`  "location_type": "${decodeResult?.location_type ?? 'Line'}",`);
-  lines.push(`  "string": "${openlrString}",`);
-  if (isPal && decodeResult?.orientation != null)
-    lines.push(`  "orientation": "${decodeResult.orientation}",`);
-  if (isPal && decodeResult?.side_of_road != null)
-    lines.push(`  "side_of_road": "${decodeResult.side_of_road}",`);
-  const posOff = fmtOffset(decodeResult?.pos_offset_lb, decodeResult?.pos_offset_ub, approx);
-  const negOff = fmtOffset(decodeResult?.neg_offset_lb, decodeResult?.neg_offset_ub, approx);
-  if (posOff) lines.push(`  "pos_offset": ${posOff},`);
-  if (negOff) lines.push(`  "neg_offset": ${negOff},`);
-  lines.push(`  "lrps": [`);
-  lrps?.forEach((l, i) => {
-    const isLast = i === lrps.length - 1;
-    const dnp = fmtDnp(l.dnp_lb, l.dnp_ub);
-    const parts = [
-      `"coord": [${l.lon.toFixed(6)}, ${l.lat.toFixed(6)}]`,
-      `"frc": ${l.frc}`,
-      `"fow": ${l.fow}`,
-      l.lfrcnp != null ? `"lfrcnp": ${l.lfrcnp}` : null,
-      `"bearing": ${fmtBearing(l.bearing_lb, l.bearing_ub)}`,
-      dnp ? `"dnp": ${dnp}` : null,
-    ].filter(Boolean);
-    lines.push(`    { ${parts.join(', ')} }${isLast ? '' : ','}`);
-  });
-  lines.push('  ]');
-  lines.push('}');
-  return lines.join('\n');
+function LrpItem({ lrp: l, index: i, isLast, setTraceLrpFocus, lfrcnpTolerance }) {
+  const [expanded, setExpanded] = useState(false);
+  const dnp = !isLast ? fmtInterval(l.dnp_lb, l.dnp_ub) : null;
+  return (
+    <div className="tp-lrp-item">
+      <div
+        className="tp-lrp-summary"
+        title="Click to pan to this LRP"
+        onClick={() => setTraceLrpFocus({ ...l, index: i })}
+      >
+        <button
+          className="tp-lrp-toggle"
+          onClick={(e) => { e.stopPropagation(); setExpanded(x => !x); }}
+          title={expanded ? 'Collapse' : 'Expand'}
+        >
+          {expanded ? '▾' : '▸'}
+        </button>
+        <span className="tp-dim">LRP{i + 1}</span>
+        <span className="tp-monospace">{l.lon.toFixed(5)}, {l.lat.toFixed(5)}</span>
+        <span>FRC {l.frc}</span>
+        <span>FOW {l.fow}</span>
+        {!isLast && <span>LFRCNP {lfrcnpCompact(l.lfrcnp, lfrcnpTolerance)}</span>}
+      </div>
+      {expanded && (
+        <div className="tp-lrp-detail">
+          <RefField label="Longitude" value={l.lon.toFixed(6)} mono />
+          <RefField label="Latitude"  value={l.lat.toFixed(6)} mono />
+          <RefField label="FRC"       value={frcLabel(l.frc)} />
+          <RefField label="FOW"       value={fowLabel(l.fow)} />
+          {!isLast && <RefField label="LFRCNP" value={lfrcnpFull(l.lfrcnp, lfrcnpTolerance)} />}
+          <RefField label="Bearing"  value={fmtBearing(l.bearing_lb, l.bearing_ub)} mono />
+          {!isLast && <RefField label="DNP" value={dnp} mono />}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function ReferenceSummarySection({ openlrString, lrps, decodeResult, setTraceLrpFocus, lfrcnpTolerance = 0 }) {
-  const summary = buildRefSummary(openlrString, lrps, decodeResult);
+  const approx = decodeResult?.offsets_approximate;
+  const isPal = isPointAlongLine(decodeResult?.location_type);
+  const hasPos = decodeResult?.pos_offset_ub > 0;
+  const hasNeg = decodeResult?.neg_offset_ub > 0;
+  const posOff = offsetRowValue(hasPos, decodeResult?.pos_offset_lb, decodeResult?.pos_offset_ub, approx);
+  const negOff = offsetRowValue(hasNeg, decodeResult?.neg_offset_lb, decodeResult?.neg_offset_ub, approx);
+
   return (
     <Section title="Reference" defaultOpen={true}>
-      <pre className="tp-ref-json">{summary}</pre>
+      <div className="tp-ref-fields">
+        <RefField label="Format"        value={formatOpenlrFormat(decodeResult?.format)} />
+        <RefField label="Location Type" value={decodeResult?.location_type ?? 'Line'} />
+        <RefField label="String"        value={openlrString} mono />
+        {isPal && decodeResult?.orientation != null &&
+          <RefField label="Orientation"  value={ORIENTATION_LABEL[decodeResult.orientation] ?? decodeResult.orientation} />}
+        {isPal && decodeResult?.side_of_road != null &&
+          <RefField label="Side of Road" value={SIDE_OF_ROAD_LABEL[decodeResult.side_of_road] ?? decodeResult.side_of_road} />}
+        {!isPal && <RefField label="Pos Offset" value={posOff} mono />}
+        {!isPal && <RefField label="Neg Offset" value={negOff} mono />}
+      </div>
       {lrps?.length > 0 && (
-        <table className="tp-table tp-lrp-table">
-          <thead>
-            <tr>
-              <th>#</th><th>Lon</th><th>Lat</th><th>FRC</th><th>FOW</th>
-              <th>LFRCNP</th><th>Bearing</th><th>DNP</th>
-            </tr>
-          </thead>
-          <tbody>
-            {lrps.map((l, i) => (
-              <tr
-                key={i}
-                className="tp-lrp-row"
-                title="Click to pan to this LRP"
-                onClick={() => setTraceLrpFocus({ ...l, index: i })}
-              >
-                <td className="tp-dim">LRP{i + 1}</td>
-                <td>{l.lon.toFixed(5)}</td>
-                <td>{l.lat.toFixed(5)}</td>
-                <td>{l.frc}</td>
-                <td>{l.fow}</td>
-                <td>{l.lfrcnp != null
-                  ? (lfrcnpTolerance > 0
-                    ? `${l.lfrcnp} → ${Math.min(l.lfrcnp + lfrcnpTolerance, 7)}`
-                    : l.lfrcnp)
-                  : '—'}</td>
-                <td className="tp-monospace">
-                  {Math.abs(l.bearing_ub - l.bearing_lb) < 0.1
-                    ? `${l.bearing_lb.toFixed(1)}°`
-                    : `${l.bearing_lb.toFixed(1)}°–${l.bearing_ub.toFixed(1)}°`}
-                </td>
-                <td className="tp-monospace">
-                  {l.dnp_lb == null ? '—' : fmtDnp(l.dnp_lb, l.dnp_ub)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="tp-lrp-list">
+          {lrps.map((l, i) => (
+            <LrpItem
+              key={i}
+              lrp={l}
+              index={i}
+              isLast={i === lrps.length - 1}
+              setTraceLrpFocus={setTraceLrpFocus}
+              lfrcnpTolerance={lfrcnpTolerance}
+            />
+          ))}
+        </div>
       )}
     </Section>
   );
@@ -656,10 +644,55 @@ function OffsetsSection({ offsets }) {
 
 // ── Result section ────────────────────────────────────────────────────────────
 
-function ResultSection({ decodeResult }) {
+// WKT here is always either "POINT(lon lat)" or "LINESTRING(lon1 lat1, ...)"
+// (see decodeResult.wkt, computed backend-side, trimmed at the offset LB for
+// maximum extent) -- simple enough to convert to a GeoJSON geometry directly
+// without a full WKT parsing library.
+function wktToGeoJsonGeometry(wkt) {
+  if (!wkt) return null;
+  const point = wkt.match(/^POINT\s*\(\s*([-\d.]+)\s+([-\d.]+)\s*\)$/i);
+  if (point) return { type: 'Point', coordinates: [parseFloat(point[1]), parseFloat(point[2])] };
+  const line = wkt.match(/^LINESTRING\s*\((.+)\)$/i);
+  if (line) {
+    const coordinates = line[1].split(',').map(pair => pair.trim().split(/\s+/).map(Number));
+    return { type: 'LineString', coordinates };
+  }
+  return null;
+}
+
+function ResultSection({ decodeResult, openlrString }) {
   if (!decodeResult) return null;
+  const canCopy = decodeResult.ok && !!decodeResult.wkt;
+
+  const copyWkt = () => {
+    navigator.clipboard.writeText(decodeResult.wkt).catch(() => {});
+  };
+  const copyGeoJson = () => {
+    const geometry = wktToGeoJsonGeometry(decodeResult.wkt);
+    if (!geometry) return;
+    const feature = {
+      type: 'Feature',
+      properties: {
+        openlr: openlrString,
+        location_type: decodeResult.location_type,
+        format: decodeResult.format,
+      },
+      geometry,
+    };
+    navigator.clipboard.writeText(JSON.stringify(feature, null, 2)).catch(() => {});
+  };
+
   return (
-    <Section title="Result" defaultOpen={true}>
+    <Section
+      title="Result"
+      defaultOpen={true}
+      actions={canCopy && (
+        <>
+          <button className="tp-copy-btn" title="Copy WKT to clipboard" onClick={copyWkt}>Copy WKT</button>
+          <button className="tp-copy-btn" title="Copy GeoJSON to clipboard" onClick={copyGeoJson}>Copy GeoJSON</button>
+        </>
+      )}
+    >
       <div className={`tp-row ${decodeResult.ok ? 'tp-ok' : 'tp-err'}`}>
         {decodeResult.ok ? '✓ Decoded' : '✗ Failed'}
         {decodeResult.ok && ` · ${decodeResult.segments?.length ?? 0} segment${decodeResult.segments?.length !== 1 ? 's' : ''}`}
@@ -668,12 +701,6 @@ function ResultSection({ decodeResult }) {
       </div>
       {!decodeResult.ok && decodeResult.error && (
         <div className="tp-err tp-row">{decodeResult.error}</div>
-      )}
-      {decodeResult.ok && decodeResult.wkt && (
-        <div className="tp-wkt-row">
-          <div className="tp-wkt tp-monospace tp-dim">{decodeResult.wkt.slice(0, 140)}{decodeResult.wkt.length > 140 ? '…' : ''}</div>
-          <button className="tp-copy-btn" title="Copy WKT (trimmed at LB — maximum extent)" onClick={() => navigator.clipboard.writeText(decodeResult.wkt)}>⎘</button>
-        </div>
       )}
     </Section>
   );
@@ -889,7 +916,7 @@ export default function TracePanel() {
 
             {offsets.length > 0 && <OffsetsSection offsets={offsets} />}
 
-            <ResultSection decodeResult={decodeResult} />
+            <ResultSection decodeResult={decodeResult} openlrString={openlrString} />
 
             <ForcedDecodeSection
               forcedDecodeResult={forcedDecodeResult}

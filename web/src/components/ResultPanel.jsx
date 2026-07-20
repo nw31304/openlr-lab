@@ -2,19 +2,14 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useStore, getSegGeomCache } from '../store.js';
 import { diagnoseFailure, diagnoseSuccess } from '../diagnosis.js';
 import { renderLlmText } from '../renderLlmText.jsx';
-import { applyOffsets, computeTraversalDirections } from '../utils.js';
+import { computeTraversalDirections } from '../utils.js';
 import EncodeResultPanel from './EncodeResultPanel.jsx';
+import {
+  isPointAlongLine, formatOpenlrFormat, frcLabel, fowLabel, fmtBearing, fmtInterval,
+  offsetRowValue, lfrcnpFull, ORIENTATION_LABEL, SIDE_OF_ROAD_LABEL,
+} from '../refFormat.js';
 
 // ── Reference panel helpers ───────────────────────────────────────────────────
-
-const FRC_LABEL = [
-  'FRC0 · Motorway', 'FRC1 · Trunk', 'FRC2 · Secondary', 'FRC3 · Tertiary',
-  'FRC4 · Unclassified', 'FRC5 · Residential', 'FRC6 · Service/Link', 'FRC7 · Other/Path',
-];
-const FOW_LABEL = [
-  'Undefined', 'Motorway', 'Dual Carriageway', 'Single Carriageway',
-  'Roundabout', 'Traffic Square', 'Slip Road', 'Other',
-];
 
 const HELP = {
   frc:     'Functional Road Class (0–7): how important the road is (0 = motorway, 7 = local path). Candidates must match within the configured FRC tolerance.',
@@ -27,19 +22,6 @@ const HELP = {
 
 function Help({ field }) {
   return <span className="ref-help" title={HELP[field]}>?</span>;
-}
-
-function fmtBearing(lb, ub) {
-  return Math.abs(ub - lb) < 0.1
-    ? `${lb.toFixed(1)}°`
-    : `${lb.toFixed(1)}°–${ub.toFixed(1)}°`;
-}
-
-function fmtInterval(lb, ub) {
-  if (lb == null) return null;
-  return Math.abs(ub - lb) < 0.1
-    ? `${lb.toFixed(0)} m`
-    : `${lb.toFixed(0)}–${ub.toFixed(0)} m`;
 }
 
 function RefSect({ title, children, defaultOpen = true }) {
@@ -64,41 +46,73 @@ function RefRow({ label, value, helpKey }) {
   );
 }
 
-function fmtOffsetValue(lb, ub, approximate) {
-  if (lb == null || ub == null) return null;
-  const str = Math.abs(ub - lb) < 0.1
-    ? `${lb.toFixed(0)} m`
-    : `${lb.toFixed(0)}–${ub.toFixed(0)} m`;
-  return approximate ? `${str} *` : str;
+function LrpCard({ lrp, index: i, isLast, onLrpClick, lfrcnpTolerance }) {
+  const [expanded, setExpanded] = useState(false);
+  const isFirst = i === 0;
+  const role    = isFirst ? 'First' : isLast ? 'Last' : 'Intermediate';
+  const dotCls  = isFirst ? 'first' : isLast ? 'last' : 'mid';
+  const dnpStr  = !isLast ? fmtInterval(lrp.dnp_lb, lrp.dnp_ub) : null;
+  const latDir  = lrp.lat >= 0 ? 'N' : 'S';
+  const lonDir  = lrp.lon >= 0 ? 'E' : 'W';
+
+  return (
+    <div className="lrp-card">
+      <div
+        className="lrp-card-hdr"
+        title="Click to zoom to this LRP on the map"
+        onClick={() => onLrpClick?.({
+          index: i, lat: lrp.lat, lon: lrp.lon,
+          frc: lrp.frc, fow: lrp.fow,
+          lfrcnp: lrp.lfrcnp ?? null,
+          bearing_lb: lrp.bearing_lb, bearing_ub: lrp.bearing_ub,
+        })}
+      >
+        <button
+          className="lrp-card-toggle"
+          onClick={(e) => { e.stopPropagation(); setExpanded(x => !x); }}
+          title={expanded ? 'Collapse' : 'Expand'}
+        >
+          {expanded ? '▾' : '▸'}
+        </button>
+        <span className={`lrp-dot lrp-dot-${dotCls}`} />
+        <span className="lrp-card-title">LRP {i + 1} · {role}</span>
+        {!expanded && (
+          <span className="lrp-card-summary">
+            {Math.abs(lrp.lat).toFixed(4)}°{latDir} {Math.abs(lrp.lon).toFixed(4)}°{lonDir}
+            {' · '}FRC{lrp.frc} · FOW{lrp.fow}
+            {!isLast && lrp.lfrcnp != null ? ` · LFRCNP ${lrp.lfrcnp}` : ''}
+          </span>
+        )}
+      </div>
+      {expanded && (
+        <div className="lrp-card-body">
+          <RefRow label="Coord"
+            value={`${Math.abs(lrp.lat).toFixed(5)}°${latDir}  ${Math.abs(lrp.lon).toFixed(5)}°${lonDir}`} />
+          <RefRow label="FRC"     helpKey="frc"     value={frcLabel(lrp.frc)} />
+          <RefRow label="FOW"     helpKey="fow"     value={fowLabel(lrp.fow)} />
+          <RefRow label="Bearing" helpKey="bearing" value={fmtBearing(lrp.bearing_lb, lrp.bearing_ub)} />
+          {!isLast && dnpStr &&
+            <RefRow label="DNP" helpKey="dnp" value={dnpStr} />}
+          {!isLast && lrp.lfrcnp != null &&
+            <RefRow label="LFRCNP" helpKey="lfrcnp" value={lfrcnpFull(lrp.lfrcnp, lfrcnpTolerance)} />}
+        </div>
+      )}
+    </div>
+  );
 }
 
-const ORIENTATION_LABEL = {
-  NoOrientation:       'No orientation',
-  FirstTowardSecond:   'First → Second',
-  SecondTowardFirst:   'Second → First',
-  BothDirections:      'Both directions',
-};
-const SIDE_OF_ROAD_LABEL = {
-  DirectlyOnOrNA: 'Directly on / N/A',
-  Right:          'Right',
-  Left:           'Left',
-  Both:           'Both sides',
-};
-
-function ReferenceSection({ decodeResult, onLrpClick }) {
+function ReferenceSection({ decodeResult, onLrpClick, lfrcnpTolerance = 0 }) {
   const { format, location_type, lrps, pos_offset_lb, pos_offset_ub,
           neg_offset_lb, neg_offset_ub, offsets_approximate,
           orientation, side_of_road } = decodeResult;
-  const isV3  = format === 'TomTomV3';
   const hasPos = pos_offset_ub > 0;
   const hasNeg = neg_offset_ub > 0;
-  const isPal  = location_type === 'PointAlongLine' || location_type === 'PoiWithAccessPoint';
+  const isPal  = isPointAlongLine(location_type);
 
   return (
     <div className="ref-section">
       <RefSect title="Reference" defaultOpen={true}>
-        <RefRow label="Format"
-          value={isV3 ? 'TomTomV3 (binary v3)' : 'TPEG-OLR (ISO 21219-22)'} />
+        <RefRow label="Format" value={formatOpenlrFormat(format)} />
         <RefRow label="Type"   value={location_type} />
         <RefRow label="LRPs"   value={lrps.length} />
         {isPal && orientation != null && (
@@ -107,55 +121,27 @@ function ReferenceSection({ decodeResult, onLrpClick }) {
         {isPal && side_of_road != null && (
           <RefRow label="Side of road" value={SIDE_OF_ROAD_LABEL[side_of_road] ?? side_of_road} />
         )}
-        {(hasPos || hasNeg) && <>
-          {hasPos && <RefRow label="Pos. offset" helpKey="offset"
-            value={fmtOffsetValue(pos_offset_lb, pos_offset_ub, offsets_approximate)} />}
-          {hasNeg && <RefRow label="Neg. offset" helpKey="offset"
-            value={fmtOffsetValue(neg_offset_lb, neg_offset_ub, offsets_approximate)} />}
-          {offsets_approximate && <div className="ref-offset-note">* estimated from DNP sum — exact value depends on actual path length</div>}
+        {!isPal && <>
+          <RefRow label="Pos. offset" helpKey="offset"
+            value={offsetRowValue(hasPos, pos_offset_lb, pos_offset_ub, offsets_approximate)} />
+          <RefRow label="Neg. offset" helpKey="offset"
+            value={offsetRowValue(hasNeg, neg_offset_lb, neg_offset_ub, offsets_approximate)} />
+          {offsets_approximate && (hasPos || hasNeg) &&
+            <div className="ref-offset-note">* estimated from DNP sum — exact value depends on actual path length</div>}
         </>}
       </RefSect>
 
       <RefSect title="Location Reference Points" defaultOpen={true}>
-        {lrps.map((lrp, i) => {
-          const isFirst = i === 0;
-          const isLast  = i === lrps.length - 1;
-          const role    = isFirst ? 'First' : isLast ? 'Last' : 'Intermediate';
-          const dotCls  = isFirst ? 'first' : isLast ? 'last' : 'mid';
-          const dnpStr  = fmtInterval(lrp.dnp_lb, lrp.dnp_ub);
-          const latDir  = lrp.lat >= 0 ? 'N' : 'S';
-          const lonDir  = lrp.lon >= 0 ? 'E' : 'W';
-          return (
-            <div key={i} className="lrp-card">
-              <button
-                className="lrp-card-hdr"
-                title="Zoom to this LRP on the map"
-                onClick={() => onLrpClick?.({
-                  index: i, lat: lrp.lat, lon: lrp.lon,
-                  frc: lrp.frc, fow: lrp.fow,
-                  lfrcnp: lrp.lfrcnp ?? null,
-                  bearing_lb: lrp.bearing_lb, bearing_ub: lrp.bearing_ub,
-                })}
-              >
-                <span className={`lrp-dot lrp-dot-${dotCls}`} />
-                LRP {i + 1} · {role}
-              </button>
-              <RefRow label="Coord"
-                value={`${Math.abs(lrp.lat).toFixed(5)}°${latDir}  ${Math.abs(lrp.lon).toFixed(5)}°${lonDir}`} />
-              <RefRow label="FRC"     helpKey="frc"
-                value={FRC_LABEL[lrp.frc] ?? `FRC${lrp.frc}`} />
-              <RefRow label="FOW"     helpKey="fow"
-                value={FOW_LABEL[lrp.fow] != null ? `FOW${lrp.fow} · ${FOW_LABEL[lrp.fow]}` : `FOW${lrp.fow}`} />
-              <RefRow label="Bearing" helpKey="bearing"
-                value={fmtBearing(lrp.bearing_lb, lrp.bearing_ub)} />
-              {!isLast && dnpStr &&
-                <RefRow label="DNP" helpKey="dnp" value={dnpStr} />}
-              {!isLast && lrp.lfrcnp != null &&
-                <RefRow label="LFRCNP" helpKey="lfrcnp"
-                  value={FRC_LABEL[lrp.lfrcnp] ?? `FRC${lrp.lfrcnp}`} />}
-            </div>
-          );
-        })}
+        {lrps.map((lrp, i) => (
+          <LrpCard
+            key={i}
+            lrp={lrp}
+            index={i}
+            isLast={i === lrps.length - 1}
+            onLrpClick={onLrpClick}
+            lfrcnpTolerance={lfrcnpTolerance}
+          />
+        ))}
       </RefSect>
     </div>
   );
@@ -196,50 +182,66 @@ export default function ResultPanel() {
   function doExportGeoJSON() {
     if (!decodeResult?.ok) return;
     const cache = getSegGeomCache();
-    const segments = decodeResult.segments ?? [];
-    const traversalDirs = computeTraversalDirections(segments, cache);
+    const allSegments = decodeResult.segments ?? [];
+    const traversalDirs = computeTraversalDirections(allSegments, cache);
 
-    let allCoords = [];
-    for (let i = 0; i < segments.length; i++) {
-      const feat = cache.get(segments[i].segment_id);
-      if (!feat) continue;
-      let coords = feat.geometry.coordinates;
-      if (traversalDirs[i] === 'Reverse') coords = [...coords].reverse();
-      if (allCoords.length === 0) allCoords.push(...coords);
-      else allCoords.push(...coords.slice(1));
-    }
+    // Keep only segments at least partially covered by the (conservative,
+    // LB-trimmed) location -- segments entirely bypassed by the offsets are
+    // dropped. Each kept segment's own geometry is exported whole/untrimmed
+    // (including the boundary segments, which are only *partially* covered)
+    // -- see covered_pos_offset/covered_neg_offset below for exactly how far
+    // into those boundary segments the true location actually starts/ends.
+    const { covered_start_idx, covered_end_idx } = decodeResult;
+    const hasCoverageRange = covered_start_idx != null && covered_end_idx != null;
+    const startIdx = hasCoverageRange ? covered_start_idx : 0;
+    const endIdx   = hasCoverageRange ? covered_end_idx   : allSegments.length - 1;
 
-    const posM = ((decodeResult.pos_offset_lb ?? 0) + (decodeResult.pos_offset_ub ?? 0)) / 2;
-    const negM = ((decodeResult.neg_offset_lb ?? 0) + (decodeResult.neg_offset_ub ?? 0)) / 2;
-    const trimmed = applyOffsets(allCoords, posM, negM);
-
-    let wkt = null;
-    if (decodeResult.location_type === 'PointAlongLine' && decodeResult.point_lon != null) {
-      wkt = `POINT(${decodeResult.point_lon.toFixed(7)} ${decodeResult.point_lat.toFixed(7)})`;
-    } else if (trimmed.length >= 2) {
-      wkt = `LINESTRING(${trimmed.map(([lo, la]) => `${lo.toFixed(7)} ${la.toFixed(7)}`).join(', ')})`;
-    }
-
-    const features = segments.map((seg, i) => {
+    const features = [];
+    for (let i = startIdx; i <= endIdx; i++) {
+      const seg = allSegments[i];
       const feat = cache.get(seg.segment_id);
       let coords = feat?.geometry?.coordinates ?? null;
       if (coords && traversalDirs[i] === 'Reverse') coords = [...coords].reverse();
-      return {
+      features.push({
         type: 'Feature',
         properties: { frc: seg.frc, fow: seg.fow, direction: traversalDirs[i], length_m: seg.length_m },
         geometry: coords ? { type: 'LineString', coordinates: coords } : null,
-      };
-    });
+      });
+    }
+
+    // The backend's own wkt is already conservatively trimmed (path_to_wkt,
+    // LB-based -- maximal guaranteed coverage) -- reuse it directly rather
+    // than recomputing a (less conservative) trim here. PointAlongLine has
+    // no line wkt to reuse; a POINT is built from the decoded point instead.
+    let wkt = null;
+    if (decodeResult.location_type === 'PointAlongLine' && decodeResult.point_lon != null) {
+      wkt = `POINT(${decodeResult.point_lon.toFixed(7)} ${decodeResult.point_lat.toFixed(7)})`;
+    } else {
+      wkt = decodeResult.wkt ?? null;
+    }
 
     const hasPos = (decodeResult.pos_offset_ub ?? 0) > 0;
     const hasNeg = (decodeResult.neg_offset_ub ?? 0) > 0;
+    // Offsets re-expressed relative to the covered segment list's own first/
+    // last boundary (rather than the original LRP position), since that's
+    // the frame of reference someone consuming `features` actually sees --
+    // always a [lb, ub] interval, never a midpoint estimate.
+    const posOffsetFromCoveredStart = hasPos
+      ? [decodeResult.covered_pos_offset_lb ?? decodeResult.pos_offset_lb,
+         decodeResult.covered_pos_offset_ub ?? decodeResult.pos_offset_ub]
+      : null;
+    const negOffsetFromCoveredEnd = hasNeg
+      ? [decodeResult.covered_neg_offset_lb ?? decodeResult.neg_offset_lb,
+         decodeResult.covered_neg_offset_ub ?? decodeResult.neg_offset_ub]
+      : null;
+
     const fc = {
       type: 'FeatureCollection',
       metadata: {
-        openlr:           openlrString,
-        location_type:    decodeResult.location_type,
-        pos_offset_range: hasPos ? [decodeResult.pos_offset_lb, decodeResult.pos_offset_ub] : null,
-        neg_offset_range: hasNeg ? [decodeResult.neg_offset_lb, decodeResult.neg_offset_ub] : null,
+        openlr:                        openlrString,
+        location_type:                 decodeResult.location_type,
+        pos_offset_from_covered_start_m: posOffsetFromCoveredStart,
+        neg_offset_from_covered_end_m:   negOffsetFromCoveredEnd,
         ...(decodeResult.location_type === 'PointAlongLine' && decodeResult.point_lon != null
           ? { point_lat: decodeResult.point_lat, point_lon: decodeResult.point_lon }
           : {}),
@@ -294,7 +296,8 @@ export default function ResultPanel() {
       {hasRef && (
         <>
           <div className="ref-area" style={{ height: refHeight }}>
-            <ReferenceSection decodeResult={decodeResult} onLrpClick={setTraceLrpFocus} />
+            <ReferenceSection decodeResult={decodeResult} onLrpClick={setTraceLrpFocus}
+              lfrcnpTolerance={params.lfrcnp_tolerance ?? 0} />
           </div>
           <div
             className="panel-split-handle"
@@ -352,6 +355,8 @@ export default function ResultPanel() {
                     {decodeResult.segments.map((s, i) => {
                       const isActive = highlightedSegment?.tile === s.tile &&
                                        highlightedSegment?.local_index === s.local_index;
+                      const isUncovered = decodeResult.covered_start_idx != null &&
+                        (i < decodeResult.covered_start_idx || i > decodeResult.covered_end_idx);
                       return (
                         <tr key={i} className={isActive ? 'seg-row-active' : ''}>
                           <td>
@@ -364,6 +369,9 @@ export default function ResultPanel() {
                                 if (nowActive) requestInfoSegment(s.tile, s.local_index);
                               }}
                             >{s.stable_id ?? s.segment_id ?? i + 1}</button>
+                            {isUncovered && (
+                              <span className="seg-uncovered-mark" title="Bypassed by the offsets — not part of the final location">*</span>
+                            )}
                           </td>
                           <td>{FRC_NAMES[s.frc] ?? s.frc}</td>
                           <td>{FOW_NAMES[s.fow] ?? s.fow}</td>
@@ -375,6 +383,10 @@ export default function ResultPanel() {
                   </tbody>
                 </table>
               </div>
+              {decodeResult.covered_start_idx != null &&
+                decodeResult.segments.some((_, i) => i < decodeResult.covered_start_idx || i > decodeResult.covered_end_idx) && (
+                <div className="seg-uncovered-note">* bypassed by the offsets — not part of the final location</div>
+              )}
               {decodeResult.location_type === 'PointAlongLine' && decodeResult.point_lon != null && (
                 <div className="pal-point-info">
                   <div className="pal-point-row">
