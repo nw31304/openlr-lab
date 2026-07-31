@@ -124,6 +124,28 @@ const BASEMAPS = [
   { id: 'maptoolkit',  label: 'Maptoolkit',   style: 'https://styles.maptoolkit.org/street.json' },
 ];
 
+// Maptoolkit's hosted style JSON has several layers (tunnel/bridge "blur"
+// variants) with a typo'd paint property, `line-layer-opacity` instead of
+// `line-opacity`. This isn't just a console warning: MapLibre's `Style#_load`
+// gates its *entire* body (addSource/_createLayers/`style.load` firing) on
+// "style validation found zero errors" — one bad property anywhere in the
+// ~100 layers silently aborts the whole load, forever (a solid blank map,
+// no tiles ever requested). Disabling validation outright isn't safe either
+// — layer construction itself throws on the unrecognized property once
+// validation isn't there to strip it first. So this runs inside
+// `transformStyle`, which MapLibre applies *before* validation, fixing the
+// known-bad property so validation (and everything downstream of it) sees a
+// clean style.
+function sanitizeMaptoolkitStyle(style) {
+  for (const layer of style.layers ?? []) {
+    if (layer.paint && 'line-layer-opacity' in layer.paint) {
+      const { 'line-layer-opacity': mistyped, ...rest } = layer.paint;
+      layer.paint = { 'line-opacity': mistyped, ...rest };
+    }
+  }
+  return style;
+}
+
 // Custom sources/layers to preserve across basemap switches via transformStyle.
 const CUSTOM_SOURCES = new Set([
   'olr-segments', 'olr-nodes', 'decoded-path', 'decoded-path-boundaries', 'lrp-markers',
@@ -824,7 +846,10 @@ export default function MapView({ tilesBase, ready }) {
 
     const map = new maplibregl.Map({
       container: mapContainer.current,
-      style:     'https://styles.maptoolkit.org/street.json',
+      // No `style` here — set below via setStyle()+transformStyle so the
+      // initial load goes through the same sanitizeMaptoolkitStyle() pass as
+      // every basemap switch (see handleBasemapChange and the comment on
+      // sanitizeMaptoolkitStyle for why that's required).
       // Conservative default: the whole world. Overridden by the effect below
       // once the configured PMTiles archive's own bounds are known (or left
       // as-is if that lookup fails or the page loaded with an explicit
@@ -872,6 +897,14 @@ export default function MapView({ tilesBase, ready }) {
       for (const [srcId, src] of Object.entries(style.sources ?? {})) {
         if (src.type === 'raster-dem' && !stillUsed.has(srcId)) map.removeSource(srcId);
       }
+    });
+
+    // Kick off the initial style load (default basemap is 'maptoolkit' — see
+    // useState below). Routed through setStyle()+transformStyle, not the
+    // constructor's `style` option, so it gets the same sanitizeMaptoolkitStyle()
+    // pass as every basemap switch in handleBasemapChange.
+    map.setStyle(BASEMAPS.find(b => b.id === basemap).style, {
+      transformStyle: (previous, next) => sanitizeMaptoolkitStyle(next),
     });
 
     map.on('load', () => {
@@ -1652,7 +1685,7 @@ export default function MapView({ tilesBase, ready }) {
       // hillshade/raster-dem (see the 'style.load' handler in the map-init
       // effect, which covers this uniformly for every style load including
       // the very first one) happens after this transform, not here.
-      transformStyle: (previous, next) => ({
+      transformStyle: (previous, next) => sanitizeMaptoolkitStyle({
         ...next,
         sources: {
           ...next.sources,
