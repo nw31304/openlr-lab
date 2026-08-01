@@ -146,6 +146,45 @@ function sanitizeMaptoolkitStyle(style) {
   return style;
 }
 
+// Builds a WKT geometry string from a GeoJSON-style [lon,lat][] coordinate
+// array — segments are always LineStrings (node-to-node edges), a single
+// coordinate is the degenerate zero-length case.
+function segCoordsToWkt(coords) {
+  if (!coords?.length) return null;
+  if (coords.length === 1) return `POINT(${coords[0][0]} ${coords[0][1]})`;
+  return `LINESTRING(${coords.map(([lon, lat]) => `${lon} ${lat}`).join(', ')})`;
+}
+
+// Builds a GeoJSON Feature for the segment currently shown in the seg-info
+// popup, for the "Copy GeoJSON" action. `infoProps` is the popup's state —
+// see the setInfoProps() call sites, each of which attaches `geometry`
+// (the clicked feature's GeoJSON geometry) alongside the tile-decoded
+// attributes. Properties cover every physical (frc/fow/direction/length/
+// nodes) and OpenLR-vocabulary (frc/fow are OpenLR's own classification
+// terms) attribute segments carry — bearing/DNP/offsets are LRP-level, not
+// segment-level (see CLAUDE.md §7), so they don't apply here.
+function segInfoToGeoJsonFeature(infoProps) {
+  if (!infoProps?.geometry) return null;
+  return {
+    type: 'Feature',
+    properties: {
+      segment_id:  infoProps.segment_id  ?? null,
+      stable_id:   infoProps.stable_id   ?? null,
+      frc:         infoProps.frc,
+      frc_name:    infoProps.frc_name,
+      fow:         infoProps.fow,
+      fow_name:    infoProps.fow_name,
+      direction:   infoProps.direction,
+      length_m:    infoProps.length_m != null ? Number(infoProps.length_m) : null,
+      start_node:  infoProps.start_node  ?? null,
+      end_node:    infoProps.end_node    ?? null,
+      tile:        infoProps.tile,
+      local_index: infoProps.local_index,
+    },
+    geometry: infoProps.geometry,
+  };
+}
+
 // Custom sources/layers to preserve across basemap switches via transformStyle.
 const CUSTOM_SOURCES = new Set([
   'olr-segments', 'olr-nodes', 'decoded-path', 'decoded-path-boundaries', 'lrp-markers',
@@ -517,6 +556,12 @@ export default function MapView({ tilesBase, ready }) {
   const nodesCacheRef   = useRef(new Map());
   const pendingCountRef = useRef(0);
   const pmtilesRef      = useRef(null);
+  // Bumped at the start of every loadVisibleTiles() call. A call's async tile
+  // fetch checks this after awaiting — if a newer call has since started
+  // (e.g. the user zoomed out again before this one's fetch finished), this
+  // one's completion is stale and must not overwrite what the newer call
+  // already wrote (including an empty clear at a since-reached low zoom).
+  const loadGenerationRef = useRef(0);
   // Captured once, before the map is constructed, so a later effect can tell
   // whether the page loaded with an explicit #hash (bookmark/share link) —
   // if so, the auto-fit-to-dataset-bounds effect below must not override it.
@@ -595,6 +640,12 @@ export default function MapView({ tilesBase, ready }) {
   const setTraceLrpFocus      = useStore(s => s.setTraceLrpFocus);
   const mapFlyTo              = useStore(s => s.mapFlyTo);
   const showSegmentLayer      = useStore(s => s.showSegmentLayer);
+  // Always-current ref so the map's 'load' handler (which fires once, and may
+  // fire after the user has already toggled Segments on) can read the latest
+  // value without depending on the [showSegmentLayer] effect having run —
+  // see the 'load' handler below for why that matters.
+  const showSegmentLayerRef = useRef(showSegmentLayer);
+  useEffect(() => { showSegmentLayerRef.current = showSegmentLayer; }, [showSegmentLayer]);
   const searchRadiusM         = useStore(s => s.params.candidate_search_radius_m);
   const lfrcnpTolerance       = useStore(s => s.params.lfrcnp_tolerance ?? 0);
   // In encode mode these read the round-trip verify-decode's replay data
@@ -818,7 +869,7 @@ export default function MapView({ tilesBase, ready }) {
     // fitBounds and then register the moveend listener — storing the target coord
     // in pendingPopupCoordRef lets it project AFTER the animation settles.
     closeAllPopups();
-    setInfoProps({ ...feat.properties, segment_id: segId });
+    setInfoProps({ ...feat.properties, segment_id: segId, geometry: feat.geometry });
 
     const coords = feat.geometry.coordinates;
     pendingPopupCoordRef.current = polylineMid(coords);
@@ -952,6 +1003,12 @@ export default function MapView({ tilesBase, ready }) {
         id:     'olr-nodes-circle',
         type:   'circle',
         source: 'olr-nodes',
+        // Segment lines are legible (and useful for seeing road-network shape/
+        // FRC colour) from MIN_LOAD_ZOOM (10), but a marker at every single
+        // junction is what actually turns dense areas into unreadable clutter
+        // that early. Node data still loads at MIN_LOAD_ZOOM same as segments —
+        // this just delays *rendering* them until they're legible on their own.
+        minzoom: 13,
         layout: { visibility: 'none' },
         paint: {
           'circle-radius':       5,
@@ -1588,6 +1645,16 @@ export default function MapView({ tilesBase, ready }) {
       map.on('mousemove', e => { const c = [e.lngLat.lng, e.lngLat.lat]; setCursorCoord(c); cursorCoordRef.current = c; });
       map.getCanvas().addEventListener('mouseleave', () => { setCursorCoord(null); cursorCoordRef.current = null; });
 
+      // These layers were just created with visibility:'none' regardless of
+      // the current showSegmentLayer toggle — if the user already turned
+      // Segments on before 'load' fired (very plausible on a fresh deep-zoom
+      // page load, while the style/basemap is still settling), the toggle
+      // effect ran earlier against layers that didn't exist yet and did
+      // nothing, and it won't re-run again since showSegmentLayer itself
+      // hasn't changed since. Re-apply the current value now that the
+      // layers actually exist, rather than leaving it invisible until the
+      // user happens to toggle Segments off and back on.
+      applySegmentLayerVisibility(map, showSegmentLayerRef.current);
       loadVisibleTiles(map);
     });
 
@@ -1715,11 +1782,59 @@ export default function MapView({ tilesBase, ready }) {
 
   // ── Tile loading ─────────────────────────────────────────────────────────────
 
+  function clearSegmentSources(map) {
+    if (map.getSource('olr-segments')) map.getSource('olr-segments').setData({ type: 'FeatureCollection', features: [] });
+    if (map.getSource('olr-nodes'))    map.getSource('olr-nodes').setData({ type: 'FeatureCollection', features: [] });
+  }
+
+  // Shared by the showSegmentLayer-toggle effect and the map's 'load' handler
+  // (which needs to apply whatever the toggle's current value already is to
+  // the layers it just created — see the 'load' handler for why that's
+  // necessary, not optional).
+  function applySegmentLayerVisibility(map, visible) {
+    const vis = visible ? 'visible' : 'none';
+    for (let frc = 0; frc < 8; frc++) {
+      if (map.getLayer(`olr-frc${frc}`)) map.setLayoutProperty(`olr-frc${frc}`, 'visibility', vis);
+    }
+    if (map.getLayer('olr-highlight'))    map.setLayoutProperty('olr-highlight',    'visibility', vis);
+    if (map.getLayer('olr-nodes-circle')) map.setLayoutProperty('olr-nodes-circle', 'visibility', vis);
+  }
+
   async function loadVisibleTiles(map) {
-    if (!map.isStyleLoaded()) return;
-    const zoom = map.getZoom();
-    if (zoom < MIN_LOAD_ZOOM) {
+    // Bumped unconditionally, before any other check, so an older in-flight
+    // call's eventual completion can always detect it's been superseded
+    // (see the checks further down) — regardless of which branch below runs.
+    const myGen = ++loadGenerationRef.current;
+
+    // Checked BEFORE isStyleLoaded()/idle-deferral, deliberately: clearing
+    // our own two sources doesn't depend on anything else (basemap tiles,
+    // other sources) finishing first. Gating this behind isStyleLoaded() was
+    // itself a bug — while a big archive's prior fetch is still draining,
+    // isStyleLoaded() stays false for seconds at a time, so a zoomed-out
+    // call would silently defer via once('idle', ...) instead of clearing,
+    // leaving stale (and much denser than intended) data on screen for that
+    // entire window.
+    if (map.getZoom() < MIN_LOAD_ZOOM) {
       setStatus(`Zoom in past ${MIN_LOAD_ZOOM} to load road segments`);
+      // Clear whatever was last loaded at a higher zoom — otherwise it just
+      // stays rendered forever once you zoom back out past MIN_LOAD_ZOOM.
+      clearSegmentSources(map);
+      return;
+    }
+
+    if (!map.isStyleLoaded()) {
+      // isStyleLoaded() can stay false for a while after 'load' fires, while
+      // other basemap sources (unrelated to ours) are still fetching.
+      // map.once('idle', ...) looks like the natural fix (retry once things
+      // settle), but 'idle' only fires on the *next* busy→idle transition —
+      // if the map happens to already be at rest by the time this call
+      // registers the listener (very likely after a burst of rapid zoom
+      // events, each deferring in turn), no future 'idle' event ever comes
+      // to fire it, and this position is stuck with nothing loaded until the
+      // user happens to pan/zoom again. requestAnimationFrame just re-checks
+      // unconditionally next frame — cheap, and guaranteed to make progress
+      // regardless of whether the map ever fires another event on its own.
+      requestAnimationFrame(() => loadVisibleTiles(map));
       return;
     }
     setStatus(null);
@@ -1735,11 +1850,17 @@ export default function MapView({ tilesBase, ready }) {
         return;
       }
     }
+    // Superseded while awaiting the manifest fetch above, or the map has
+    // since been zoomed/panned away from where this call's tiles apply.
+    if (myGen !== loadGenerationRef.current || map.getZoom() < MIN_LOAD_ZOOM) return;
 
     const tileCache = tileCacheRef.current;
     const tiles   = tilesForBounds(map.getBounds(), TILE_ZOOM);
     const missing = tiles.filter(({ z, x, y }) => !tileCache.has(`${z}/${x}/${y}`));
-    if (missing.length === 0) { rebuildSource(map, tiles); return; }
+    if (missing.length === 0) {
+      rebuildSource(map, tiles);
+      return;
+    }
 
     pendingCountRef.current += missing.length;
     setStatus(`Loading ${pendingCountRef.current} tile${pendingCountRef.current > 1 ? 's' : ''}…`);
@@ -1765,6 +1886,13 @@ export default function MapView({ tilesBase, ready }) {
       }
     }));
 
+    // This call may have been superseded by a newer one while the fetch
+    // above was in flight — including one that already zoomed out past
+    // MIN_LOAD_ZOOM and cleared the source. Re-check the CURRENT zoom
+    // directly (not just the generation counter) before writing: a slow
+    // fetch started while zoom was >= MIN_LOAD_ZOOM must never resurrect
+    // stale data after the map has since dropped below it.
+    if (myGen !== loadGenerationRef.current || map.getZoom() < MIN_LOAD_ZOOM) return;
     rebuildSource(map, tiles);
   }
 
@@ -1879,7 +2007,7 @@ export default function MapView({ tilesBase, ready }) {
     }
     closeAllPopups();
     setHighlightedSegment({ tile: props.tile, local_index: props.local_index });
-    setInfoProps({ ...props, segment_id: segId >= 0 ? segId : null });
+    setInfoProps({ ...props, segment_id: segId >= 0 ? segId : null, geometry: bestFeat.geometry });
     e.originalEvent.stopPropagation();
   }
 
@@ -1941,7 +2069,7 @@ export default function MapView({ tilesBase, ready }) {
         pendingPopupCoordRef.current = polylineMid(bestCoords);
       }
       closeAllPopups();
-      setInfoProps({ ...best.feat.properties, segment_id: best.segId });
+      setInfoProps({ ...best.feat.properties, segment_id: best.segId, geometry: best.feat.geometry });
       setHighlightedSegment({
         tile:        best.feat.properties.tile,
         local_index: best.feat.properties.local_index,
@@ -2560,7 +2688,7 @@ export default function MapView({ tilesBase, ready }) {
       // segId is the WASM runtime segment_id — include it so the popup
       // doesn't show "— (decode first)" for Internal ID.
       closeAllPopups();
-      setInfoProps({ ...feat.properties, segment_id: traceHighlightSegIds[0] });
+      setInfoProps({ ...feat.properties, segment_id: traceHighlightSegIds[0], geometry: feat.geometry });
       setInfoAnchor(null); // defer until fitBounds animation completes
       const coords = feat.geometry?.coordinates;
       if (coords?.length && allCoords.length >= 2) {
@@ -3041,12 +3169,7 @@ export default function MapView({ tilesBase, ready }) {
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    const vis = showSegmentLayer ? 'visible' : 'none';
-    for (let frc = 0; frc < 8; frc++) {
-      if (map.getLayer(`olr-frc${frc}`)) map.setLayoutProperty(`olr-frc${frc}`, 'visibility', vis);
-    }
-    if (map.getLayer('olr-highlight'))     map.setLayoutProperty('olr-highlight',     'visibility', vis);
-    if (map.getLayer('olr-nodes-circle')) map.setLayoutProperty('olr-nodes-circle', 'visibility', vis);
+    applySegmentLayerVisibility(map, showSegmentLayer);
     // Turning the layer on doesn't imply a pan/zoom, so the moveend/zoomend
     // listeners that normally trigger tile loading never fire — load explicitly.
     if (showSegmentLayer) loadVisibleTiles(map);
@@ -3734,6 +3857,24 @@ export default function MapView({ tilesBase, ready }) {
                 ))}
               </tbody>
             </table>
+            {infoProps.geometry && (
+              <div className="seg-info-copy-row">
+                <button
+                  className="tp-copy-btn"
+                  title="Copy WKT to clipboard"
+                  onClick={() => navigator.clipboard.writeText(segCoordsToWkt(infoProps.geometry.coordinates)).catch(() => {})}
+                >
+                  Copy WKT
+                </button>
+                <button
+                  className="tp-copy-btn"
+                  title="Copy GeoJSON to clipboard"
+                  onClick={() => navigator.clipboard.writeText(JSON.stringify(segInfoToGeoJsonFeature(infoProps), null, 2)).catch(() => {})}
+                >
+                  Copy GeoJSON
+                </button>
+              </div>
+            )}
           </div>
           {decodeResult && !segDiagnosis && (
             <button

@@ -1388,6 +1388,15 @@ html, body, #root, .app {
   background: rgba(255, 255, 255, 0.08);
 }
 
+.seg-info-copy-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.seg-info-copy-row .tp-copy-btn {
+  flex: 1;
+}
+
 /* ── Candidate popup extras ─────────────────────────────────────────────────── */
 
 /* Wider than the default seg-info-panel */

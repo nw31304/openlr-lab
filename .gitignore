@@ -7,4 +7,5 @@
 node_modules/
 web/dist/
 web/.wrangler/
+web/.dev/
 .claude/
