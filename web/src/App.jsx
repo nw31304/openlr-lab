@@ -14,6 +14,7 @@ import OnboardingTour   from './components/OnboardingTour.jsx';
 import { setPmtiles, setDecoder, setEncoder, setZoom, useStore } from './store.js';
 import DecodeToast from './components/DecodeToast.jsx';
 import { initWasm } from './wasm.js';
+import { getSharedOpenlrLink } from './utils.js';
 
 export default function App() {
   const [ready, setReady]   = useState(false);
@@ -27,8 +28,14 @@ export default function App() {
 
   // First-ever load (per browser): auto-start the onboarding tour once the
   // app has actually finished loading, rather than over a blank/loading map.
+  // Skipped entirely when a shared decode link (?olr=/#q=) is present — the
+  // visitor's clear intent is to see that decode, not sit through a tour,
+  // and the tour's own "snapshot camera at start, ease back to it at end"
+  // behavior (Map.jsx's tourCameraRef effect) would otherwise capture the
+  // pre-decode camera and stomp the decode's own camera fit the moment the
+  // tour is dismissed.
   useEffect(() => {
-    if (ready && !hasSeenTour && tourStep == null) startTour();
+    if (ready && !hasSeenTour && tourStep == null && !getSharedOpenlrLink()) startTour();
   }, [ready]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Keep `route` in sync with the browser back/forward buttons -- openDocs/

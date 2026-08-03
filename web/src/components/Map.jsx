@@ -6,7 +6,7 @@ import { PMTiles } from 'pmtiles';
 import { useStore, getSegmentId, getNodeId, getSegGeomCache, getSegIdToTile, getTileGeomCache, getSnapCandidates, loadEncoderTilesNear, previewRouteBetween } from '../store.js';
 import { useDraggable } from '../hooks.js';
 import { emptyState, applyStep, computeVisualState, stateToGeoJSON } from '../replayEngine.js';
-import { haversineM } from '../utils.js';
+import { haversineM, getSharedOpenlrLink } from '../utils.js';
 
 
 // Inline SVG tip for speech bubbles — above: tip points down, below: tip points up.
@@ -703,14 +703,18 @@ export default function MapView({ tilesBase, ready }) {
   const permalinkAutoLoaded = useRef(false);
   useEffect(() => {
     if (!ready || permalinkAutoLoaded.current) return;
-    const hash = window.location.hash;
-    if (hash.startsWith('#q=')) {
-      const q = decodeURIComponent(hash.slice(3));
-      if (q) {
-        permalinkAutoLoaded.current = true;
-        setOpenlrString(q);
-        runDecode();
-      }
+    // getSharedOpenlrLink() checks ?olr= (current format) then falls back to
+    // the legacy #q= hash format. See its own comment in utils.js for why
+    // ?olr= is preferred: MapLibre's hash:true continuously rewrites
+    // window.location.hash to its own #z/lat/lng camera format on every
+    // moveend, so a value stored in the hash can already have been
+    // clobbered by the time this effect gets a chance to run — the query
+    // string is never touched by that rewriting.
+    const q = getSharedOpenlrLink();
+    if (q) {
+      permalinkAutoLoaded.current = true;
+      setOpenlrString(q);
+      runDecode();
     }
   }, [ready]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -3178,8 +3182,25 @@ export default function MapView({ tilesBase, ready }) {
   // ── Decode result → map layers + camera ─────────────────────────────────────
 
   useEffect(() => {
+    applyDecodeResultToMap();
+  }, [decodeResult, mode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function applyDecodeResultToMap() {
     const map = mapRef.current;
     if (!map) return;
+
+    if (!map.getSource('decoded-path')) {
+      // These sources are all created together inside the map's 'load'
+      // handler. A decode that completes before 'load' has fired — e.g. an
+      // auto-decode triggered the instant the WASM decoder becomes ready,
+      // which can easily race ahead of the map's own style/tile loading —
+      // would otherwise silently do nothing below (every setData call is
+      // optional-chained and no-ops on a missing source), with nothing to
+      // retry it once 'load' finally does fire. Re-run this same logic next
+      // frame instead of giving up (same pattern as loadVisibleTiles).
+      requestAnimationFrame(applyDecodeResultToMap);
+      return;
+    }
 
     const pathSource        = map.getSource('decoded-path');
     const pathBoundarySource = map.getSource('decoded-path-boundaries');
@@ -3449,7 +3470,7 @@ export default function MapView({ tilesBase, ready }) {
         }
       });
     }
-  }, [decodeResult, mode]);
+  }
 
   // ── Measurement tool ──────────────────────────────────────────────────────────
 
@@ -3585,8 +3606,14 @@ export default function MapView({ tilesBase, ready }) {
   }, [mode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function doPermalink() {
-    const url = `${window.location.origin}${window.location.pathname}#q=${encodeURIComponent(openlrString)}`;
-    navigator.clipboard.writeText(url).catch(() => {});
+    // Query string, not hash — see the permalinkAutoLoaded effect above for
+    // why the hash isn't safe here (MapLibre's hash:true keeps rewriting it).
+    // Built from the current URL so any other query params (e.g. ?tiles=)
+    // carry over unchanged.
+    const url = new URL(window.location.href);
+    url.hash = '';
+    url.searchParams.set('olr', openlrString);
+    navigator.clipboard.writeText(url.toString()).catch(() => {});
     setPermalinkCopied(true);
     setTimeout(() => setPermalinkCopied(false), 1500);
   }

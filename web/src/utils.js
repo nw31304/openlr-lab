@@ -1,3 +1,20 @@
+// A shared decode link, either ?olr=<string> (current) or the legacy #q=
+// hash format. Checked in two places that both need to agree on it: App.jsx
+// gates the onboarding tour's auto-start on this (so a shared link takes the
+// visitor straight to the decode instead of interrupting with a tour that
+// would also stomp the decode's camera fit when dismissed — see the
+// tourCameraRef effect in Map.jsx), and Map.jsx uses it to pre-fill and
+// auto-run the decode itself.
+export function getSharedOpenlrLink() {
+  const q = new URLSearchParams(window.location.search).get('olr');
+  if (q) return q;
+  if (window.location.hash.startsWith('#q=')) {
+    const legacy = decodeURIComponent(window.location.hash.slice(3));
+    if (legacy) return legacy;
+  }
+  return null;
+}
+
 export function haversineM(lon1, lat1, lon2, lat2) {
   const R = 6371000;
   const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
