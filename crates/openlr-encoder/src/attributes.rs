@@ -3,7 +3,9 @@
 //! serializers in `openlr_codec::encoder` apply their own sector/bucket
 //! quantization when writing bytes.
 
-use openlr_graph::{bearing_away_from_node, Graph, NodeId, SegmentId};
+use openlr_graph::{bearing_away_from_node, point_and_bearing_into_segment, Graph, NodeId, SegmentId};
+
+use crate::virtual_split::LrpAnchor;
 
 /// Attributes describing one leg (from an LRP's node to the next LRP's node).
 pub struct LegAttributes {
@@ -44,6 +46,34 @@ pub fn leg_attributes(graph: &Graph, node: NodeId, leg_segments: &[SegmentId]) -
         dnp_m,
         bearing_deg,
     })
+}
+
+/// Coordinate + FRC/FOW/LFRCNP/BEAR for a leg anchored by `start` — a real
+/// node, or (Rule-1 virtual-point splitting, `crate::virtual_split`) a point
+/// partway into `leg_segments[0]`. Generalizes `leg_attributes` to also
+/// handle `LrpAnchor::Virtual`; callers use the leg's own precomputed
+/// `length_m` for DNP, not this function's `dnp_m` (which double-counts a
+/// partially-covered boundary segment whenever `start` is `Virtual`).
+pub fn leg_attributes_from_anchor(graph: &Graph, start: &LrpAnchor, leg_segments: &[SegmentId]) -> Option<((f64, f64), LegAttributes)> {
+    let first_id = *leg_segments.first()?;
+    let first_seg = graph.segments.get(&first_id)?;
+
+    let mut lfrcnp = 0u8;
+    let mut dnp_m = 0.0f64;
+    for seg_id in leg_segments {
+        let seg = graph.segments.get(seg_id)?;
+        lfrcnp = lfrcnp.max(seg.frc);
+        dnp_m += seg.length_m;
+    }
+
+    let (coord, bearing_deg) = match *start {
+        LrpAnchor::Node(n) => (graph.nodes.get(&n).map(|nd| (nd.lon, nd.lat))?, bearing_away_from_node(first_seg, n)?),
+        LrpAnchor::Virtual { entry_node, dist_from_entry_m, .. } => {
+            point_and_bearing_into_segment(first_seg, entry_node, dist_from_entry_m, true)?
+        }
+    };
+
+    Some((coord, LegAttributes { frc: first_seg.frc, fow: first_seg.fow, lfrcnp, dnp_m, bearing_deg }))
 }
 
 /// BEAR only, for the last LRP of a location — it has no leg of its own (DNP

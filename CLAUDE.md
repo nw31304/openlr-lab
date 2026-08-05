@@ -289,7 +289,30 @@ portable Rust — see §14 note below).
   junction or dead end) if it isn't already one, composing `final_offset = original_offset +
   expansion_distance` per the whitepaper's Figure 27. `coverage.rs` re-verifies the assembled path
   with a real A*-equivalent turn-angle sweep afterward — expansion's own turn-angle stop condition
-  is a heuristic escape hatch, not a substitute for this.
+  is a heuristic escape hatch, not a substitute for this. A leg that's *still* over `max_leg_m`
+  after all that (most commonly: one physical segment longer than 15km with no interior node)
+  is handled by `virtual_split.rs`'s whitepaper-standard virtual-point splitting — it inserts
+  intermediate LRPs along the already-verified path (preferring a valid node, then any node,
+  then a mid-segment point) without re-running A*, since placing a marker along a path whose
+  shortest-path correctness `coverage.rs` already established is not a new routing decision.
+  `EncodeError::LegTooLong` now only surfaces for a degenerate `max_leg_m` itself, not a real
+  route. Out of scope for now: PointAlongLine (below) can't use this — OpenLR's PAL wire format
+  is hard-fixed at exactly 2 LRPs, so a PAL point on a single segment over 15km still errors.
+  Rule-5 (an offset must be strictly less than its own bracketing leg) is also handled with the
+  spec's full cascade, not an error: `pos_offset_m`/`neg_offset_m` include the entire Rule-4
+  expansion distance, but `coverage.rs`'s own divergence protection can split a leg short partway
+  through that expansion — so the true start/end can legitimately land past the first (or before
+  the last) leg entirely. When that happens, `encode_line` drops that boundary leg, reduces the
+  offset by its length, and re-applies it against the next leg in (cascading further if needed) —
+  the same "place a marker along an already-verified path, no new routing decision" reasoning as
+  Rule-1. Dropping a *trailing* leg is the one asymmetric case: the new final LRP has no leg of
+  its own and uses the reversed bearing convention, so its bearing is recomputed (backward-facing,
+  via `point_and_bearing_into_segment`'s `facing_forward` parameter) rather than reused from
+  whatever attributes it had as an ordinary leg-start LRP. Exhausting every leg (the offset
+  reaching or exceeding the *entire* encoded path) is asserted unreachable rather than surfaced as
+  a caller-facing error — it would mean the encoder's own expansion-budget bookkeeping was
+  internally inconsistent (the expansion distance is itself bounded by the same `max_leg_m` budget
+  that bounds every leg), not that the caller supplied a bad route.
 - **PointAlongLine** (`pal.rs`): input is one segment + an along-segment offset + orientation +
   side-of-road. No coverage-sweep step — the segment itself *is* the path, verbatim. This is
   exactly why Invariant 10 matters most here: there is nothing downstream to catch a

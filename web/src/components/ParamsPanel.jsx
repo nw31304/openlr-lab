@@ -96,7 +96,7 @@ export const PARAM_DOCS = {
     decrease: 'Rejects implausibly sharp turns (e.g. a route that doubles back on itself at a roundabout exit due to a missing OSM turn restriction). Risk: may block a legitimate route that genuinely requires a tight turn.',
   },
   max_leg_m: {
-    what: 'Encoder-only: Rule-1 cap on the distance between consecutive LRPs. Not part of the OpenLR wire format itself — it only controls how the encoder chooses to split a location into legs. Clamped to the architecture\'s 15 km ceiling.',
+    what: 'Encoder-only: Rule-1 cap on the distance between consecutive LRPs. Not part of the OpenLR wire format itself — it only controls how the encoder chooses to split a location into legs. Clamped to the architecture\'s 15 km ceiling. A leg over this cap is never a failure — the encoder automatically inserts extra LRP(s) to split it (preferring a real junction, then any node, then a point mid-segment for an unbroken stretch over 15 km).',
     increase: 'Fewer intermediate LRPs for long routes. Rarely needed above the 15 km default.',
     decrease: 'Forces more frequent intermediate LRPs, keeping each leg small enough for a constrained decoder tile budget (e.g. a memory-limited head unit).',
   },

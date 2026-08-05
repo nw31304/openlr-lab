@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use crate::{NetworkNode, NetworkSegment, NodeId, SegmentId, TurnRestriction, Direction, TileKey};
-use crate::geometry::{bearing_at_offset, haversine_m, polyline_length_m, project_onto_polyline};
+use crate::geometry::{bearing_at_offset, haversine_m, interpolate_at, polyline_length_m, project_onto_polyline};
 
 // Grid cell size: 1/500 degree ≈ 222 m at equator.  Fine enough to cover the
 // default 30 m candidate radius in a 3×3 neighbourhood and the 200 m permissive
@@ -49,6 +49,45 @@ pub fn bearing_away_from_node(seg: &NetworkSegment, node: NodeId) -> Option<f64>
         Some(bearing_at_offset(&seg.geometry, 0.0, true))
     } else if seg.end_node == node {
         Some(bearing_at_offset(&seg.geometry, polyline_length_m(&seg.geometry), false))
+    } else {
+        None
+    }
+}
+
+/// Point and bearing at `dist_from_entry_m` traveled INTO `seg` from
+/// `entry_node` (one of the segment's own endpoints) — i.e. what
+/// `bearing_away_from_node` computes at `dist_from_entry_m = 0`, generalized
+/// to an arbitrary distance. Used for LRPs that fall mid-segment rather
+/// than exactly at a node: Rule-1 virtual-point splitting
+/// (`openlr_encoder::virtual_split`) for an ordinary LRP, and Rule-5's
+/// offset cascade (`openlr_encoder::line`) for a location's *final* LRP
+/// when it lands mid-segment. Always measured against
+/// `polyline_length_m(&seg.geometry)` (the geometry-derived length), not the
+/// stored `seg.length_m` — the two can differ slightly, and this function's
+/// coordinate/bearing math must agree with whatever arc-length bookkeeping
+/// the caller used to derive `dist_from_entry_m`, not with the stored field.
+///
+/// `facing_forward = true` gives the direction of continued travel away
+/// from `entry_node` (an ordinary LRP's own outgoing bearing — mirrors
+/// `bearing_away_from_node`'s convention at a node). `facing_forward =
+/// false` gives the reverse: looking back toward `entry_node`, matching the
+/// whitepaper's reversed convention for a location's final LRP (mirrors
+/// `bearing_away_from_node`'s *other* convention, which it gets "for free"
+/// by simply being handed the arrival node instead of the departure node —
+/// a virtual point has no such second node to swap in, hence the explicit
+/// flag here). Returns `None` if `entry_node` isn't one of `seg`'s own
+/// endpoints or the geometry is degenerate.
+pub fn point_and_bearing_into_segment(seg: &NetworkSegment, entry_node: NodeId, dist_from_entry_m: f64, facing_forward: bool) -> Option<((f64, f64), f64)> {
+    if seg.geometry.len() < 2 {
+        return None;
+    }
+    let total = polyline_length_m(&seg.geometry);
+    if seg.start_node == entry_node {
+        let arc = dist_from_entry_m.clamp(0.0, total);
+        Some((interpolate_at(&seg.geometry, arc), bearing_at_offset(&seg.geometry, arc, facing_forward)))
+    } else if seg.end_node == entry_node {
+        let arc = (total - dist_from_entry_m).clamp(0.0, total);
+        Some((interpolate_at(&seg.geometry, arc), bearing_at_offset(&seg.geometry, arc, !facing_forward)))
     } else {
         None
     }
@@ -563,5 +602,70 @@ mod tests {
         let near = g.segments_near(0.0005, 0.0005, 200.0);
         assert_eq!(near.len(), 1);
         assert_eq!(near[0].0, SegmentId(1));
+    }
+
+    #[test]
+    fn point_and_bearing_into_segment_matches_bearing_away_from_node_at_zero() {
+        let mut seg = make_seg(1, 0, 1, 3, Direction::Both);
+        seg.geometry = vec![(0.0, 0.0), (0.01, 0.0)]; // due east
+
+        let expected_bearing = bearing_away_from_node(&seg, NodeId(0)).unwrap();
+        let (point, bearing) = point_and_bearing_into_segment(&seg, NodeId(0), 0.0, true).unwrap();
+        assert!((point.0 - 0.0).abs() < 1e-9 && (point.1 - 0.0).abs() < 1e-9);
+        assert!((bearing - expected_bearing).abs() < 1e-6);
+
+        let expected_bearing_end = bearing_away_from_node(&seg, NodeId(1)).unwrap();
+        let total = polyline_length_m(&seg.geometry);
+        let (point_end, bearing_end) = point_and_bearing_into_segment(&seg, NodeId(1), 0.0, true).unwrap();
+        assert!((point_end.0 - 0.01).abs() < 1e-9 && (point_end.1 - 0.0).abs() < 1e-9);
+        assert!((bearing_end - expected_bearing_end).abs() < 1e-6);
+        assert!(total > 0.0);
+    }
+
+    #[test]
+    fn point_and_bearing_into_segment_midpoint_faces_forward_regardless_of_entry_node() {
+        let mut seg = make_seg(1, 0, 1, 3, Direction::Both);
+        seg.geometry = vec![(0.0, 0.0), (0.01, 0.0)]; // due east
+        let total = polyline_length_m(&seg.geometry);
+
+        // Entered from the west end (node 0), traveling east: bearing ~90.
+        let (p1, b1) = point_and_bearing_into_segment(&seg, NodeId(0), total / 2.0, true).unwrap();
+        assert!((b1 - 90.0).abs() < 1.0, "b1={b1}");
+
+        // Entered from the east end (node 1), traveling west: bearing ~270,
+        // and the midpoint coordinate should match regardless of entry side.
+        let (p2, b2) = point_and_bearing_into_segment(&seg, NodeId(1), total / 2.0, true).unwrap();
+        assert!((b2 - 270.0).abs() < 1.0, "b2={b2}");
+        assert!((p1.0 - p2.0).abs() < 1e-6 && (p1.1 - p2.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn point_and_bearing_into_segment_facing_forward_false_reverses_bearing() {
+        let mut seg = make_seg(1, 0, 1, 3, Direction::Both);
+        seg.geometry = vec![(0.0, 0.0), (0.01, 0.0)]; // due east
+        let total = polyline_length_m(&seg.geometry);
+
+        // Entered from the west end (node 0): forward-facing (continuing
+        // east) is ~90; backward-facing (looking back toward node 0, west)
+        // is ~270. Same coordinate either way.
+        let (p_fwd, b_fwd) = point_and_bearing_into_segment(&seg, NodeId(0), total / 2.0, true).unwrap();
+        let (p_back, b_back) = point_and_bearing_into_segment(&seg, NodeId(0), total / 2.0, false).unwrap();
+        assert!((b_fwd - 90.0).abs() < 1.0, "b_fwd={b_fwd}");
+        assert!((b_back - 270.0).abs() < 1.0, "b_back={b_back}");
+        assert!((p_fwd.0 - p_back.0).abs() < 1e-9 && (p_fwd.1 - p_back.1).abs() < 1e-9);
+
+        // Entered from the east end (node 1): forward-facing (continuing
+        // west) is ~270; backward-facing (looking back toward node 1, east)
+        // is ~90 -- exactly mirrored.
+        let (_, b_fwd_e) = point_and_bearing_into_segment(&seg, NodeId(1), total / 2.0, true).unwrap();
+        let (_, b_back_e) = point_and_bearing_into_segment(&seg, NodeId(1), total / 2.0, false).unwrap();
+        assert!((b_fwd_e - 270.0).abs() < 1.0, "b_fwd_e={b_fwd_e}");
+        assert!((b_back_e - 90.0).abs() < 1.0, "b_back_e={b_back_e}");
+    }
+
+    #[test]
+    fn point_and_bearing_into_segment_rejects_non_endpoint_node() {
+        let seg = make_seg(1, 0, 1, 3, Direction::Both);
+        assert!(point_and_bearing_into_segment(&seg, NodeId(9), 10.0, true).is_none());
     }
 }

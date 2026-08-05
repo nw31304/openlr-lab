@@ -15,6 +15,7 @@ pub mod coverage;
 pub mod diagnose;
 pub mod line;
 pub mod pal;
+pub mod virtual_split;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
@@ -32,11 +33,14 @@ pub enum EncodeError {
     IllegalDirection { index: usize, segment: openlr_graph::SegmentId },
     #[error("no route exists between the requested points on this graph")]
     NoRoute,
-    /// Distinct from `NoRoute`: a route *was* found (or the un-expanded core
-    /// alone already exceeds the cap), but Rule-1 (max distance between
-    /// consecutive LRPs) rejects it. Callers that see this should suggest
-    /// raising `max_leg_m` or adding an intermediate waypoint/via-point —
-    /// not "check connectivity", which is `NoRoute`'s actual meaning.
+    /// A leg over `max_leg_m` is normally handled automatically —
+    /// `virtual_split::split_for_rule1` inserts intermediate LRPs (preferring
+    /// a valid node, then any node, then a virtual mid-segment point) so
+    /// every consecutive-LRP distance stays under the cap. This variant now
+    /// only ever surfaces for a degenerate `max_leg_m` itself (`<= 0` or
+    /// non-finite) — a real configuration error, not a "this route can't be
+    /// encoded" signal, since the splitter can always make progress for any
+    /// positive finite cap.
     #[error("leg length {length_m:.0}m exceeds the {max_leg_m:.0}m Rule-1 cap")]
     LegTooLong { length_m: f64, max_leg_m: f64 },
     #[error("tile {0:?} required by the route search is not loaded")]

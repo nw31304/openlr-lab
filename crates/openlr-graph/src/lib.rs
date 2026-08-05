@@ -8,7 +8,7 @@ pub mod tile;
 
 pub use geometry::{bearing_at_offset, bearing_deg, haversine_m, project_onto_polyline,
                    polyline_length_m, interpolate_at, Projection};
-pub use graph::{Graph, EdgeSkipReason, bearing_away_from_node};
+pub use graph::{Graph, EdgeSkipReason, bearing_away_from_node, point_and_bearing_into_segment};
 pub use node::{NetworkNode, NodeId};
 pub use path_search::{shortest_path, PathOutcome, PathResult, NO_PRIOR_SEG};
 pub use restriction::TurnRestriction;

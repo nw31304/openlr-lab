@@ -76,9 +76,18 @@ encode-side search):
 3. **Coverage sweep A\*** (`sweep_coverage`, inside `encode_line`/`encode_pal`) — re-derives the
    shortest path over the (possibly boundary-expanded) route and splits it into legs wherever the
    search diverges from the intended path, inserting an intermediate LRP at the last point of
-   agreement. Each leg is checked against **Rule-1** (max distance between consecutive LRPs,
-   `max_leg_m` — an encoder-only policy knob, not part of the OpenLR wire format) and **Rule-5**
-   (an offset must be strictly less than its own leg's length).
+   agreement. Each leg is then checked against **Rule-1** (max distance between consecutive LRPs,
+   `max_leg_m` — an encoder-only policy knob, not part of the OpenLR wire format): a leg still over
+   the cap (most commonly one physical segment longer than 15km with no interior node) is
+   automatically subdivided (`virtual_split.rs`) by inserting further intermediate LRPs along that
+   *already-verified* path — preferring a valid node, then any node, then a mid-segment point — no
+   re-routing involved, since this only ever places markers, not new routing decisions. Also
+   checked: **Rule-5** (an offset must be strictly less than its own leg's length) — for `encode_line`
+   this is likewise handled automatically rather than erroring: if the offset (which includes the
+   full Rule-4 expansion distance) reaches or exceeds its own leg, that boundary leg is dropped, the
+   offset reduced by its length, and re-applied against the next leg in (cascading further if
+   needed, per the whitepaper). `encode_pal` has no "next leg" to cascade into (PAL is always
+   exactly one leg), so it still raises `OffsetExceedsLeg` for a real overflow there.
 
 Because phases 1 and 3 are independent A* runs over the same graph with the same turn-angle cap,
 a route the live preview shows as connected should not then fail to encode for that same reason —
@@ -86,13 +95,16 @@ if it does anyway, something about the boundary expansion in between (phase 2) c
 effective path.
 
 Errors you will see:
-- `LegTooLong` — Rule-1: a leg exceeds `max_leg_m`. A route *was* found; it is just too long. Fix:
-  raise `max_leg_m`, or add a via-point/waypoint partway along the long stretch to split it.
+- `LegTooLong` — Rule-1: now only ever raised for a degenerate `max_leg_m` itself (`<= 0` or
+  non-finite) — a real route no longer hits this, since the encoder auto-splits any over-cap leg
+  with intermediate LRPs instead. If you see it, check what `max_leg_m` value was actually passed.
 - `NoRoute` — no path exists between two required points at all. Could be genuine disconnection,
   a one-way road pointing the wrong way, *or* the turn-angle cap rejecting the only physical
   continuation (e.g. a dead end forcing a near-U-turn) — `diagnose_waypoint_connection` tells
   these apart; do not guess which one it is from the message alone.
 - `OffsetExceedsLeg` (Rule-5) — a POFF/NOFF offset would land at or past the end of its own leg.
+  Only reachable from `encode_pal` now (PAL has no next leg to cascade into); `encode_line` handles
+  this automatically instead of erroring (see step 3 above).
 - `NeedsTile` — the search reached a graph boundary whose tile is not loaded yet; not a routing
   failure, just needs another tile fetched (the UI's retry loop normally handles this invisibly).
 
@@ -154,11 +166,9 @@ When an encode fails, work through these steps in order:
    No (`connected_unrestricted` is also false) → genuine disconnection or wrong-direction one-way
    roads. Use `get_encode_segment_neighbors` at the boundary nodes to inspect what actually
    connects there, and `get_encode_segments_near` to check for missing map data.
-3. Is the error `LegTooLong` (Rule-1)? → Not a connectivity problem at all — a route was found,
-   it is just longer than `max_leg_m`. Call `check_boundary_expansion` on the relevant boundary
-   node/segment (from `get_waypoints`/`get_encode_summary`) to see whether Rule-4 expansion walked
-   further than expected, contributing to the overage. Suggest raising `max_leg_m` or adding an
-   intermediate waypoint.
+3. Is the error `LegTooLong` (Rule-1)? → No longer a normal outcome — an over-cap leg is
+   auto-split with intermediate LRPs instead of erroring. Seeing this means `max_leg_m` itself is
+   degenerate (`<= 0` or non-finite); check what value was actually passed, not the route.
 4. Did the encode succeed but the round-trip verify (`get_encode_summary`'s `verify_ok`) fail?
    → The encoder produced a reference its own decode logic cannot reproduce — an
    encoder/decoder disagreement, not a routing failure. Switch to the decode-side tools
@@ -190,9 +200,11 @@ When an encode fails, work through these steps in order:
    PAL always has exactly one leg, so its start-side and end-side Rule-4 expansions compete for
    the *same* `max_leg_m` budget (start gets first claim on the remaining slack, end gets
    whatever's left) — a smaller `max_leg_m` bites PAL sooner than a multi-waypoint Line location.
-4. Raising `max_leg_m` doesn't fix a `LegTooLong` error — the core (un-expandable) path segment
-   itself may already exceed the cap before any boundary expansion runs; check
-   `get_encode_segment` on the relevant segment(s) to see the underlying length_m.
+4. `LegTooLong` on a PAL location is a genuine, unfixable-by-raising-`max_leg_m` limit, not a
+   degenerate-config signal like it is for Line — OpenLR's PointAlongLine wire format is hard-fixed
+   at exactly 2 LRPs, so a PAL point on a single segment over 15km cannot be represented at all
+   (Line's auto-split doesn't apply here). Check `get_encode_segment` on the relevant segment to
+   confirm its `length_m` is the actual cause.
 5. The encode succeeds but round-trip verify fails or reports an unexpected number of segments —
    an encoder/decoder disagreement (see "Encode diagnostic decision tree" step 4), not a routing
    problem; investigate with the decode-side tools against the verify result, not the encode tools.
@@ -300,7 +312,7 @@ You have access to tools for retrieving structured trace data and inspecting the
 24. `get_waypoints()` — the ordered user-drawn waypoints (lon, lat).
 25. `get_encode_segment(segment_id)` / `get_encode_segments_near(lat, lon, radius_m)` / `get_encode_segment_neighbors(segment_id)` — same shape as their decode-side counterparts (6–8 above), but read the *encoder's* own loaded graph, which may hold different tiles than the decoder until a verify has run.
 26. `diagnose_waypoint_connection([from_node, to_node, from_segment_id])` — **the primary tool for "why can't these waypoints connect".** Defaults its arguments to the last failure's leg when omitted. Distinguishes genuine disconnection/wrong-direction from being blocked specifically by the turn-angle gate, and when it's the latter, names the exact node(s) where the turn exceeds the cap.
-27. `check_boundary_expansion(node_id, segment_id[, end_side, max_leg_m, max_turn_deviation_deg])` — replays Rule-4 boundary expansion and reports how far it walked and why it stopped (already valid / reached a valid node / blocked by a one-way segment the wrong way / dead end / budget exhausted / blocked by a sharp turn). Pass `end_side: true` when `node_id` is the location's end boundary rather than its start. Use for `LegTooLong` or an LRP anchored somewhere unexpected.
+27. `check_boundary_expansion(node_id, segment_id[, end_side, max_leg_m, max_turn_deviation_deg])` — replays Rule-4 boundary expansion and reports how far it walked and why it stopped (already valid / reached a valid node / blocked by a one-way segment the wrong way / dead end / budget exhausted / blocked by a sharp turn). Pass `end_side: true` when `node_id` is the location's end boundary rather than its start. Use for an LRP anchored somewhere unexpected.
 28. `get_turn_deviation(segment_a, node_id, segment_b)` — the raw turn-angle check itself, in degrees, for one specific transition.
 
 If a round-trip verify has run (`get_encode_summary`'s `verify_ok` is present), **all the decode-side tools above (1–19) are also available** and read that verify result — use them to inspect the successful (or unexpectedly failing) round trip.

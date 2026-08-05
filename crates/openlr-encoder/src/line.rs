@@ -2,8 +2,9 @@
 //! nodes, sweep coverage into legs, compute attributes, assemble offsets.
 
 use openlr_codec::{CircularInterval, LinearInterval, LocationReference, Lrp};
-use openlr_graph::{Graph, NodeId, SegmentId, NO_PRIOR_SEG};
+use openlr_graph::{point_and_bearing_into_segment, Graph, NodeId, SegmentId, NO_PRIOR_SEG};
 
+use crate::virtual_split::LrpAnchor;
 use crate::{attributes, coverage, expansion, EncodeError};
 
 /// Rule-1: the OpenLR architecture's own absolute ceiling on the distance
@@ -117,7 +118,7 @@ pub fn encode_line(graph: &Graph, input: &LineLocationInput, max_turn_deviation_
     // where a search from the first genuine decision point actually
     // diverges from the drawn path — never merely because a waypoint (or an
     // expansion seam) happens to sit somewhere.
-    let legs = coverage::sweep_coverage(
+    let mut legs = coverage::sweep_coverage(
         graph, &full_path, expanded_start_node, NO_PRIOR_SEG, expanded_end_node,
         max_leg_m, max_turn_deviation_deg, zoom,
     )?;
@@ -125,18 +126,66 @@ pub fn encode_line(graph: &Graph, input: &LineLocationInput, max_turn_deviation_
         return Err(EncodeError::EmptyPath);
     }
 
-    // Step 7: attributes per LRP.
+    // Rule-5 cascade: `pos_offset_m`/`neg_offset_m` include the full Rule-4
+    // expansion distance, but `sweep_coverage`'s own divergence protection
+    // can split a leg short partway through that expansion (a shortcut found
+    // there) -- so the true start/end can legitimately land past the first
+    // (or before the last) leg entirely. When that happens, per the
+    // whitepaper, drop that boundary leg, reduce the offset by its length,
+    // and re-apply against the next leg in. Placing a marker along a path
+    // whose correctness `sweep_coverage` already established is not a new
+    // routing decision, so (as with Rule-1's `virtual_split`) this never
+    // re-runs A*/divergence checks -- it only ever adjusts bookkeeping over
+    // legs already known to be correct.
+    //
+    // `final_anchor` tracks the location's own overall end -- normally the
+    // real node `expanded_end_node`, but reassigned to whatever the dropped
+    // leg's own start was whenever the neg-offset cascade drops a trailing
+    // leg (which may itself be a Rule-1 virtual, mid-segment point).
+    let mut final_anchor = LrpAnchor::Node(expanded_end_node);
+    let mut pos_offset_m = pos_offset_m;
+    let mut neg_offset_m = neg_offset_m;
+
+    while legs.len() > 1 && pos_offset_m >= legs[0].length_m {
+        pos_offset_m -= legs[0].length_m;
+        legs.remove(0);
+    }
+    assert!(
+        pos_offset_m < legs[0].length_m,
+        "Rule-5 cascade exhausted every leg -- pos_offset_m computed upstream (input.start_offset_m + \
+         Rule-4 expansion distance) must never reach the total encoded path length; this is an encoder \
+         bug (not a caller error), since the expansion distance is itself bounded by the same max_leg_m \
+         budget that bounds every leg"
+    );
+
+    while legs.len() > 1 && neg_offset_m >= legs.last().unwrap().length_m {
+        neg_offset_m -= legs.last().unwrap().length_m;
+        let dropped = legs.pop().unwrap();
+        final_anchor = dropped.start;
+    }
+    assert!(
+        neg_offset_m < legs.last().unwrap().length_m,
+        "Rule-5 cascade exhausted every leg -- neg_offset_m computed upstream (input.end_offset_m + \
+         Rule-4 expansion distance) must never reach the total encoded path length; this is an encoder \
+         bug (not a caller error), since the expansion distance is itself bounded by the same max_leg_m \
+         budget that bounds every leg"
+    );
+
+    // Step 7: attributes per LRP. `leg.length_m` (not `attrs.dnp_m`) is the
+    // authoritative DNP -- summing segment lengths would double-count a
+    // partially-covered boundary segment whenever Rule-1 virtual-point
+    // splitting (`virtual_split`) anchored this leg mid-segment.
     let mut lrps = Vec::with_capacity(legs.len() + 1);
     for leg in &legs {
-        let attrs = attributes::leg_attributes(graph, leg.start_node, &leg.segments)
+        let (coord, attrs) = attributes::leg_attributes_from_anchor(graph, &leg.start, &leg.segments)
             .ok_or(EncodeError::UnknownSegment(leg.segments[0]))?;
         lrps.push(Lrp {
-            coord: node_coord(graph, leg.start_node)?,
+            coord,
             bearing: CircularInterval::point(attrs.bearing_deg),
             frc: attrs.frc,
             fow: attrs.fow,
             lfrcnp: Some(attrs.lfrcnp),
-            dnp: Some(LinearInterval::point(attrs.dnp_m)),
+            dnp: Some(LinearInterval::point(leg.length_m)),
             pos_offset: None,
             neg_offset: None,
             pos_offset_raw: None,
@@ -144,13 +193,35 @@ pub fn encode_line(graph: &Graph, input: &LineLocationInput, max_turn_deviation_
         });
     }
 
+    // The final LRP has no leg of its own (no DNP/LFRCNP) and its bearing
+    // faces backward -- looking back the way arrived, per the whitepaper's
+    // reversed final-LRP convention -- rather than forward like every other
+    // LRP above. `final_anchor` is normally the real node `expanded_end_node`,
+    // but may be a Rule-1 virtual (mid-segment) point if the Rule-5 cascade
+    // above dropped a trailing leg that was itself virtually split.
     let last_leg_seg = *legs.last().unwrap().segments.last().unwrap();
     let last_seg = graph.segments.get(&last_leg_seg).ok_or(EncodeError::UnknownSegment(last_leg_seg))?;
-    let last_bearing = attributes::last_lrp_bearing_deg(graph, expanded_end_node, last_leg_seg)
-        .ok_or(EncodeError::UnknownSegment(last_leg_seg))?;
+    let (final_coord, final_bearing) = match final_anchor {
+        LrpAnchor::Node(n) => (
+            node_coord(graph, n)?,
+            attributes::last_lrp_bearing_deg(graph, n, last_leg_seg).ok_or(EncodeError::UnknownSegment(last_leg_seg))?,
+        ),
+        LrpAnchor::Virtual { segment, entry_node, dist_from_entry_m } => {
+            // `segment` (from a leg's own start anchor) is only ever
+            // `Virtual` when it's a continuation within a single
+            // `virtual_split::split_for_rule1` call (the *first* leg of any
+            // fresh call always starts at a real node) -- so the
+            // immediately-preceding leg (now `legs.last()`, since the leg
+            // that used to follow it was just popped above) is guaranteed
+            // to be from that same call, ending on this same segment.
+            debug_assert_eq!(segment, last_leg_seg, "a virtual final_anchor must land on the preceding leg's own last segment");
+            point_and_bearing_into_segment(last_seg, entry_node, dist_from_entry_m, false)
+                .ok_or(EncodeError::UnknownSegment(last_leg_seg))?
+        }
+    };
     lrps.push(Lrp {
-        coord: node_coord(graph, expanded_end_node)?,
-        bearing: CircularInterval::point(last_bearing),
+        coord: final_coord,
+        bearing: CircularInterval::point(final_bearing),
         frc: last_seg.frc,
         fow: last_seg.fow,
         lfrcnp: None,
@@ -162,24 +233,12 @@ pub fn encode_line(graph: &Graph, input: &LineLocationInput, max_turn_deviation_
     });
 
     // Offsets, bounded per Rule-5 (must be strictly less than the bracketing
-    // leg). v1 scope: error out rather than the spec's full cascade of
-    // dropping the boundary LRP and re-deriving against the next leg.
-    let first_leg_m = lrps[0].dnp.unwrap().lb;
+    // leg) -- guaranteed by the cascade above, so no further check is needed
+    // here, just recording the (possibly reduced) values.
     if pos_offset_m > 0.0 {
-        if pos_offset_m >= first_leg_m {
-            return Err(EncodeError::Codec(openlr_codec::EncodeError::OffsetExceedsLeg {
-                offset_m: pos_offset_m, leg_m: first_leg_m,
-            }));
-        }
         lrps[0].pos_offset = Some(LinearInterval::point(pos_offset_m));
     }
-    let last_leg_m = lrps[lrps.len() - 2].dnp.unwrap().lb;
     if neg_offset_m > 0.0 {
-        if neg_offset_m >= last_leg_m {
-            return Err(EncodeError::Codec(openlr_codec::EncodeError::OffsetExceedsLeg {
-                offset_m: neg_offset_m, leg_m: last_leg_m,
-            }));
-        }
         let n = lrps.len() - 1;
         lrps[n].neg_offset = Some(LinearInterval::point(neg_offset_m));
     }
@@ -310,15 +369,15 @@ mod tests {
         assert!((dnp - 160.0).abs() < 1.0, "dnp={dnp}");
 
         // 50m: less than the core alone — both budgets clamp to zero, and
-        // the pre-existing Rule-1 check (now reachable on the "no divergence"
-        // success path too) must reject the still-oversized leg.
-        match encode_line(&g, &input, 180.0, 50.0, 12) {
-            Err(EncodeError::LegTooLong { length_m, max_leg_m }) => {
-                assert!((length_m - 100.0).abs() < 1.0, "length_m={length_m}");
-                assert_eq!(max_leg_m, 50.0);
-            }
-            other => panic!("expected LegTooLong when the 100m core alone exceeds a 50m cap, got {other:?}"),
-        }
+        // the 100m core (with no interior node, per node 2's own pass-through
+        // status) now gets a Rule-1 virtual-point split instead of erroring:
+        // 3 LRPs (node 1, a virtual point 50m in, node 2), each leg exactly 50m.
+        let loc = encode_line(&g, &input, 180.0, 50.0, 12).unwrap();
+        let lrps = loc.lrps().unwrap();
+        assert_eq!(lrps.len(), 3, "the 100m core needed exactly one virtual-point split");
+        assert!((lrps[0].dnp.unwrap().lb - 50.0).abs() < 1.0);
+        assert!((lrps[1].dnp.unwrap().lb - 50.0).abs() < 1.0);
+        assert!(lrps[2].dnp.is_none(), "the final LRP has no leg of its own");
     }
 
     #[test]
@@ -366,6 +425,157 @@ mod tests {
         let tpeg = openlr_codec::encode_tpeg_hex(&loc).unwrap();
         let redecoded_tpeg = openlr_codec::decode_tpeg_hex(&tpeg).unwrap();
         assert_eq!(redecoded_tpeg.lrps().unwrap().len(), 2);
+    }
+
+    /// Rule-5 cascade (pos-offset side): node A (dead end, 0,0) --50m-- node X
+    /// (pass-through, invalid) --50m(core)-- node B (dead end). The drawn
+    /// path starts at X with a 40m within-segment offset; X is invalid, so
+    /// Rule-4 expansion walks 50m back to A. `pos_offset_m` = 40 + 50 = 90m,
+    /// but a 60m `max_leg_m` forces Rule-1 to split the (A,X,B) 100m path
+    /// into two 50m legs at X (the only node between A and B) -- so the
+    /// first leg (A to X) is only 50m, shorter than the 90m offset. The true
+    /// start lies entirely past it, in the second leg: the cascade must
+    /// drop the first leg, reduce the offset to 90-50=40m, and re-apply it
+    /// to the (now first) X-to-B leg -- collapsing 3 LRPs down to 2.
+    #[test]
+    fn rule5_cascade_drops_a_leading_leg_the_offset_entirely_bypasses() {
+        let mut g = Graph::new();
+        g.add_node(node(0, 0.0, 0.0));        // A: dead end
+        g.add_node(node(1, 50.0 / 111_000.0, 0.0)); // X: pass-through (invalid)
+        g.add_node(node(2, 100.0 / 111_000.0, 0.0)); // B: dead end
+        g.add_segment(seg(10, 0, 1, 50.0 / 111_000.0)); // A -> X, 50m
+        g.add_segment(seg(1, 1, 2, 50.0 / 111_000.0));  // X -> B, the drawn core, 50m
+
+        let input = LineLocationInput {
+            path: vec![SegmentId(1)],
+            start_node: NodeId(1), // X: invalid, forces Rule-4 expansion to A
+            start_offset_m: 40.0,
+            end_offset_m: 0.0,
+            via_split_points: vec![],
+        };
+        let loc = encode_line(&g, &input, 180.0, 60.0, 12).unwrap();
+        let lrps = loc.lrps().unwrap();
+
+        assert_eq!(lrps.len(), 2, "the A-X leg should be dropped entirely, collapsing 3 LRPs to 2");
+        assert!((lrps[0].coord.0 - (50.0 / 111_000.0)).abs() < 1e-9, "first LRP should now sit at X, not A");
+        assert!((lrps[0].dnp.unwrap().lb - 50.0).abs() < 1.0, "dnp={:?}", lrps[0].dnp);
+        assert!((lrps[0].pos_offset.unwrap().lb - 40.0).abs() < 1.0, "pos_offset={:?}", lrps[0].pos_offset);
+        assert!(lrps[1].dnp.is_none());
+    }
+
+    /// Rule-5 cascade (neg-offset side): mirrors the pos-offset test, but
+    /// trims from the end. node A (dead end) --50m(core)-- node X
+    /// (pass-through, invalid) --50m-- node B (dead end). The drawn path
+    /// ends at X with a 40m within-segment end-offset; Rule-4 expansion
+    /// walks 50m forward from X to B, so `neg_offset_m` = 40 + 50 = 90m. A
+    /// 60m `max_leg_m` again splits the 100m (A,X,B) path at X into two 50m
+    /// legs, so the *last* leg (X to B) is only 50m -- shorter than the 90m
+    /// offset. The cascade must drop that trailing leg, reduce the offset
+    /// to 40m, and re-anchor the final LRP at X -- with a *backward-facing*
+    /// bearing (into the A-X segment, looking back from X), not the forward
+    /// bearing X's leg-start LRP would otherwise have had.
+    #[test]
+    fn rule5_cascade_drops_a_trailing_leg_and_recomputes_backward_bearing() {
+        let mut g = Graph::new();
+        g.add_node(node(0, 0.0, 0.0));        // A: dead end
+        g.add_node(node(1, 50.0 / 111_000.0, 0.0)); // X: pass-through (invalid)
+        g.add_node(node(2, 100.0 / 111_000.0, 0.0)); // B: dead end
+        g.add_segment(seg(1, 0, 1, 50.0 / 111_000.0));  // A -> X, the drawn core, 50m
+        g.add_segment(seg(11, 1, 2, 50.0 / 111_000.0)); // X -> B, 50m
+
+        let input = LineLocationInput {
+            path: vec![SegmentId(1)],
+            start_node: NodeId(0),
+            start_offset_m: 0.0,
+            end_offset_m: 40.0, // true end sits 40m *before* X along the core
+            via_split_points: vec![],
+        };
+        let loc = encode_line(&g, &input, 180.0, 60.0, 12).unwrap();
+        let lrps = loc.lrps().unwrap();
+
+        assert_eq!(lrps.len(), 2, "the X-B leg should be dropped entirely, collapsing 3 LRPs to 2");
+        assert!((lrps[0].dnp.unwrap().lb - 50.0).abs() < 1.0, "dnp={:?}", lrps[0].dnp);
+        assert!(lrps[1].dnp.is_none());
+        assert!((lrps[1].coord.0 - (50.0 / 111_000.0)).abs() < 1e-9, "final LRP should now sit at X, not B");
+        assert!((lrps[1].neg_offset.unwrap().lb - 40.0).abs() < 1.0, "neg_offset={:?}", lrps[1].neg_offset);
+        // Backward-facing: looking back (west, ~270°) into the A->X segment
+        // from X, not forward (east, ~90°) as X's own leg-start LRP would
+        // have faced had it not been converted into the final LRP.
+        assert!((lrps[1].bearing.lb_deg - 270.0).abs() < 1.0, "bearing={:?}", lrps[1].bearing);
+    }
+
+    /// Same scenario as `rule5_cascade_drops_a_trailing_leg_and_recomputes_backward_bearing`,
+    /// but proved end-to-end through the real decode engine rather than just
+    /// inspecting the produced LRP fields directly -- the backward-bearing
+    /// recompute is new, easy-to-get-subtly-wrong logic, so this is worth
+    /// nailing down the same way the Rule-1 virtual-point case was.
+    #[test]
+    fn rule5_trailing_cascade_round_trips_through_the_real_decode_engine() {
+        use openlr_engine::{decode, DecodeParams, Preset};
+
+        let mut g = Graph::new();
+        g.add_node(node(0, 0.0, 0.0));
+        g.add_node(node(1, 50.0 / 111_000.0, 0.0));
+        g.add_node(node(2, 100.0 / 111_000.0, 0.0));
+        g.add_segment(seg(1, 0, 1, 50.0 / 111_000.0));
+        g.add_segment(seg(11, 1, 2, 50.0 / 111_000.0));
+
+        let input = LineLocationInput {
+            path: vec![SegmentId(1)],
+            start_node: NodeId(0),
+            start_offset_m: 0.0,
+            end_offset_m: 40.0,
+            via_split_points: vec![],
+        };
+        let loc = encode_line(&g, &input, 180.0, 60.0, 12).unwrap();
+
+        let v3 = openlr_codec::encode_v3_base64(&loc).unwrap();
+        let redecoded = openlr_codec::decode_v3_base64(&v3).unwrap();
+
+        let params = DecodeParams::preset(Preset::Permissive);
+        let result = decode(&redecoded, &g, &params, 12).expect("engine decode of a Rule-5 cascaded location failed");
+        let decoded = result.as_network().unwrap();
+        assert_eq!(decoded.path, vec![SegmentId(1)], "decoder must recover the single A->X segment, not wander onto X->B");
+        let neg_offset = decoded.neg_offset.expect("a 40m neg_offset was encoded");
+        assert!((neg_offset.lb - 40.0).abs() < 5.0, "neg_offset={neg_offset:?}");
+    }
+
+    /// End-to-end proof (not just code-inspection) that the existing decode
+    /// engine already handles a Rule-1 virtual-point-split LRP correctly via
+    /// its generic per-leg candidate/routing logic (see `virtual_split`'s
+    /// module doc) -- no `openlr-engine` changes were made for this feature,
+    /// so this is the one assumption most worth nailing down empirically. A
+    /// single 40km segment (no interior node at all) needs two virtual-point
+    /// splits; the real decode engine must still recover the full path.
+    #[test]
+    fn virtual_point_split_location_round_trips_through_the_real_decode_engine() {
+        use openlr_engine::{decode, DecodeParams, Preset};
+
+        let mut g = Graph::new();
+        g.add_node(node(0, 0.0, 0.0));
+        g.add_node(node(1, 40_000.0 / 111_000.0, 0.0));
+        g.add_segment(seg(1, 0, 1, 40_000.0 / 111_000.0)); // length_m = len_deg * 111_000.0 = 40_000.0 exactly
+
+        let input = LineLocationInput {
+            path: vec![SegmentId(1)],
+            start_node: NodeId(0),
+            start_offset_m: 0.0,
+            end_offset_m: 0.0,
+            via_split_points: vec![],
+        };
+        let loc = encode_line(&g, &input, 180.0, 15_000.0, 12).unwrap();
+        let lrps = loc.lrps().unwrap();
+        assert_eq!(lrps.len(), 4, "40km / 15km needs 2 virtual-point splits -> 3 legs -> 4 LRPs");
+
+        let v3 = openlr_codec::encode_v3_base64(&loc).unwrap();
+        let redecoded = openlr_codec::decode_v3_base64(&v3).unwrap();
+
+        let params = DecodeParams::preset(Preset::Permissive);
+        let result = decode(&redecoded, &g, &params, 12).expect("engine decode of a virtual-point-split location failed");
+        let decoded = result.as_network().unwrap();
+        let decoded_len_m: f64 = decoded.path.iter().filter_map(|id| g.segments.get(id)).map(|s| s.length_m).sum();
+        assert!((decoded_len_m - 40_000.0).abs() < 200.0, "decoded_len_m={decoded_len_m}");
+        assert_eq!(decoded.path, vec![SegmentId(1)]);
     }
 
     /// A drawn via-point (0→1→2) that is NOT on the shortest 0→2 route (a

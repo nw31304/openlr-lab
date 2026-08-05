@@ -10,13 +10,19 @@
 
 use openlr_graph::{shortest_path, Graph, NodeId, PathOutcome, SegmentId, NO_PRIOR_SEG};
 
+use crate::virtual_split::{self, LrpAnchor};
 use crate::EncodeError;
 
 /// One leg of the eventual location reference.
 #[derive(Debug)]
 pub struct Leg {
-    pub start_node: NodeId,
+    pub start: LrpAnchor,
+    /// Full segment IDs spanned by this leg, in travel order — the first
+    /// and/or last entry may be only partially covered when `start` (or the
+    /// next leg's own `start`) is `LrpAnchor::Virtual`; `length_m` is the
+    /// authoritative distance, not a re-sum of these segments' full lengths.
     pub segments: Vec<SegmentId>,
+    pub length_m: f64,
 }
 
 /// Sweep `path` (the full desired route, already expanded to valid start/end
@@ -71,15 +77,11 @@ pub fn sweep_coverage(
             // `max_leg_m` allows (this was never reachable when the cap was
             // always the architecture's 15km ceiling, since a drawn route
             // rarely goes that far without a natural via-point, but a
-            // caller-supplied smaller cap hits it routinely).
-            let leg_len_m: f64 = remaining.iter()
-                .filter_map(|id| graph.segments.get(id))
-                .map(|s| s.length_m)
-                .sum();
-            if leg_len_m > max_leg_m {
-                return Err(EncodeError::LegTooLong { length_m: leg_len_m, max_leg_m });
-            }
-            legs.push(Leg { start_node: current_start, segments: remaining.to_vec() });
+            // caller-supplied smaller cap hits it routinely). `split_for_rule1`
+            // subdivides it (inserting virtual-point LRPs if needed) rather
+            // than erroring — see its own doc comment for why no additional
+            // A*/divergence check is needed for those new split points.
+            legs.extend(virtual_split::split_for_rule1(graph, current_start, remaining, max_leg_m)?);
             return Ok(legs);
         }
 
@@ -100,14 +102,7 @@ pub fn sweep_coverage(
         let agreement = common_prefix_len(tail, &result.segments);
 
         if agreement == tail.len() {
-            let leg_len_m: f64 = remaining.iter()
-                .filter_map(|id| graph.segments.get(id))
-                .map(|s| s.length_m)
-                .sum();
-            if leg_len_m > max_leg_m {
-                return Err(EncodeError::LegTooLong { length_m: leg_len_m, max_leg_m });
-            }
-            legs.push(Leg { start_node: current_start, segments: remaining.to_vec() });
+            legs.extend(virtual_split::split_for_rule1(graph, current_start, remaining, max_leg_m)?);
             return Ok(legs);
         }
 
@@ -126,19 +121,14 @@ pub fn sweep_coverage(
             .ok_or(EncodeError::NoRoute)?;
         let last_seg_of_leg = leg_segments[leg_segments.len() - 1];
 
-        // Rule-1: split further if this leg alone exceeds the 15km cap. (v1
-        // scope: report an error rather than the spec's full virtual-point
-        // splitting — real inputs built from a routed path rarely produce a
-        // single leg this long before an intermediate is otherwise needed.)
-        let leg_len_m: f64 = leg_segments.iter()
-            .filter_map(|id| graph.segments.get(id))
-            .map(|s| s.length_m)
-            .sum();
-        if leg_len_m > max_leg_m {
-            return Err(EncodeError::LegTooLong { length_m: leg_len_m, max_leg_m });
-        }
+        // Rule-1: split further if this leg alone exceeds the 15km cap
+        // (inserting virtual-point LRPs if needed). This operates on the raw,
+        // unsplit `leg_segments` -- `intermediate_node`/`last_seg_of_leg`
+        // above (which drive the *outer* divergence-protection loop's next
+        // iteration) are computed from that same raw list regardless of how
+        // many pieces `split_for_rule1` produces internally.
+        legs.extend(virtual_split::split_for_rule1(graph, current_start, &leg_segments, max_leg_m)?);
 
-        legs.push(Leg { start_node: current_start, segments: leg_segments });
         remaining = &remaining[split_at..];
         current_start = intermediate_node;
         current_start_seg = last_seg_of_leg;
@@ -241,7 +231,7 @@ pub(crate) fn trace_end_node_validated(
 }
 
 /// The node at the far end of `seg_id` from `entered_from`.
-fn other_end(graph: &Graph, seg_id: SegmentId, entered_from: NodeId) -> Option<NodeId> {
+pub(crate) fn other_end(graph: &Graph, seg_id: SegmentId, entered_from: NodeId) -> Option<NodeId> {
     let seg = graph.segments.get(&seg_id)?;
     if seg.start_node == entered_from {
         Some(seg.end_node)
@@ -307,15 +297,18 @@ mod tests {
         let legs = sweep_coverage(&g, &path, NodeId(0), NO_PRIOR_SEG, NodeId(2), 15_000.0, 180.0, 12).unwrap();
         assert_eq!(legs.len(), 1);
         assert_eq!(legs[0].segments, path);
-        assert_eq!(legs[0].start_node, NodeId(0));
+        assert!(matches!(legs[0].start, LrpAnchor::Node(NodeId(0))));
     }
 
     #[test]
-    fn straight_path_over_max_leg_cap_is_rejected() {
+    fn straight_path_over_max_leg_cap_is_split_via_virtual_points() {
         // Same shape as straight_path_needs_no_intermediates (a perfectly
         // reproducible, undivergent path) — but with a `max_leg_m` well below
         // its 200m total. The "no divergence" success branch must still
-        // enforce Rule-1, not just the "had to split" branch.
+        // enforce Rule-1, not just the "had to split" branch -- but instead
+        // of erroring, it now subdivides via `virtual_split::split_for_rule1`
+        // (no real node exists within a 50m budget on either 100m segment,
+        // so every split here is a virtual, mid-segment point).
         let mut g = Graph::new();
         g.add_node(node(0, 0.0, 0.0));
         g.add_node(node(1, 0.001, 0.0));
@@ -324,13 +317,16 @@ mod tests {
         g.add_segment(seg(2, 1, 2, 100.0));
 
         let path = vec![SegmentId(1), SegmentId(2)];
-        match sweep_coverage(&g, &path, NodeId(0), NO_PRIOR_SEG, NodeId(2), 50.0, 180.0, 12) {
-            Err(EncodeError::LegTooLong { length_m, max_leg_m }) => {
-                assert!((length_m - 200.0).abs() < 1e-6);
-                assert_eq!(max_leg_m, 50.0);
-            }
-            other => panic!("expected LegTooLong (200m path over a 50m cap with no divergence), got {other:?}"),
+        let legs = sweep_coverage(&g, &path, NodeId(0), NO_PRIOR_SEG, NodeId(2), 50.0, 180.0, 12).unwrap();
+
+        assert_eq!(legs.len(), 4, "200m over a 50m cap needs 3 splits");
+        for leg in &legs {
+            assert!((leg.length_m - 50.0).abs() < 1e-6, "length_m={}", leg.length_m);
         }
+        assert!(matches!(legs[0].start, LrpAnchor::Node(NodeId(0))));
+        assert!(matches!(legs[1].start, LrpAnchor::Virtual { .. }), "50m into the 100m seg1 -- no node there");
+        assert!(matches!(legs[2].start, LrpAnchor::Node(NodeId(1))), "the next 50m finishes seg1, landing exactly on node 1");
+        assert!(matches!(legs[3].start, LrpAnchor::Virtual { .. }), "50m into the 100m seg2 -- no node there");
     }
 
     #[test]
@@ -361,7 +357,7 @@ mod tests {
 
         assert_eq!(legs.len(), 1, "the shortcut leaves from the LRP's own node, so bearing already handles it");
         assert_eq!(legs[0].segments, path);
-        assert_eq!(legs[0].start_node, NodeId(0));
+        assert!(matches!(legs[0].start, LrpAnchor::Node(NodeId(0))));
     }
 
     #[test]
@@ -391,9 +387,9 @@ mod tests {
 
         assert_eq!(legs.len(), 2, "node 1 is a real decision point past the forced ground, so its shortcut needs protecting");
         assert_eq!(legs[0].segments, vec![SegmentId(1)]);
-        assert_eq!(legs[0].start_node, NodeId(0));
+        assert!(matches!(legs[0].start, LrpAnchor::Node(NodeId(0))));
         assert_eq!(legs[1].segments, vec![SegmentId(2), SegmentId(3)]);
-        assert_eq!(legs[1].start_node, NodeId(1));
+        assert!(matches!(legs[1].start, LrpAnchor::Node(NodeId(1))));
     }
 
     #[test]
