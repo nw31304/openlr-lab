@@ -72,10 +72,24 @@ export default function App() {
           initWasm(),
           pmtiles.getHeader().catch(() => null),
         ]);
+        // The manifest is the sole source of truth for which zoom this archive
+        // was actually tiled at (CLAUDE.md Invariant 11) -- every TileKey
+        // computed downstream (prefetch, candidate search, A*) depends on it
+        // matching exactly. A missing field here must be a hard error, not a
+        // silent `?? 12` substitution: that would target the wrong z/x/y grid
+        // for any archive actually built at a different zoom, with no
+        // cross-check to ever catch the mismatch.
+        const tileZoom = manifest.tile_zoom ?? manifest.zoom;
+        if (!Number.isFinite(tileZoom)) {
+          throw new Error(
+            `manifest.json at ${base} has no tile_zoom field -- refusing to assume a default zoom, ` +
+            `since a wrong zoom would silently make every tile request target the wrong grid cell for this archive.`
+          );
+        }
         setPmtiles(pmtiles);
         setDecoder(decoder);
         setEncoder(encoder);
-        setZoom(manifest.tile_zoom ?? manifest.zoom ?? 12);
+        setZoom(tileZoom);
         const { minLon, minLat, maxLon, maxLat } = header ?? {};
         const boundsValid = [minLon, minLat, maxLon, maxLat].every(Number.isFinite)
           && maxLon > minLon && maxLat > minLat;

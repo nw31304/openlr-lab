@@ -158,7 +158,7 @@ export const TOOL_DEFINITIONS = [
     function: {
       name: 'retry_decode',
       description:
-        'Re-run the decode with a partial parameter override merged over the current params. Returns ok/fail, segment count, and total path length so you can immediately compare with the original result. Tiles must already be loaded (always true after a normal decode). Example: {"max_bearing_deviation_deg": 30} to test a wider bearing window.',
+        'Re-run the decode with a partial parameter override merged over the current params. Returns ok/fail, segment count, and total path length so you can immediately compare with the original result. If widening a positional tolerance (e.g. candidate_search_radius_m) needs tiles beyond what the original decode loaded, they are fetched automatically before retrying. Example: {"max_bearing_deviation_deg": 30} to test a wider bearing window.',
       parameters: {
         type: 'object',
         properties: {
@@ -838,7 +838,7 @@ async function executeEncodeTool(name, args, { encoder, encodeResult, waypoints,
 
 const ENCODE_TOOL_NAMES = new Set(ENCODE_TOOL_DEFINITIONS.map(t => t.function.name));
 
-// storeActions: { setPinnedCandidates, runForcedDecodeAndGet, highlightSegments, flyTo }
+// storeActions: { setPinnedCandidates, fetchAndLoadDecodeTiles, runForcedDecodeAndGet, highlightSegments, flyTo }
 export async function executeTool(name, args, ctx) {
   const { decodeResult, params, decoder, storeActions, forcedDecodeResult, encoder, encodeResult, waypoints, liveRoute, maxEncodeLegM, zoom } = ctx;
 
@@ -1251,6 +1251,23 @@ export async function executeTool(name, args, ctx) {
       const overrideStr = typeof params_override === 'string'
         ? params_override
         : JSON.stringify(params_override);
+
+      // A params override can widen a positional tolerance (e.g.
+      // candidate_search_radius_m) enough to need tiles beyond what the
+      // original start() prefetch requested. Candidate search has no
+      // reactive NeedsTile fallback (CLAUDE.md Invariant 11), so
+      // retry_decode() surfaces this as `needs_tiles` up front instead of
+      // silently searching an incomplete graph — fetch them and retry,
+      // capped so a pathological override can't loop forever.
+      const MAX_TILE_FETCH_ROUNDS = 5;
+      for (let round = 0; round < MAX_TILE_FETCH_ROUNDS; round++) {
+        const raw = decoder.retry_decode(overrideStr);
+        let parsed;
+        try { parsed = JSON.parse(raw); } catch { return raw; }
+        if (!parsed.needs_tiles?.length) return raw;
+        if (!storeActions?.fetchAndLoadDecodeTiles) return raw;
+        await storeActions.fetchAndLoadDecodeTiles(parsed.needs_tiles);
+      }
       return decoder.retry_decode(overrideStr);
     }
 

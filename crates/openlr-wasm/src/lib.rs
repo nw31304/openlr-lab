@@ -725,8 +725,12 @@ impl Decoder {
     }
 
     /// Re-run the decode with `params_override` merged over the current params.
-    /// Tiles must already be loaded; returns an error if a new tile is required.
-    /// Returns a compact comparison result — call get_decode_summary for full segment details.
+    /// If the merged params need tiles beyond what the original `start()` prefetch
+    /// requested (candidate search has no reactive `NeedsTile` fallback the way A*
+    /// interior routing does — CLAUDE.md Invariant 11), returns
+    /// `{ "needs_tiles": [[z,x,y], ...] }` instead of decoding; the caller should
+    /// load those tiles and call this again. Otherwise returns a compact comparison
+    /// result — call get_decode_summary for full segment details.
     pub fn retry_decode(&mut self, params_override: &str) -> String {
         let loc_ref = match &self.location_ref {
             Some(r) => r,
@@ -736,6 +740,29 @@ impl Decoder {
             Ok(p) => p,
             Err(e) => return serde_json::json!({"ok": false, "error": format!("invalid params override: {e}")}).to_string(),
         };
+
+        // Candidate search has no reactive NeedsTile fallback the way A* interior
+        // routing does (CLAUDE.md Invariant 11) -- it silently trusts whatever's
+        // already in the graph. A params override that widens a positional
+        // tolerance (e.g. candidate_search_radius_m) can need tiles beyond what
+        // the original start() call's prefetch requested, so recompute the
+        // prefetch set for the MERGED params here and surface anything missing
+        // *before* decoding, instead of silently searching an incomplete graph.
+        if let Some(lrps) = loc_ref.lrps() {
+            let missing: Vec<[u32; 3]> = prefetch_tile_keys(lrps, &merged, self.zoom)
+                .into_iter()
+                .filter(|tk| !self.loader.graph.is_tile_loaded(*tk))
+                .map(|tk| [tk.z as u32, tk.x, tk.y])
+                .collect();
+            if !missing.is_empty() {
+                return serde_json::json!({
+                    "ok": false,
+                    "needs_tiles": missing,
+                    "error": "params override needs additional tiles not yet loaded",
+                }).to_string();
+            }
+        }
+
         // Temporarily apply merged params, decode, restore originals.
         let saved = std::mem::replace(&mut self.params, merged.clone());
         let raw = self.decode();

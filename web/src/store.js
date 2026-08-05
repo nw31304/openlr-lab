@@ -19,6 +19,25 @@ function tileBytes(res) {
   return new Uint8Array(res.data);
 }
 
+/** Fetch and load each `[z,x,y]` tile into `_decoder` — used by the LLM chat's
+ *  `retry_decode` tool when a params override needs tiles beyond what the
+ *  original `start()` prefetch requested (CLAUDE.md Invariant 11: candidate
+ *  search has no reactive NeedsTile fallback, so these must be loaded
+ *  proactively before retrying, not discovered mid-search). Mirrors
+ *  `runDecode`'s own per-tile fetch pattern. */
+async function fetchAndLoadDecodeTiles(tiles) {
+  if (!_pmtiles || !_decoder) return;
+  await Promise.all(tiles.map(async ([z, x, y]) => {
+    try {
+      const res = await _pmtiles.getZxy(z, x, y);
+      const bytes = tileBytes(res);
+      if (bytes) _decoder.load_tile(z, x, y, bytes);
+    } catch (e) {
+      console.warn(`[retry_decode] tile ${z}/${x}/${y} load failed:`, e?.message ?? e);
+    }
+  }));
+}
+
 /** Build a client-side decode-failure result (e.g. giving up after exceeding the
  *  dynamic tile-load cap) that still has real format/location_type/lrps to show —
  *  decode()'s own Rust-side failures include this metadata, but a failure invented
@@ -509,6 +528,7 @@ export const useStore = create(persist(
           get().clearPinnedCandidates();
           snapsArray.forEach(({ lrp_index, ...snap }) => get().setPinnedCandidate(lrp_index, snap));
         },
+        fetchAndLoadDecodeTiles,
         runForcedDecodeAndGet: async () => {
           await get().runForcedDecode();
           return get().forcedDecodeResult;
