@@ -550,7 +550,6 @@ export default function MapView({ tilesBase, ready }) {
   const archiveBounds = useStore(s => s.archiveBounds);
   const mapContainer    = useRef(null);
   const mapRef          = useRef(null);
-  const tourCameraRef      = useRef(null);
   const tourWasRunningRef  = useRef(false);
   const tileCacheRef    = useRef(new Map());
   const nodesCacheRef   = useRef(new Map());
@@ -1717,33 +1716,27 @@ export default function MapView({ tilesBase, ready }) {
     mapRef.current?.fitBounds(archiveBounds, { padding: 40, duration: 0 });
   }, [archiveBounds]);
 
-  // ── Onboarding tour: restore the camera on exit ─────────────────────────────
+  // ── Onboarding tour: reset the camera to the archive's full extent on exit ──
   // The tour's Results/Trace steps swap in a fake decode result (see
-  // OnboardingTour.jsx) purely to populate those panels, but the ordinary
-  // decode-visualization effect above reacts to it exactly like a real decode
-  // and re-fits the camera to the sample path — leaving the user looking at
-  // wherever that sample happens to be instead of where they were. Snapshot
-  // the camera the moment the tour starts (before any sample data is ever
-  // swapped in) and ease back to it once the tour ends.
+  // OnboardingTour.jsx) purely to populate those panels, and the closing
+  // Encode-mode steps let the user genuinely interact with the map (place
+  // waypoints, pan, zoom) -- unlike the earlier steps, which never touch the
+  // camera themselves. Rather than restore "wherever the camera happened to
+  // be before the tour started", which stops meaning much once the user may
+  // have actually navigated during it, just fit back to the whole loaded
+  // archive's bounds once the tour ends -- a clean, predictable end state
+  // regardless of how the tour was used. No-op if the archive's bounds were
+  // never resolved (see the startup fit-to-bounds effect above).
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
     const running = tourStep != null;
     const wasRunning = tourWasRunningRef.current;
-    if (running && !wasRunning) {
-      tourCameraRef.current = {
-        center: map.getCenter(),
-        zoom: map.getZoom(),
-        bearing: map.getBearing(),
-        pitch: map.getPitch(),
-      };
-    } else if (!running && wasRunning) {
-      const snap = tourCameraRef.current;
-      if (snap) map.easeTo({ ...snap, duration: 500 });
-      tourCameraRef.current = null;
+    if (!running && wasRunning && archiveBounds) {
+      map.fitBounds(archiveBounds, { padding: 40, duration: 500 });
     }
     tourWasRunningRef.current = running;
-  }, [tourStep]);
+  }, [tourStep]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Basemap switch ───────────────────────────────────────────────────────────
 

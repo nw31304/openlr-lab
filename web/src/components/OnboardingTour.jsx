@@ -264,6 +264,13 @@ export default function OnboardingTour() {
   // once it ends -- otherwise it finishes with panels left open (Results/
   // Trace now showing nothing, since the sample data has been swapped back
   // out), which reads as broken/empty.
+  //
+  // Mode is handled differently: the closing steps force Encode mode (see
+  // 'encodeMode' above) and let the user genuinely place waypoints there, so
+  // there's no single well-defined "previous" mode worth restoring to -- the
+  // tour unconditionally leaves the app in Decode mode once it ends, exactly
+  // like it unconditionally forces Decode mode at the "paste a reference"
+  // step regardless of whatever mode was active when the tour started.
   useEffect(() => {
     const wasRunning = prevRunningRef.current;
     if (running && !wasRunning) {
@@ -282,9 +289,10 @@ export default function OnboardingTour() {
         showTileSourceMenu: snap.showTileSourceMenu,
       });
       panelSnapshotRef.current = null;
+      setMode('decode');
     }
     prevRunningRef.current = running;
-  }, [running]);
+  }, [running]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Swap in a fixed, made-up sample decode result while showing the
   // Results/Trace steps -- not a real decode, so it renders correctly
