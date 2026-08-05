@@ -58,7 +58,7 @@ const STEPS = [
   {
     target: '.map-area, .replay-panel',
     title: 'A* routing, live',
-    body: 'A live slice of a real decode\'s A* search, playing automatically: the router expands the road graph node by node — g = distance travelled so far, h = straight-line estimate to the target — honoring one-way streets and turn restrictions until it finds the shortest legal path.',
+    body: 'A live slice of a real decode\'s A* search, playing automatically: the router expands the road graph node by node — g = distance travelled so far, h = straight-line estimate to the target — honoring one-way streets and turn restrictions until it finds the shortest legal path. Replay animates the LRP candidate search the same way (accepted and rejected candidates as colored dots) — this slice just zooms in on the A* portion.',
     ensure: 'replayDemo',
   },
   {
