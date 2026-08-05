@@ -46,6 +46,11 @@ const STEPS = [
     showSample: true,
   },
   {
+    target: '.tp-forced-bar',
+    title: 'Forced re-decode: "what if?"',
+    body: 'Pin a specific candidate at any LRP — or click "Pin best candidates" to seed every LRP at once — then re-run A* using exactly those choices instead of what the decoder picked on its own. Great for testing "why didn\'t it use *this* road?" without editing the input string at all.',
+  },
+  {
     target: '[data-tour-solo="replay-btn"]',
     title: 'Replay: watch it happen',
     body: 'The standout feature — step through every phase of a decode (or an encode\'s verify) one at a time: candidate search, A* routing, offset trimming, all animated live on the map exactly as the engine experienced it. Step forward, back, or scrub the timeline directly.',
@@ -70,8 +75,8 @@ const STEPS = [
   },
   {
     target: '[data-tour="config-tools"]',
-    title: 'More tools',
-    body: 'How much trace detail to capture, and an AI chat that can answer questions about a decode.',
+    title: 'AI chat and trace detail',
+    body: 'Configure an AI provider here to unlock AI Chat — a real diagnostic assistant, not a chatbot guessing from the screen. It calls tools directly into the live engine (candidate scores, A* stats, graph topology) to answer questions grounded in the actual trace, can embed live SVG diagrams, and can even pin candidates and trigger a forced re-decode on your behalf. Trace Level here controls how much detail the *next* decode records for it — and for Replay — to work with.',
   },
 ];
 

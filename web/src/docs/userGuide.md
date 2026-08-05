@@ -43,6 +43,7 @@ map location you draw → a new OpenLR string) in full detail.
 - [Map Tools](#map-tools)
 - [Inspecting Segments and Nodes](#inspecting-segments-and-nodes)
 - [Bringing Your Own Map](#bringing-your-own-map)
+- [Tile Data Format](#tile-data-format)
 - [AI Chat](#ai-chat)
   - [How It Works](#how-it-works)
   - [Suggested Prompts](#suggested-prompts)
@@ -527,8 +528,9 @@ active:
 - **🧭 Measure bearing and distance** — click a start point, then an end point, to see the compass
   bearing and straight-line distance between them; click again to start a fresh measurement.
 - **🔗 Copy permalink** — copies a URL that reopens this app with the *current OpenLR string*
-  pre-filled and automatically decoded on load (`#q=<string>`) — a quick way to share exactly what
-  you're looking at, or bookmark it for later.
+  pre-filled and automatically decoded on load (`?olr=<string>`) — a quick way to share exactly what
+  you're looking at, or bookmark it for later. Old links using the previous `#q=<string>` hash
+  format still work too.
 
 Every pin dropped by the coordinate tools (capture or zoom-to) shows its own popup with **Dismiss**
 and **Dismiss all** buttons, and stays on the map until dismissed.
@@ -572,6 +574,30 @@ Two more ways to point at a specific archive without touching that menu:
   useful for linking directly to a specific sub-archive without changing the stored default.
 - The **🔗 Copy permalink** [map tool](#map-tools) — reopens the app with the current OpenLR string
   pre-filled and decoded, using whichever tile source is already configured.
+
+## Tile Data Format
+
+The map data behind decoding and encoding — the road segments, junctions, and turn restrictions —
+comes from a [PMTiles](https://protomaps.com/) archive: one large, static file served over plain
+HTTP range requests, with no database or API server behind it. Inside that archive, each tile
+holds a custom binary payload (not the vector-tile/MVT format most map viewers use) purpose-built
+for this app: a list of road segments (each already split at every junction, so a segment always
+runs node-to-node with nothing branching off it partway through), a list of junction/end nodes,
+and a table of turn restrictions. Every segment and node carries its **FRC** (Functional Road
+Class, 0=motorway down to 7=minor/local) and, for segments, **FOW** (Form of Way — motorway,
+roundabout, slip road, etc.) — the same two attributes an OpenLR reference itself encodes, which
+is exactly what the decoder compares candidates against. All tiles sit at one fixed zoom level
+(not a multi-level pyramid the way basemap tiles usually are) — chosen so that a handful of tiles
+around any point comfortably covers even a generous candidate search radius.
+
+Every segment and node also carries a **stable ID**: an opaque text string — an OSM way ID, a
+database key, a UUID, whatever the archive's builder chose — shown throughout the UI (segment
+popups, the Results/Trace panels' segment tables) as the **Segment Key**. It's meaningful only in
+the sense that the same real-world road keeps the same ID across archive rebuilds; this app treats
+it as an opaque label, not something to parse. If you build your own archive (see
+[Bringing Your Own Map](#bringing-your-own-map)), the full format spec and build pipeline live in
+this project's own documentation repos, not here — this section is just enough to make sense of
+what you're looking at on screen.
 
 ## AI Chat
 
