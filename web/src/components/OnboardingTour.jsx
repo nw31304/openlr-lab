@@ -78,6 +78,28 @@ const STEPS = [
     title: 'AI chat and trace detail',
     body: 'Configure an AI provider here to unlock AI Chat — a real diagnostic assistant, not a chatbot guessing from the screen. It calls tools directly into the live engine (candidate scores, A* stats, graph topology) to answer questions grounded in the actual trace, can embed live SVG diagrams, and can even pin candidates and trigger a forced re-decode on your behalf. Trace Level here controls how much detail the *next* decode records for it — and for Replay — to work with.',
   },
+  {
+    target: '[data-tour="mode-toggle"]',
+    title: 'Encoding: a different workflow',
+    body: 'Everything so far has been Decode mode: an existing OpenLR string in, a matched route out. Encode mode is a second, self-contained workflow, not a variant of the first — instead of pasting a string, you draw a route directly on the map. The bottom decode input and the Results/Trace/Replay decode buttons disappear entirely, replaced by the encode workflow panel covered next. Switching back and forth never discards either side\'s state — whatever you\'ve decoded and whatever you\'re encoding both wait right where you left them.',
+    ensure: 'encodeMode',
+  },
+  {
+    target: '.map-area',
+    title: 'Placing waypoints',
+    body: 'Right-click empty map to append a waypoint (Line) or place/replace the single point (Point Along Line). Right-click directly on the already-drawn route to insert a via-point mid-leg. Right-click a numbered waypoint marker to move it — a plain left-click on one instead removes it immediately, no confirmation. Any of these can be a right-click-drag: a dashed "ghost" line previews the pending edit live as you drag.',
+  },
+  {
+    target: '.map-area',
+    title: 'The snap candidate popup',
+    body: 'A waypoint you click isn\'t itself an LRP — it\'s just where the encoder starts looking for a real road to anchor to. Releasing any waypoint edit opens a popup listing nearby roads and intersections to choose from; picking one redraws the actual routed preview for that specific choice, not just a straight line to it, so you can compare before committing rather than silently snapping to the nearest point.',
+  },
+  {
+    target: '.side-panel-left',
+    title: 'Encode, then verify the round trip',
+    body: 'This panel mirrors Decode\'s Results panel: the waypoint list, a live route preview that updates as you add waypoints (no need to encode first to see what the route looks like), and an Encode button. Once encoded, the result is immediately re-decoded through the exact same engine used everywhere else in this app — a genuine round trip, not a simulated check — reported as a ✓/⚠ verify badge, with the same Trace and Replay available for that verify decode.',
+    ensure: 'result',
+  },
 ];
 
 const INTRO_BULLETS = [
@@ -181,6 +203,12 @@ export default function OnboardingTour() {
     // force it so this step's target actually exists, regardless of
     // whichever mode was active when the tour was (re)started.
     if (step.ensure === 'decodeMode') setMode('decode');
+    // EncodeResultPanel (waypoint list, live preview) only renders in encode
+    // mode -- force it so the closing encode-mode steps' targets exist,
+    // regardless of whichever mode was active when the tour started. Left in
+    // place (no restore) once the tour ends, matching decodeMode's own
+    // precedent above.
+    if (step.ensure === 'encodeMode') setMode('encode');
     if (step.ensure === 'params') {
       openParams();
       return () => closeParams();
