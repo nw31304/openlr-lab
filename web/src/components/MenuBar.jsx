@@ -182,7 +182,7 @@ export default function MenuBar() {
 
       <div className="menu-spacer" />
 
-      <button className="menu-btn" onClick={toggleParams} title="Decode parameters" data-tour-solo="params-btn">
+      <button className="menu-btn" onClick={toggleParams} title="Decode parameters">
         Parameters
       </button>
 

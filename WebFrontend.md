@@ -18,8 +18,8 @@ core (`Decoder` and `Encoder` structs — see §4 and §20).
 ```
 Browser
   App.jsx           — startup, WASM init, tile base URL from ?tiles= param
-    MenuBar.jsx     — decode/encode mode toggle, location-type dropdown, panel toggles
-    TopBar.jsx      — OpenLR string input, preset, toggles, Decode button (decode mode)
+    MenuBar.jsx     — decode/encode mode toggle, location-type dropdown, panel toggles,
+                      Parameters/Trace Level/Tile source dropdowns, Help menu
     ParamsPanel.jsx — all DecodeParams fields; FRC/FOW penalty tables
     Map.jsx         — MapLibre GL JS canvas; GeoJSON sources/layers for both modes
     ResultPanel.jsx — decoded segment list; click-to-highlight (decode mode)
@@ -27,7 +27,7 @@ Browser
     TracePanel.jsx  — full trace: candidates, A*, DNP, offsets, result (both modes —
                       reads decodeResult or verifyResult depending on mode)
     ReplayPanel.jsx — step-by-step A* replay (both modes)
-    BottomBar.jsx   — status line
+    BottomBar.jsx   — OpenLR string input + Decode button (decode mode)
     LlmChatPanel.jsx / LlmSettingsPanel.jsx — AI assistant, both modes
     DecodeToast.jsx — transient result/error banner
 ```
@@ -270,15 +270,28 @@ WASM segment references.
 
 ---
 
-## 7. TopBar (`TopBar.jsx`)
+## 7. MenuBar toolbar controls (`MenuBar.jsx`) and BottomBar (`BottomBar.jsx`)
 
-Contains:
-- **OpenLR input**: text input; Enter key triggers decode
-- **Gear menu** (`⚙`): dropdown with toggle rows for Road segments, Trace panel, and Replay; plus a **Trace level** button group (Off / Summary / Full) that sets `params.trace_level`; plus Parameters… and Reset to defaults actions
-- **▶ Replay button**: appears only when `replaySteps.length > 0`; toggles `showReplay`
-- **Decode button**: calls `runDecode()`; disabled while `decoding` is true
+`MenuBar.jsx` is a flat row of buttons and dropdowns (no nested "gear" menu) — mode
+toggle and location-type dropdown are covered in §20; the rest:
+- **Segments / Trace / Replay / Results** toggle buttons: show/hide the corresponding
+  panel (`showSegmentLayer`/`showTrace`/`showReplay`/`showResult`); Trace, Replay, and
+  Results are hidden in encode mode (they read `decodeResult`, not `verifyResult`).
+- **Parameters** button: toggles `ParamsPanel` (§8), which also owns the **Reset decode
+  params to defaults** action.
+- **Trace Level** dropdown: sets `params.trace_level` (Off / Summary / Full).
+  **Full** is required before decoding to get `AStarNodeExpanded` events, which the A\*
+  replay (§13) depends on; Summary records candidates and routing outcomes only.
+- **AI Chat** / **AI** buttons: toggle `LlmChatPanel`/`LlmSettingsPanel` (§17).
+- **Tile source** dropdown: edits `tileUrl` (an input + "Apply & reload", which does a
+  full `window.location.assign` reload after `setTileUrl`) — see §21 for how this
+  interacts with `VITE_TILE_BASE_URL` in production.
+- **?** dropdown: **Quick Tour** (`OnboardingTour.jsx`) and **Documentation**
+  (`DocumentationPage.jsx`).
 
-`trace_level` must be set to **Full** before decoding to get `AStarNodeExpanded` events, which are required for A\* visualisation in the replay. Summary level records candidates and routing outcomes only.
+`BottomBar.jsx` is just the OpenLR string input (Enter triggers decode) and the Decode
+button (calls `runDecode()`, disabled while `decoding` is true) — shown only in decode
+mode (`App.jsx`: `{mode !== 'encode' && <BottomBar />}`).
 
 ---
 
@@ -552,10 +565,10 @@ This avoids the O(N²) cost of recomputing from step 0 on every step during forw
 |---|---|
 | `src/main.jsx` | React root mount; `<StrictMode>` wrapper |
 | `src/App.jsx` | Startup, WASM init, tile base URL, component tree |
-| `src/App.css` | All styles (TopBar, panels, map overlays, trace panel, replay panel, LLM chat) |
+| `src/App.css` | All styles (MenuBar, BottomBar, panels, map overlays, trace panel, replay panel, LLM chat) |
 | `src/store.js` | Zustand store; 3 module-level caches; `runDecode()`; PRESETS; replay + LLM + encode state (§20) |
 | `src/replayEngine.js` | `buildReplaySteps`, `applyStep`, `emptyState`, `computeVisualState`, `stateToGeoJSON(state, geomLookup)`, `verdictType` |
-| `src/tileDecoder.js` | OLRL v2 binary → GeoJSON |
+| `src/tileDecoder.js` | OLRL v3 binary → GeoJSON |
 | `src/wasm.js` | WASM module loader (`initWasm()`), exposes both the `Decoder` and `Encoder` classes |
 | `src/hooks.js` | `useDraggable` |
 | `src/diagnosis.js` | `diagnoseFailure`, `diagnoseSuccess` — rule-based decode diagnosis from trace events |
@@ -567,17 +580,20 @@ This avoids the O(N²) cost of recomputing from step 0 on every step during forw
 | `src/llm/tools.js` | LLM function-calling tool schemas + handlers, decode and encode side |
 | `src/llm/README.md` | LLM integration documentation |
 | `src/components/Map.jsx` | MapLibre GL JS; all sources/layers for both decode and encode mode; tile loader; highlight + replay + candidatePopup effects; waypoint snap-picker popup (§20) |
-| `src/components/MenuBar.jsx` | Decode/encode mode toggle; location-type dropdown (encode); panel visibility toggles |
-| `src/components/TopBar.jsx` | Input bar, gear menu, Trace level, ▶ Replay button, Decode button |
+| `src/components/MenuBar.jsx` | Decode/encode mode toggle; location-type dropdown (encode); panel visibility toggles; Parameters/Trace Level/Tile source/Help dropdowns |
+| `src/components/BottomBar.jsx` | OpenLR string input + Decode button (decode mode) |
 | `src/components/ParamsPanel.jsx` | DecodeParams editor; FRC/FOW penalty tables; `SpinInput` with optional max |
 | `src/components/ResultPanel.jsx` | Decoded segment list; click-to-highlight; failure diagnosis; LLM chat button |
 | `src/components/EncodeResultPanel.jsx` | v3/TPEG output + copy buttons; verify-decode glance badge (§20) |
 | `src/components/TracePanel.jsx` | Full trace; `SegBtn`; `buildCandPopup`; `RejectedTable`; candidate evaluation popup; forced-decode pin/re-run UI; reads `decodeResult` or `verifyResult` depending on `mode` |
 | `src/components/ReplayPanel.jsx` | Step replay UI: ◀/▶ buttons, step counter, scrubable timeline |
-| `src/components/BottomBar.jsx` | Status line |
 | `src/components/DecodeToast.jsx` | Transient result/error banner |
 | `src/components/LlmChatPanel.jsx` | AI chat panel (draggable modal) |
 | `src/components/LlmSettingsPanel.jsx` | LLM provider/key/model config (draggable modal) |
+| `src/components/DocumentationPage.jsx` | Full-page Documentation route (`route === 'docs'`, pushState-based, not a modal — rest of the app stays mounted underneath); renders `docs/userGuide.md` via `ReactMarkdown` plus synthetic Presets/Field-reference sections generated from `ParamsPanel.jsx`'s `PARAM_DOCS`/`SCALAR_FIELDS` and `refFormat.js`'s `HELP`/`PARAM_ORDER` |
+| `src/components/OnboardingTour.jsx` | First-run guided tour; `STEPS` array of `{ target: <CSS selector>, ... }` spotlights driven by `data-tour`/`data-tour-solo` attributes elsewhere in the component tree; `unionRect()` degrades silently (empty spotlight) on a no-match selector — see CLAUDE.md §15 |
+| `src/tourSampleData.js` | Canned sample OpenLR string + trace data the onboarding tour replays live, independent of any real tile source |
+| `src/docs/userGuide.md` | Documentation panel content (rendered by `DocumentationPage.jsx`) |
 | `vite.config.js` | Dev server; serve-tiles plugin (HTTP 206 / range support) |
 
 ---
@@ -825,10 +841,10 @@ shares the Pages project's deploy lifecycle.
 - `web/.env.production` — sets `VITE_TILE_BASE_URL=/tiles`, so a production build's
   default tile base is the same-origin Pages Function instead of the local dev
   server. Local dev is unaffected (falls back to `http://localhost:5176`, matching
-  `vite.config.js`'s dev-only tile server — see §1). This env var is read in four
+  `vite.config.js`'s dev-only tile server — see §1). This env var is read in three
   places that used to hardcode the localhost default: `store.js`'s `tileUrl` initial
-  state, `App.jsx`'s `resolveBase()`, `MenuBar.jsx`'s tile-menu sync effect, and
-  `TopBar.jsx`'s `effectiveUrl` derivation.
+  state, `App.jsx`'s `resolveBase()`, and `MenuBar.jsx`'s tile-menu sync effect (the
+  "Tile source" dropdown, §7).
 
 **One-time setup:**
 1. `npx wrangler login` (OAuth against the Cloudflare account).

@@ -7,6 +7,11 @@ Two formats are supported, both for decode and encode:
 - **OpenLR binary v3** (TomTom) — 11.25° bearing buckets, ~58.6 m DNP buckets
 - **TPEG-OLR / ISO 21219-22** — full-precision intervals
 
+**Read [`CLAUDE.md`](CLAUDE.md) before writing any code.** It's the canonical reference for this
+repo's critical invariants, architecture, data model, and agent conventions — several of those
+invariants fail *silently* (wrong output, not a crash) if violated. This README covers build/run
+instructions; `CLAUDE.md` covers everything about *why* the code is shaped the way it is.
+
 ## Architecture
 
 ```
@@ -77,6 +82,11 @@ cd crates/openlr-wasm
 wasm-pack build --target web --out-dir ../../web/src/wasm
 ```
 
+**This is not a one-time step.** The Vite dev server does not watch or rebuild the WASM module —
+re-run this command (from `crates/openlr-wasm/`) and reload the browser after *every* change under
+`crates/`, or you'll silently keep testing against a stale binary. The output is gitignored, so
+`npm run deploy` (see Deployment, below) also rebuilds it fresh before every deploy.
+
 ### 2. Run the web dev server
 
 ```sh
@@ -85,17 +95,24 @@ npm install
 npm run dev
 ```
 
-`npm run dev` starts both the Vite dev server (default `localhost:5173`) and a built-in tile server at `http://localhost:5176` (see the `tile-server` plugin in `vite.config.js`). By default it serves range requests out of `../out`; set `OPENLR_TILES_DIR` to point it at wherever [openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles) built its archives instead (e.g. `OPENLR_TILES_DIR=../../openlr-pmtiles/out npm run dev`). Override the tile source in the **Tile source** menu if you're pointing at a different archive or host.
+`npm run dev` starts both the Vite dev server (default `localhost:5173`) and a built-in tile server at `http://localhost:5176` (see the `tile-server` plugin in `vite.config.js`). By default it serves range requests out of the path hardcoded as `DEFAULT_TILES_DIR` in `vite.config.js`; set `OPENLR_TILES_DIR` to point it at wherever [openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles) built its archives instead (e.g. `OPENLR_TILES_DIR=../../openlr-pmtiles/out npm run dev`). Override the tile source in the **Tile source** menu if you're pointing at a different archive or host.
 
-### 3. Build a tile archive (optional — if you have road network data)
+Alternatively, `web/scripts/dev.sh start`/`stop` wraps this step — checks for (and offers to kill)
+anything already listening on the webapp/tile-server ports, backgrounds `npm run dev`, and waits
+until it actually responds before returning. Run `web/scripts/dev.sh --help` for its flags
+(`--port`, `--tiles-dir`).
 
-Building PMTiles archives is a separate repo now:
-[openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles). See its README
-for build commands. Point this repo's dev server at its output via
-`OPENLR_TILES_DIR` (step 2), or serve the archive from any PMTiles-compatible
-host (e.g. [`pmtiles serve`](https://github.com/protomaps/go-pmtiles), or
-R2/CDN with range-request support) and point the app at it via the **Tile
-source** menu.
+### 3. Get a tile archive
+
+The app can't do much without one — no PMTiles archive means the map loads with no road data and
+decode/encode has nothing to snap against. Building one is a separate repo:
+[openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles) (private). See its README for build
+commands. Point this repo's dev server at its output via `OPENLR_TILES_DIR` (step 2), or serve the
+archive from any PMTiles-compatible host (e.g. [`pmtiles serve`](https://github.com/protomaps/go-pmtiles),
+or R2/CDN with range-request support) and point the app at it via the **Tile source** menu. There is
+currently no sample/test archive bundled in this repo and no public fallback host documented — if
+you don't have access to the `openlr-pmtiles` repo or an existing archive, you can compile and run
+the app (steps 1–2) but won't see live map data.
 
 ## Deployment
 

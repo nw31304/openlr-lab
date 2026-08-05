@@ -30,7 +30,13 @@ LocationReference  ──▶  select_candidates (per LRP)
 
 The two main public entry points are:
 - `decode(loc_ref, graph, params)` → `Result<DecodedLocation, DecodeFailure>`
-- `path_to_wkt(path, pos_offset_m, neg_offset_m, first_lrp_arc_m, last_lrp_arc_m, graph)` → `Option<String>`
+- `path_to_wkt(path, pos_offset_m, neg_offset_m, first_lrp_arc_m, last_lrp_arc_m,
+  first_seg_traversal, _last_seg_traversal, graph)` → `Option<String>` — the traversal-direction
+  params exist because the heuristic (comparing `end_node` with `seg[1]`'s endpoints) can fail
+  when A* U-turns back through the departure segment, making `seg[1]` appear to share
+  `seg[0].end_node` even though `seg[0]` is actually traversed Backward; `first_seg_traversal` is
+  the explicit, disambiguated value from candidate selection instead.
+- `path_band_wkt`/`coverage_range` (`wkt.rs`) — the offset-*uncertainty-range* feature (§8.1)
 
 `DecodeFailure` bundles the error with whatever trace was collected before the failure:
 
@@ -296,6 +302,9 @@ For each outgoing segment from `node`, skip if:
   are available while lower-priority roads aren't mistakenly used)
 - The turn `(via_seg → next_seg)` via `node` is prohibited by the restriction table
 - `seg.direction` doesn't permit traversal from `node`
+- The geometric turn angle at `node` exceeds `max_interior_turn_deviation_deg`
+  (`EdgeSkipReason::SharpTurn` — a hard gate, distinct from `max_bearing_deviation_deg`,
+  which only scores candidates at the LRP endpoints and never constrains the interior route)
 
 ### 6.5 Distance bounds
 
@@ -340,16 +349,29 @@ of `dnp` itself.
 
 ## 8. Offset application and WKT assembly
 
-### 8.1 apply_offset (`validation.rs`)
+### 8.1 Offset trimming and uncertainty range (`wkt.rs`)
 
-Uses the midpoint of the offset interval as the trim point:
+There is no standalone `apply_offset` function — trimming is inline inside `path_to_wkt` (§8.2),
+using the midpoint of the offset interval as the primary trim point:
 ```rust
 trim_m = (offset_interval.lb + offset_interval.ub) / 2.0;
 ```
 
-This is a placeholder — the correct approach is to treat the entire interval as a
-range and report the resulting location uncertainty to the UI (especially important
-for v3 where the 58.6 m bucket width means the real start could be ±29 m).
+The "treat the entire interval as a range and report the resulting location uncertainty" idea —
+previously a placeholder wish here — **is now implemented**, as a second, separate code path
+rather than a change to `path_to_wkt` itself:
+- `coverage_range(path, pos_offset_lb, pos_offset_ub, neg_offset_lb, neg_offset_ub,
+  first_lrp_arc_m, last_lrp_arc_m, graph)` → `Option<CoverageRange>` computes which segments and
+  arc-length sub-ranges the LB/UB offset bounds actually land in.
+- `path_band_wkt(path, from_m, to_m, first_seg_traversal, graph)` → `Option<String>` renders the
+  WKT geometry of an arbitrary arc-length band — used to draw the uncertainty zone `coverage_range`
+  identifies, by delegating to `path_to_wkt` with synthetic trim parameters (`from_m` as a
+  pos-offset from a zero-arc-length first LRP, `total_path_len - to_m` as a neg-offset from a
+  full-length last LRP).
+- The web UI surfaces this as two WKT strings per decode: `wkt` (midpoint trim, the primary
+  result) and `conservative_wkt` (UB trim, the pessimistic bound) — see `WebFrontend.md` §5. This
+  is especially relevant for v3, where the 58.6m DNP bucket width means the real start/end could
+  be ±29m from the midpoint.
 
 ### 8.2 path_to_wkt (`wkt.rs`)
 
@@ -421,6 +443,7 @@ skipped.
 |---|---|---|
 | `max_bearing_deviation_deg` | 45.0° | Rejects candidates with bearing excess beyond this (`#[serde(default)]`) |
 | `max_candidate_score` | 1.5 | Rejects candidates with total score above this (`#[serde(default)]`) |
+| `max_interior_turn_deviation_deg` | 150.0° | A\* interior-route hard gate: rejects an edge if the geometric turn angle at its node deviates from straight-ahead by more than this (`EdgeSkipReason::SharpTurn`, §6.4). Independent of `max_bearing_deviation_deg`, which only scores LRP-endpoint candidates and never constrains the interior route. |
 
 ### Routing / search
 | Parameter | Default | Role |
@@ -429,6 +452,7 @@ skipped.
 | `dnp_tolerance_pct` | 0.25 | DNP window percentage map-divergence term |
 | `max_path_search_factor` | 5.0 | A\* distance upper bound = `dnp.ub × factor` |
 | `max_astar_expansions` | 100 000 | Hard node-expansion cap (0 = unlimited) |
+| `max_routing_attempts` | 10 | Cap on how many candidate-index combinations `RouteGenerator` will try before giving up (0 = unlimited) |
 | `lfrcnp_tolerance` | 2 | Extra FRC steps added to LFRCNP floor |
 | `trace_level` | `Summary` | `Off` / `Summary` / `Full` |
 
@@ -530,8 +554,8 @@ candidates for an LRP were rejected.
 | `candidate.rs` | `select_candidates()`, `evaluate_candidate()`, bearing/projection scoring |
 | `astar.rs` | `find_route()`, path reconstruction, A\* state machine |
 | `route_generator.rs` | `RouteGenerator` — best-first combination iterator |
-| `validation.rs` | `validate_dnp()`, `apply_offset()`, `path_length_m()` |
-| `wkt.rs` | `path_to_wkt()`, `segment_vertices()` |
+| `validation.rs` | `validate_dnp()`, `path_length_m()` |
+| `wkt.rs` | `path_to_wkt()`, `path_band_wkt()`, `coverage_range()`, `CoverageRange`, `segment_vertices()` |
 | `params.rs` | `DecodeParams`, `Preset` |
 | `trace.rs` | `DecodeTrace`, `DecodeEvent`, `ScoredCandidate`, `TraversalDir`, etc. |
 | `tile_prefetch.rs` | `prefetch_tile_keys()` — compute tiles needed before decode |
@@ -541,16 +565,12 @@ candidates for an LRP were rejected.
 
 ## 13. Known limitations / next steps
 
-- **`apply_offset` uses interval midpoint** — should use the full interval to
-  report the location uncertainty range to the UI (especially material for v3's
-  ±29 m bucket half-width).
-
 - **`diagnostics.rs` is a stub** — the *automated* root-cause verdict (feasibility
   margin computation and LP-based ranking-flip check, closed-form decoder-tunable
   vs. encoder-deficient classification) is not implemented. The manual mechanism it
   would build on — pin a candidate per LRP and re-run A* (forced-decode mode) — *is*
-  implemented, in `web/src/components/TracePanel.jsx` and the LLM `retry_leg` tool;
-  see `Diagnosis.md` §8.
+  implemented, in `web/src/components/TracePanel.jsx` and the LLM
+  `set_pinned_candidates`/`run_forced_decode` tools; see `Diagnosis.md` §8.
 
 - **RouteGenerator ordering** is approximately best-first, not exactly. For
   references with many LRPs and many candidates, the first winning combination may

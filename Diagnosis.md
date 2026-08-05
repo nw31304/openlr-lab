@@ -1,7 +1,7 @@
 # OpenLR Decode Failure Taxonomy
 
 Tags: 🔧 decoder-tunable · 🗺️ map deficiency · 📝 encoding deficiency  
-Annotation: **[auto]** = currently surfaced by the UI failure diagnosis · **[trace]** = visible in the trace panel · **[future]** = requires planned forced-decode mode
+Annotation: **[auto]** = currently surfaced by the UI failure diagnosis · **[trace]** = visible in the trace panel · **[future]** = requires the planned automated root-cause verdict (closed-form/LP tuning check, not yet implemented — forced-decode mode itself is already shipped, see §8)
 
 A decode can fail hard (an error is returned) or fail silently (success returned
 but the wrong path is highlighted). Silent misdecoders are the most important
@@ -90,16 +90,17 @@ no Full trace required), `RouteFailed`.*
 
 Candidates exist at both LRPs but A\* cannot find a connecting path. The
 `AStarTerminated` event is the primary diagnostic; it carries `reason`,
-`nodes_expanded`, and four skip counters even at Summary trace level. **[auto]**
+`nodes_expanded`, and five skip counters even at Summary trace level. **[auto]**
 
 ```
 AStarTerminated {
-  reason:                  OpenSetExhausted | ExpansionLimitHit { limit }
-  nodes_expanded:          u32
-  edges_skipped_frc:       u32   // FRC > LFRCNP ceiling
-  edges_skipped_turn:      u32   // explicit turn restriction
-  edges_skipped_direction: u32   // one-way direction violation
-  edges_skipped_distance:  u32   // path length > dnp.ub × max_path_search_factor
+  reason:                    OpenSetExhausted | ExpansionLimitHit { limit }
+  nodes_expanded:            u32
+  edges_skipped_frc:         u32   // FRC > LFRCNP ceiling
+  edges_skipped_turn:        u32   // explicit turn restriction
+  edges_skipped_direction:   u32   // one-way direction violation
+  edges_skipped_distance:    u32   // path length > dnp.ub × max_path_search_factor
+  edges_skipped_sharp_turn:  u32   // turn angle > max_interior_turn_deviation_deg
 }
 ```
 
@@ -120,6 +121,16 @@ AStarTerminated {
   deficiency (the reference needs an intermediate LRP to route around the
   restriction) 📝
 - Restriction incorrectly modelled in the target map 🗺️ **[auto: reported in bullets]**
+
+### Turn-angle gate blocks all exits
+
+*Signal: `edges_skipped_sharp_turn` > 0, `nodes_expanded` is small.*
+
+- The only physical continuation requires a turn sharper than
+  `max_interior_turn_deviation_deg` (e.g. a dead end forcing a near-U-turn) —
+  raise the cap 🔧 **[auto: suggests raising max_interior_turn_deviation_deg]**
+- The encoded reference genuinely requires a turn no real vehicle could make
+  there — encoding deficiency 📝
 
 ### A\* search budget exhausted
 
@@ -230,10 +241,11 @@ primary reason this tool exists.*
 **Forced-decode mode is implemented**: pin any candidate per LRP (📌 in the
 TracePanel candidate table) and re-run A* against just those pinned
 candidates (`▶ Re-run with pinned candidates`), or drive the equivalent
-`retry_leg` tool from the LLM chat. This lets you test directly whether the
-path you expected is even feasible, and if so, why the decoder didn't pick
-it — but the comparison against the winning path is still manual (read the
-score tables side by side), not an automated verdict.
+`set_pinned_candidates` + `run_forced_decode` tools from the LLM chat. This
+lets you test directly whether the path you expected is even feasible, and
+if so, why the decoder didn't pick it — but the comparison against the
+winning path is still manual (read the score tables side by side), not an
+automated verdict.
 
 The **automated root-cause verdict** described below — mechanically proving
 *decoder-tunable* vs. *encoder-deficient* — is **not implemented**. It would
@@ -250,7 +262,8 @@ The AI Chat button in the ResultPanel (see `WebFrontend.md`) is the closest
 thing to this today: `buildSystemContext`/`buildEncodeDiagnosticPrompt` inject
 the full trace (and, in encode mode, the waypoint/route/verify state) into
 the LLM context so the model can reason about candidate scores, route
-choices, and parameter sensitivities, including calling `retry_leg` itself.
+choices, and parameter sensitivities, including calling
+`set_pinned_candidates`/`run_forced_decode` itself.
 This is a human-in-the-loop tool, not the closed-form proof above.
 
 ### Wrong candidate selected at an LRP

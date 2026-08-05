@@ -286,7 +286,7 @@ You have access to tools for retrieving structured trace data and inspecting the
 6. `get_segment(segment_id)` — full attributes, geometry, and source_key for one segment by internal ID
 7. `get_segments_near(lat, lon, radius_m)` — all loaded segments within radius_m of a coordinate, sorted by distance; useful when investigating why an LRP found no candidates
 8. `get_segment_neighbors(segment_id)` — all segments connected at each endpoint of a segment, with `can_arrive`/`can_depart` flags and turn-restriction flags; useful for understanding junction topology or why A* took or avoided a particular turn
-9. `retry_decode(params_override)` — re-run the decode with modified parameters (e.g. `{"max_bearing_deviation_deg": 30}`) and compare segment count and path length with the original result
+9. `retry_decode(params_override)` — re-run the decode with modified parameters (e.g. `{"max_bearing_deviation_deg": 30}`) and compare segment count and path length with the original result. If widening a positional tolerance (e.g. `candidate_search_radius_m`) needs tiles beyond what the original decode loaded, they're fetched automatically before retrying — you don't need to do anything extra for this.
 
 **Forced-decode tools — use to test a specific candidate combination:**
 10. `set_pinned_candidates(snaps)` — pin one accepted candidate per LRP by specifying `lrp_index`, `segment_id`, and `traversal`; snap geometry is resolved automatically. Clears existing pins first. Must cover every LRP.

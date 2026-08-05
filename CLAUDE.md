@@ -66,6 +66,60 @@ decode and encode: **OpenLR binary v3** (TomTom; 11.25° bearing buckets, ~58.6 
     choosing a segment/direction at a boundary with no subsequent validator, this is almost
     certainly the wrong helper.
 
+11. **Candidate-search tile-prefetch completeness rests on three things staying true.** Unlike
+    A* interior routing (which has a `NeedsTile` retry, Invariant 3's neighbor), candidate search
+    (`select_candidates`) has no fallback: it assumes every tile it could need is already loaded,
+    decided entirely by `prefetch_tile_keys()` *before* any candidate search runs
+    (`openlr-engine/src/lib.rs`'s own `decode()` doc comment: "graph must already contain all
+    tiles needed"). This has been rigorously verified
+    correct for the current architecture (see the tile-boundary correctness analysis in project
+    history), but that verification leans on three specific, independently-breakable facts. Two of
+    the three had live (if currently harmless) gaps, since fixed; the first is still an open,
+    unaddressed constraint — treat a change to any of the three as requiring you to re-derive the
+    argument, not just re-run the tests:
+    - **Still open: tiles must stay geographically much larger than any configurable positional
+      tolerance used in candidate matching.** `TileKey::neighborhood()` (`tile.rs`) is a fixed 3×3
+      *tile* block — its geographic size is `9 × tile_edge_length²`, not a fixed number of meters.
+      At today's default z12 (~10km tiles) this dwarfs even the largest configured search radius
+      (500m, hard-clamped by the `ParamsPanel.jsx` UI slider; 200m in the `Permissive` preset), so
+      an LRP sitting exactly on a tile corner still has its whole search circle covered by its own
+      9-tile neighborhood. **Shrinking `tile_zoom` (smaller tiles) or raising the *ceiling* on any
+      such tolerance erodes this margin** — push either far enough and a corner-sitting LRP's true
+      search circle can reach into a tile that isn't one of its 9 neighbors, silently missing a
+      real candidate. No runtime assertion enforces this margin today. Before changing default tile
+      size or any positional-tolerance ceiling, add one (e.g. `tile_edge_length_m > K ×
+      max_configured_radius_m` for a generous `K`) rather than relying on today's ratio staying
+      accidentally huge.
+    - **Fixed: prefetch and candidate search must use the same positional tolerances.**
+      `prefetch_tile_keys()` sizes its per-leg corridor buffer from `candidate_search_radius_m` *as
+      of the `start()` call*. `Decoder::retry_decode` (`openlr-wasm/src/lib.rs`) lets a caller
+      override `DecodeParams` — including `candidate_search_radius_m` — for a fresh decode against
+      the *already-loaded* graph. `retry_decode` now recomputes `prefetch_tile_keys` for the
+      *merged* params first and returns `{ "needs_tiles": [[z,x,y], ...] }` instead of decoding if
+      any aren't loaded yet; the LLM chat's `retry_decode` tool (`web/src/llm/tools.js`) fetches
+      them via `storeActions.fetchAndLoadDecodeTiles` and retries, capped at 5 rounds. `merge_params`
+      itself still applies the override with zero range validation (only the `ParamsPanel` UI slider
+      clamps to 500m) — that's fine now, since an unbounded override just means more prefetched
+      tiles rather than a silently incomplete search.
+    - **Fixed: decode-time `zoom` must always come from the archive's own manifest, never a
+      hardcoded literal standing in for it.** `web/src/App.jsx` used to silently substitute `12`
+      via `manifest.tile_zoom ?? manifest.zoom ?? 12` if a manifest was ever published missing both
+      fields. It now throws (surfaced through the existing setup-error UI) if neither field is
+      present, rather than guessing — every subsequent `TileKey` computation depends on this
+      matching the zoom the archive was actually built at, with no cross-check otherwise. The
+      native (non-WASM) path never had this exposure — `PmtilesProvider` reads `min_zoom` directly
+      from the PMTiles binary header (`pmtiles.rs`) rather than trusting a side-channel manifest
+      field.
+
+    Don't confuse this with `openlr-graph/src/graph.rs`'s `GRID_SCALE` comment ("fine enough to
+    cover the default 30 m candidate radius in a 3×3 neighbourhood and the 200 m permissive radius
+    in a ~5×5 one") — that's a *different*, much smaller (~222m) in-memory grid used only to
+    accelerate `segments_near()` lookups within an already-loaded `Graph`, unrelated to PMTiles
+    tile fetching. Its own query logic (`segments_near`) scales its search window from `radius_m`
+    dynamically at call time, so it isn't actually at risk the way the PMTiles-tile 3×3 above is —
+    but the comment's wording is easy to mistake for describing the same invariant as this one. It
+    doesn't; don't let a future edit here quietly become "fixing" the wrong 3×3.
+
 ---
 
 ## 3. Architecture
@@ -199,10 +253,12 @@ pub struct Lrp {
     pub coord: (f64, f64),
     pub bearing: CircularInterval,
     pub frc: u8, pub fow: u8,
-    pub lfrcnp: u8,
+    pub lfrcnp: Option<u8>,                   // None on last LRP
     pub dnp: Option<LinearInterval>,          // None on last LRP
     pub pos_offset: Option<LinearInterval>,
     pub neg_offset: Option<LinearInterval>,
+    pub pos_offset_raw: Option<u8>,           // raw v3 byte; derived to pos_offset once path length is known
+    pub neg_offset_raw: Option<u8>,
 }
 ```
 
@@ -213,6 +269,9 @@ base64 and TPEG-OLR hex for the encoder (§11) — no separate encode-side codec
 ---
 
 ## 8. Decode engine
+
+See `OpenLREngine.md` for the full `crates/openlr-engine` design reference (file-by-file map,
+algorithm rationale, bug-history notes) — this section is the summary.
 
 - **Candidate selection:** project LRP coordinate onto each nearby segment polyline (nearest
   point + arc-length); compute local bearing over 20 m from that position. LRP may match anywhere
@@ -238,28 +297,37 @@ base64 and TPEG-OLR hex for the encoder (§11) — no separate encode-side codec
 
 ## 9. Decode parameters
 
-Exposed to UI; permissive defaults, tuned interactively:
-- `candidate_search_radius_m` — positional tolerance
-- `bearing_tolerance_deg` (τ) — map-divergence term; widens the encoding interval
-- `dnp_tolerance_pct` (δ) — percentage tolerance on DNP; combined with absolute v3 bucket
-- `frc_weight_penalty`, `fow_weight_penalty` — soft ranking weights
-- `max_path_search_factor` — A* expansion cap
-- `lfrcnp_tolerance` — additional LFRCNP slack
+Exposed to UI; permissive defaults, tuned interactively. `DecodeParams`
+(`crates/openlr-engine/src/params.rs`) is the source of truth for the full field list — don't
+re-enumerate it here, it has ~17 fields and has already drifted out of sync with a hand-copied
+list once. The struct's own doc comments group them; the load-bearing distinction to remember is:
+- **Hard gates** (reject, don't penalize): `candidate_search_radius_m`, `max_bearing_deviation_deg`,
+  `max_interior_turn_deviation_deg`, `lfrcnp_tolerance`, DNP's own interval check.
+- **Soft ranking weights + penalty tables**: `distance_weight`, `bearing_weight`,
+  `bearing_penalty_per_bucket`, `frc_weight` (+ `frc_penalty_table`), `fow_weight`
+  (+ `fow_penalty_table`), `interior_weight`, `wrong_endpoint_weight`.
+- **Search bounds**: `max_path_search_factor`, `max_astar_expansions`, `max_routing_attempts`,
+  `max_candidates_per_lrp`, `max_candidate_score`.
 
-Hard tolerances and soft penalties must stay distinct types. A decode is
+Hard tolerances and soft penalties must stay distinct types (Invariant 7). A decode is
 `(string + tolerance profile) → path`; emit both with every result for reproducibility.
 
 ---
 
 ## 10. Diagnostics (the differentiator)
 
+See `Diagnosis.md` for the full decode-failure taxonomy (every hard-error and silent-misdecode
+class, trace event fields, and which are auto-diagnosed today vs. still manual) — this section is
+the summary.
+
 1. **Stepped debugger:** candidate radius per LRP; pass/fail colours with specific reason;
    A* frontier animation; badge where path breaks.
 2. **Interval visualization:** bearing wedge (wide v3 / narrow TPEG), DNP band, τ/δ halos.
 3. **Desired-vs-actual explanation:**
    - Forced-decode mode is **implemented**: pin a candidate per LRP in the TracePanel (or via the
-     LLM chat's `retry_leg` tool) and re-run A* against just those pins, to test directly whether
-     a desired path is feasible and see its score table next to the winning path's.
+     LLM chat's `set_pinned_candidates` + `run_forced_decode` tools) and re-run A* against just
+     those pins, to test directly whether a desired path is feasible and see its score table next
+     to the winning path's.
    - The rest of this item is **not implemented** — still the target design, not current
      behavior:
      - Automatically diff against the chosen path at its divergence node.
@@ -295,9 +363,11 @@ portable Rust — see §14 note below).
   intermediate LRPs along the already-verified path (preferring a valid node, then any node,
   then a mid-segment point) without re-running A*, since placing a marker along a path whose
   shortest-path correctness `coverage.rs` already established is not a new routing decision.
-  `EncodeError::LegTooLong` now only surfaces for a degenerate `max_leg_m` itself, not a real
-  route. Out of scope for now: PointAlongLine (below) can't use this — OpenLR's PAL wire format
-  is hard-fixed at exactly 2 LRPs, so a PAL point on a single segment over 15km still errors.
+  For **Line**, `EncodeError::LegTooLong` now only surfaces for a degenerate `max_leg_m` config,
+  not a real route. **PointAlongLine is the one exception** (see its own bullet below): it still
+  raises `LegTooLong` for a genuine over-length segment, since OpenLR's PAL wire format is
+  hard-fixed at exactly 2 LRPs — a PAL point on a single segment over 15km can't be represented
+  at all, so there's no "next leg" for Rule-1/Rule-5 to fall back into.
   Rule-5 (an offset must be strictly less than its own bracketing leg) is also handled with the
   spec's full cascade, not an error: `pos_offset_m`/`neg_offset_m` include the entire Rule-4
   expansion distance, but `coverage.rs`'s own divergence protection can split a leg short partway

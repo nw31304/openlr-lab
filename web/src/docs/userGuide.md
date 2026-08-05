@@ -534,7 +534,7 @@ Every pin dropped by the coordinate tools (capture or zoom-to) shows its own pop
 and **Dismiss all** buttons, and stays on the map until dismissed.
 
 A **basemap selector** (also bottom-right) switches between several free vector/raster styles
-(Liberty, Bright, Positron, OSM, Carto Light/Dark, Satellite, Maptoolkit, and more) — purely cosmetic, entirely
+(Liberty, Bright, Positron, OSM, Carto Light/Dark, Satellite, Maptoolkit) — purely cosmetic, entirely
 independent of whichever OpenLR tile source is configured for decoding/encoding (see
 [Bringing Your Own Map](#bringing-your-own-map)).
 
