@@ -1,8 +1,0 @@
-[package]
-name    = "openlr-graph"
-edition.workspace = true
-version.workspace = true
-
-[dependencies]
-serde.workspace     = true
-thiserror.workspace = true

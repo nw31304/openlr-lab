@@ -1,6 +1,6 @@
 # OpenLRLab
 
-A browser-based diagnostic decoder **and encoder** for [OpenLR](https://www.openlr-association.com/) location references. The Rust core compiles to WebAssembly and runs the full codec, graph, A\* path search, and encoder entirely client-side. A MapLibre GL JS front end renders the decoded/encoded path and step-by-step diagnostics.
+A browser-based diagnostic decoder **and encoder** for [OpenLR](https://www.openlr-association.com/) location references. The decode/encode engine (codec, graph, A\* path search, encoder) lives in a separate repo, [openlr-core](https://github.com/nw31304/openlr-core), compiled to WebAssembly here via a thin `openlr-wasm` binding crate. A MapLibre GL JS front end renders the decoded/encoded path and step-by-step diagnostics.
 
 Two formats are supported, both for decode and encode:
 
@@ -19,40 +19,44 @@ BUILD TIME  (a few times per year, separate repo: openlr-pmtiles)
   Road network source data ──▶ openlr-pmtiles-build ──▶ PMTiles archive ──▶ R2 / CDN
 
 RUNTIME  (browser, no server)
-  PMTiles (range reads) ──▶ TileLoader ──▶ OpenLRDataProvider ──▶ in-memory graph
-                                                    │
-  decode:  OpenLR string ──▶ codec (v3 / TPEG) ──▶ unified LRP model
-                                                    │
-                             engine: candidate selection + A* + validation
-                                                    │
-  encode:  waypoints (map clicks) ──▶ snap + route ──▶ encoder (Rule-1/Rule-4)
+  PMTiles (range reads) ──▶ TileLoader ──▶ OpenLRDataProvider ──▶ in-memory graph   ┐
+                                                    │                                │ openlr-core
+  decode:  OpenLR string ──▶ codec (v3 / TPEG) ──▶ unified LRP model                │ (separate repo,
+                                                    │                                │  external dep)
+                             engine: candidate selection + A* + validation          │
+                                                    │                                │
+  encode:  waypoints (map clicks) ──▶ snap + route ──▶ encoder (Rule-1/Rule-4)      ┘
                                                     │
                              codec (v3 / TPEG) ──▶ round-trip verify (decode)
                                                     │
-                                         diagnostics + MapLibre UI
+                                openlr-wasm (this repo) + diagnostics + MapLibre UI
 ```
 
 All map I/O stays in JavaScript. WASM receives pre-fetched tile bytes and operates synchronously over an in-memory cache, avoiding async-trait across the FFI boundary.
 
-### Rust crates
+### Crates
 
-| Crate | Role |
-|---|---|
-| `openlr-codec` | v3 / TPEG-OLR binary parsing and serialization ↔ unified `Lrp` model |
-| `openlr-graph` | Tile format, segment/node tables, geometry pool |
-| `openlr-engine` | Decode: candidate selection, A\* (`state = (node, incoming_segment)`), scoring, diagnostics |
-| `openlr-encoder` | Encode: Rule-1/Rule-4 Line and PointAlongLine encoding, boundary expansion, coverage sweep |
-| `openlr-provider` | `OpenLRDataProvider` trait + `PmtilesProvider` implementation |
-| `openlr-wasm` | `wasm-bindgen` glue exposing `Decoder` (decode) and `Encoder` (waypoint snapping, route preview, encode) to JS |
+| Crate | Repo | Role |
+|---|---|---|
+| `openlr-codec` | [openlr-core](https://github.com/nw31304/openlr-core) | v3 / TPEG-OLR binary parsing and serialization ↔ unified `Lrp` model |
+| `openlr-graph` | openlr-core | Tile format, segment/node tables, geometry pool |
+| `openlr-engine` | openlr-core | Decode: candidate selection, A\* (`state = (node, incoming_segment)`), scoring, diagnostics |
+| `openlr-encoder` | openlr-core | Encode: Rule-1/Rule-4 Line and PointAlongLine encoding, boundary expansion, coverage sweep, waypoint snapping |
+| `openlr-provider` | openlr-core | `OpenLRDataProvider` trait + `PmtilesProvider` implementation |
+| `openlr-cli` | openlr-core | Native batch-decode binary against a local `.pmtiles` archive |
+| `openlr-wasm` | this repo | Thin `wasm-bindgen` adapter exposing `Decoder`/`Encoder` to JS — JSON shaping and the tile-injection protocol only, no algorithmic logic |
+
+`openlr-wasm/Cargo.toml` depends on `openlr-core`'s crates via `git` references, overridden by a
+`[patch]` section in this repo's root `Cargo.toml` to a local sibling checkout — clone
+`openlr-core` alongside this repo (`../openlr-core` relative to here) before building. See
+`CLAUDE.md` §1 for why this arrangement (rather than a bare path dependency) was chosen.
 
 The PMTiles builder (`openlr-pmtiles-build`, ingesting Overture, OSM, generic
 GeoJSONL, or a canonical DuckDB source) lives in a separate repo,
-[openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles) — this repo is a
-consumer of the archives it produces, not the producer. Only the tile
-**format** (magic, header layout, segment/node/restriction records — see
-`CLAUDE.md §4–5`) is a contract shared between the two repos; a format change
-must land in openlr-pmtiles first, then propagate here to `openlr-provider`'s
-decoder.
+[openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles) — `openlr-core` (not this repo) is the
+consumer of the archives it produces. Only the tile **format** (magic, header layout,
+segment/node/restriction records) is a contract shared between those two repos; a format change
+must land in openlr-pmtiles first, then propagate to `openlr-core`'s `openlr-provider` decoder.
 
 ### Web frontend
 
@@ -72,6 +76,8 @@ The UI is a stepped debugger, not just a result renderer:
 
 - Rust toolchain + `wasm-pack`
 - Node.js ≥ 18
+- [openlr-core](https://github.com/nw31304/openlr-core) cloned as a sibling directory of this repo
+  (`../openlr-core`) — the actual decode/encode engine `openlr-wasm` depends on. See `CLAUDE.md` §1.
 
 ## Build
 
@@ -142,7 +148,7 @@ This builds the WASM module fresh (it's gitignored, never committed), runs `vite
 
 ## Tile format
 
-Custom binary payload (magic `OLRL`, version 3). All integers little-endian, single zoom level (default z12). Segments are post-split at every interior junction — junctions are never elided. Each segment and node carries a provider-defined opaque stable ID (UTF-8 string, stored in a per-tile string pool). See `CLAUDE.md §4–5` for the full layout.
+Custom binary payload (magic `OLRL`, version 3). All integers little-endian, single zoom level (default z12). Segments are post-split at every interior junction — junctions are never elided. Each segment and node carries a provider-defined opaque stable ID (UTF-8 string, stored in a per-tile string pool). The full byte-level layout is owned by [openlr-core](https://github.com/nw31304/openlr-core) now — see that repo's `CLAUDE.md §4–5`.
 
 ## License
 

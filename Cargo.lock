@@ -97,9 +97,7 @@ name = "openlr-encoder"
 version = "0.1.0"
 dependencies = [
  "openlr-codec",
- "openlr-engine",
  "openlr-graph",
- "openlr-provider",
  "serde",
  "thiserror",
 ]
@@ -108,10 +106,8 @@ dependencies = [
 name = "openlr-engine"
 version = "0.1.0"
 dependencies = [
- "flate2",
  "openlr-codec",
  "openlr-graph",
- "openlr-provider",
  "serde",
  "serde_json",
  "thiserror",
@@ -130,8 +126,6 @@ name = "openlr-provider"
 version = "0.1.0"
 dependencies = [
  "flate2",
- "openlr-codec",
- "openlr-engine",
  "openlr-graph",
  "serde",
  "thiserror",

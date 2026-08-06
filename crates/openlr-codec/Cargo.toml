@@ -1,9 +1,0 @@
-[package]
-name    = "openlr-codec"
-edition.workspace = true
-version.workspace = true
-
-[dependencies]
-serde.workspace     = true
-thiserror.workspace = true
-base64.workspace    = true
