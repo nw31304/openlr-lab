@@ -78,37 +78,48 @@ pub fn default_fow_table() -> [[f64; 8]; 8] {
 pub struct DecodeParams {
     // ── Spatial ──────────────────────────────────────────────────────────────
     /// Maximum distance from an LRP to a candidate segment, meters (hard gate).
+    #[serde(default = "default_candidate_search_radius_m")]
     pub candidate_search_radius_m: f64,
 
     // ── Endpoint snapping ─────────────────────────────────────────────────────
     /// If the projection arc-offset is within this many meters of a segment
     /// endpoint, snap the LRP to that endpoint.
+    #[serde(default = "default_snap_to_endpoint_threshold_m")]
     pub snap_to_endpoint_threshold_m: f64,
 
     // ── Scoring weights ───────────────────────────────────────────────────────
     /// Weight for the distance component: `distance_m / search_radius_m`.
+    #[serde(default = "default_distance_weight")]
     pub distance_weight: f64,
     /// Weight for the bearing component.
+    #[serde(default = "default_bearing_weight")]
     pub bearing_weight: f64,
     /// Penalty added to the bearing score per bucket of circular deviation.
     /// Bucket size is taken from the LRP's own bearing interval (`ub − lb`).
     /// Calibrated for v3 (32 sectors of 11.25°); scale down for TPEG (256 sectors).
+    #[serde(default = "default_bearing_penalty_per_bucket")]
     pub bearing_penalty_per_bucket: f64,
     /// Weight for the FRC-table component.
+    #[serde(default = "default_frc_weight")]
     pub frc_weight: f64,
     /// Weight for the FOW-table component.
+    #[serde(default = "default_fow_weight")]
     pub fow_weight: f64,
     /// Weight for the interior-snap penalty (1.0 when LRP is not at an endpoint).
+    #[serde(default = "default_interior_weight")]
     pub interior_weight: f64,
     /// Weight for the wrong-endpoint penalty.
     /// Scales continuously from 0.0 (correct end) to 1.0 (wrong end).
     /// For non-last LRPs the "wrong" end is the exit; for the last LRP it is the entry.
+    #[serde(default = "default_wrong_endpoint_weight")]
     pub wrong_endpoint_weight: f64,
 
     // ── Penalty tables ────────────────────────────────────────────────────────
     /// 8×8 FRC mismatch table.  `frc_penalty_table[lrp_frc][cand_frc]` ∈ [0, 1].
+    #[serde(default = "default_frc_table")]
     pub frc_penalty_table: [[f64; 8]; 8],
     /// 8×8 FOW mismatch table.  `fow_penalty_table[lrp_fow][cand_fow]` ∈ [0, 1].
+    #[serde(default = "default_fow_table")]
     pub fow_penalty_table: [[f64; 8]; 8],
 
     // ── Hard gates ────────────────────────────────────────────────────────────
@@ -124,19 +135,24 @@ pub struct DecodeParams {
 
     // ── Candidate set ─────────────────────────────────────────────────────────
     /// Number of top candidates to retain per LRP after scoring (best-first).
+    #[serde(default = "default_max_candidates_per_lrp")]
     pub max_candidates_per_lrp: usize,
 
     // ── DNP ───────────────────────────────────────────────────────────────────
     /// DNP tolerance δ as a fraction of expected path length (e.g. 0.25 = 25%).
+    #[serde(default = "default_dnp_tolerance_pct")]
     pub dnp_tolerance_pct: f64,
 
     // ── A* ────────────────────────────────────────────────────────────────────
     /// A* expansion cap as a ratio of the expected DNP.
+    #[serde(default = "default_max_path_search_factor")]
     pub max_path_search_factor: f64,
     /// Hard cap on A* node expansions per leg (0 = unlimited).
+    #[serde(default = "default_max_astar_expansions")]
     pub max_astar_expansions: usize,
     /// Extra FRC steps added to the encoded LFRCNP floor before passing to A*.
     /// Compensates for FRC mapping differences between encoder and decoder maps.
+    #[serde(default = "default_lfrcnp_tolerance")]
     pub lfrcnp_tolerance: u8,
     /// Turn-angle gate: an interior A* edge is rejected if the geometric turn at
     /// its node deviates from straight-ahead by more than this many degrees
@@ -167,11 +183,34 @@ pub struct DecodeParams {
     pub max_leg_m: f64,
 
     // ── Trace ─────────────────────────────────────────────────────────────────
+    #[serde(default)]
     pub trace_level: TraceLevel,
 }
 
+// Every field has an explicit serde default matching `DecodeParams::default()`'s
+// own value for that field -- not just the handful that used to have one.
+// Without this, deserializing a genuinely sparse JSON/TOML object (one that
+// only sets the fields it cares about) fails outright the moment it omits any
+// non-defaulted field -- caught by openlr-core's openlr-cli, whose whole
+// --params-file design depends on a profile only needing to list the fields
+// it wants to change. Backported here since this file is still the live copy
+// until openlr-wasm depends on openlr-core instead.
+fn default_candidate_search_radius_m()        -> f64 { 30.0 }
+fn default_snap_to_endpoint_threshold_m()      -> f64 { 15.0 }
+fn default_distance_weight()                   -> f64 { 0.5 }
+fn default_bearing_weight()                    -> f64 { 0.3 }
+fn default_bearing_penalty_per_bucket()        -> f64 { 0.05 }
+fn default_frc_weight()                        -> f64 { 0.10 }
+fn default_fow_weight()                        -> f64 { 0.20 }
+fn default_interior_weight()                   -> f64 { 0.10 }
+fn default_wrong_endpoint_weight()             -> f64 { 0.20 }
 fn default_max_bearing_deviation_deg()        -> f64 { 45.0 }
 fn default_max_candidate_score()              -> f64 { 1.5 }
+fn default_max_candidates_per_lrp()            -> usize { 8 }
+fn default_dnp_tolerance_pct()                 -> f64 { 0.25 }
+fn default_max_path_search_factor()            -> f64 { 5.0 }
+fn default_max_astar_expansions()              -> usize { 100_000 }
+fn default_lfrcnp_tolerance()                  -> u8 { 2 }
 fn default_max_routing_attempts()             -> usize { 10 }
 fn default_max_interior_turn_deviation_deg()  -> f64 { 150.0 }
 fn default_max_leg_m()                        -> f64 { 15_000.0 }

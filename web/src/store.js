@@ -166,7 +166,10 @@ export function getNodeId(z, x, y, localIndex) {
 // literal left in JS -- Permissive/Strict, and the FRC/FOW penalty tables
 // every preset carries, used to come from separate hardcoded copies here too,
 // with nothing enforcing they matched Rust's own Preset::preset() values.
-// They happened to still agree, but that was luck, not a guarantee.
+// They happened to still agree, but that was luck, not a guarantee -- this
+// bootstrap literal's own wrong_endpoint_weight was 5.00 until caught while
+// building the openlr-core CLI, which actually was still 0.20 in Rust; harmless
+// here only because this object is overwritten before the UI ever renders.
 const BOOTSTRAP_DEFAULT_PARAMS = {
   candidate_search_radius_m:     30.0,
   snap_to_endpoint_threshold_m:  15.0,
@@ -176,7 +179,7 @@ const BOOTSTRAP_DEFAULT_PARAMS = {
   frc_weight:                     0.10,
   fow_weight:                     0.20,
   interior_weight:                0.10,
-  wrong_endpoint_weight:          5.00,
+  wrong_endpoint_weight:          0.20,
   frc_penalty_table: [
     [0.00, 0.10, 0.25, 0.45, 0.65, 0.80, 0.90, 1.00],
     [0.10, 0.00, 0.10, 0.25, 0.45, 0.65, 0.80, 0.90],
