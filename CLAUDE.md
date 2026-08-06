@@ -387,10 +387,13 @@ portable Rust — see §14 note below).
   side-of-road. No coverage-sweep step — the segment itself *is* the path, verbatim. This is
   exactly why Invariant 10 matters most here: there is nothing downstream to catch a
   wrong-direction anchor the way Line's coverage sweep or interior A* would.
-- **Waypoint snapping** (`crates/openlr-wasm/src/lib.rs`: `snap_point`, `route_waypoints`,
+- **Waypoint snapping** (`crates/openlr-encoder/src/waypoint.rs`: `snap_point`, `route_waypoints`,
   `boundary_candidates`): turns a raw map click into a graph anchor (node or mid-segment point)
   and chains legs between waypoints via the same A* the decoder's interior routing uses. This is
-  real encoding logic, not UI glue — see §14 for why its current location matters.
+  real encoding logic — it originated inside `openlr-wasm` (where it was wasm-bindgen glue that
+  happened to also be the only implementation) and was moved here specifically so a native caller
+  doesn't have to duplicate it; see §14. `openlr-wasm`'s `Encoder` impl is now a thin adapter
+  translating between this module's plain-Rust types and the JSON the JS side expects.
 - **Round-trip verification**: every encode in the UI immediately decodes its own output (both
   v3 and TPEG) through the ordinary decoder — this *is* a real decode, so it drives the same
   Segments/Trace/Replay panels the decode side already has, unmodified.
@@ -411,17 +414,19 @@ share-alike obligations. Document exact attribution text before public release.
 
 ---
 
-## 14. Native (non-wasm) use — planned, not yet built
+## 14. Native (non-wasm) use — unblocked, no CLI binary written yet
 
 `openlr-codec`/`openlr-graph`/`openlr-engine`/`openlr-encoder`/`openlr-provider` have no
-`wasm-bindgen`/`wasm32` dependency today — they're already plain, portable Rust. `openlr-provider`
-already has a native `PmtilesReader` (`pmtiles.rs`, `std::fs::File`-based, no HTTP) alongside the
-byte-injection path the web app uses. A native CLI/HTTP binary crate (batch decode/encode against
-a local `.pmtiles` archive) is therefore mostly plumbing — **except** the waypoint-snapping/
-routing logic in `crates/openlr-wasm/src/lib.rs` (`snap_point`, `route_waypoints`,
-`boundary_candidates` — see §11), which is real encoding logic that currently exists only in the
-wasm-bindgen crate. That has to move into `openlr-encoder` (plain Rust types, no `JsValue`) before
-a native binary can reuse it instead of duplicating it. Not done as of this writing.
+`wasm-bindgen`/`wasm32` dependency — they're plain, portable Rust. `openlr-provider` already has a
+native `PmtilesReader` (`pmtiles.rs`, `std::fs::File`-based, no HTTP) alongside the byte-injection
+path the web app uses. The waypoint-snapping/routing logic (`snap_point`, `route_waypoints`,
+`boundary_candidates` — see §11) used to be the one exception, living only in `openlr-wasm` as
+wasm-bindgen glue that happened to also be the sole implementation; it now lives in
+`openlr-encoder/src/waypoint.rs` as plain Rust with its own unit tests, so it's no longer a
+blocker. A native CLI/HTTP binary crate (batch decode/encode against a local `.pmtiles` archive,
+or a remote one — see the discussion of the `pmtiles` crate's HTTP-range backend as an alternative
+to `PmtilesReader` for that case) is therefore genuinely just plumbing now: argument parsing,
+wiring `DecodeParams`/profile resolution, and a batch loop. Not written yet.
 
 ---
 
