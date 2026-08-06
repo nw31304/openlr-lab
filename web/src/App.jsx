@@ -68,7 +68,7 @@ export default function App() {
         setUrlDraft(base);
         const manifest = await fetch(`${base}/manifest.json`).then(r => r.json());
         const pmtiles  = new PMTiles(`${base}/${manifest.archive}`);
-        const [{ decoder, encoder }, header] = await Promise.all([
+        const [{ decoder, encoder, presetsJson }, header] = await Promise.all([
           initWasm(),
           pmtiles.getHeader().catch(() => null),
         ]);
@@ -90,6 +90,7 @@ export default function App() {
         setDecoder(decoder);
         setEncoder(encoder);
         setZoom(tileZoom);
+        useStore.getState().loadPresetsFromEngine(presetsJson);
         const { minLon, minLat, maxLon, maxLat } = header ?? {};
         const boundsValid = [minLon, minLat, maxLon, maxLat].every(Number.isFinite)
           && maxLon > minLon && maxLat > minLat;

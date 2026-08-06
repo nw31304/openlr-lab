@@ -8,7 +8,7 @@ pub mod trace;
 pub mod validation;
 pub mod wkt;
 
-pub use params::{DecodeParams, Preset};
+pub use params::{merge_params, DecodeParams, Preset};
 pub use route_generator::RouteGenerator;
 pub use tile_prefetch::prefetch_tile_keys;
 pub use trace::{DecodeEvent, DecodeOutcome, DecodeTrace, TraceLevel};

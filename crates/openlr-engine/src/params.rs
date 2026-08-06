@@ -154,6 +154,18 @@ pub struct DecodeParams {
     #[serde(default = "default_max_routing_attempts")]
     pub max_routing_attempts: usize,
 
+    // ── Encoder-only ──────────────────────────────────────────────────────────
+    /// Rule-1 cap on the distance between consecutive LRPs, meters. Not part
+    /// of the OpenLR wire format itself — purely a policy knob controlling
+    /// how the encoder splits a location into legs (see
+    /// `openlr_encoder::line::encode_line`'s doc comment). Nothing on the
+    /// decode side reads this field; it lives on `DecodeParams` anyway so a
+    /// single profile/params file can drive both directions (a decode-only
+    /// caller can simply ignore it). Clamped to the architecture's own 15km
+    /// ceiling by the encoder itself, not enforced here.
+    #[serde(default = "default_max_leg_m")]
+    pub max_leg_m: f64,
+
     // ── Trace ─────────────────────────────────────────────────────────────────
     pub trace_level: TraceLevel,
 }
@@ -162,6 +174,7 @@ fn default_max_bearing_deviation_deg()        -> f64 { 45.0 }
 fn default_max_candidate_score()              -> f64 { 1.5 }
 fn default_max_routing_attempts()             -> usize { 10 }
 fn default_max_interior_turn_deviation_deg()  -> f64 { 150.0 }
+fn default_max_leg_m()                        -> f64 { 15_000.0 }
 
 impl DecodeParams {
     pub fn preset(p: Preset) -> Self {
@@ -187,6 +200,7 @@ impl DecodeParams {
                 lfrcnp_tolerance:                  2,
                 max_interior_turn_deviation_deg: 180.0,
                 max_routing_attempts:              0,
+                max_leg_m:                   15_000.0,
                 trace_level: TraceLevel::Summary,
             },
             Preset::Default => Self::default(),
@@ -211,6 +225,7 @@ impl DecodeParams {
                 lfrcnp_tolerance:                  0,
                 max_interior_turn_deviation_deg: 120.0,
                 max_routing_attempts:              5,
+                max_leg_m:                   15_000.0,
                 trace_level: TraceLevel::Summary,
             },
         }
@@ -240,7 +255,56 @@ impl Default for DecodeParams {
             lfrcnp_tolerance:                  2,
             max_interior_turn_deviation_deg: 150.0,
             max_routing_attempts:             10,
+            max_leg_m:                   15_000.0,
             trace_level: TraceLevel::Summary,
         }
+    }
+}
+
+/// Apply a partial JSON override onto a base `DecodeParams` — only the
+/// fields present in `override_json` change, everything else keeps `base`'s
+/// value. Used both for the web UI's `retry_decode` (re-run with a couple of
+/// tweaked fields, not a whole new profile) and a CLI's `--set field=value`
+/// overrides on top of a `--profile`/`--params-file` base. Moved here from
+/// `openlr-wasm` (where it originated as wasm-bindgen glue that happened to
+/// also be the only implementation) so a native caller shares the identical
+/// merge semantics instead of duplicating this or going through JSON/wasm.
+pub fn merge_params(base: &DecodeParams, override_json: &str) -> Result<DecodeParams, serde_json::Error> {
+    let mut base_val = serde_json::to_value(base)?;
+    let overlay: serde_json::Value = serde_json::from_str(override_json)?;
+    if let (Some(base_obj), Some(overlay_obj)) = (base_val.as_object_mut(), overlay.as_object()) {
+        for (k, v) in overlay_obj {
+            base_obj.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::from_value(base_val)
+}
+
+#[cfg(test)]
+mod merge_params_tests {
+    use super::*;
+
+    #[test]
+    fn overrides_only_the_named_fields() {
+        let base = DecodeParams::default();
+        let merged = merge_params(&base, r#"{"candidate_search_radius_m": 75.0}"#).unwrap();
+        assert_eq!(merged.candidate_search_radius_m, 75.0);
+        // Everything else carries over from base unchanged.
+        assert_eq!(merged.lfrcnp_tolerance, base.lfrcnp_tolerance);
+        assert_eq!(merged.max_candidates_per_lrp, base.max_candidates_per_lrp);
+    }
+
+    #[test]
+    fn empty_override_reproduces_base_exactly() {
+        let base = DecodeParams::preset(Preset::Strict);
+        let merged = merge_params(&base, "{}").unwrap();
+        assert_eq!(merged.candidate_search_radius_m, base.candidate_search_radius_m);
+        assert_eq!(merged.max_astar_expansions, base.max_astar_expansions);
+    }
+
+    #[test]
+    fn malformed_override_json_errors() {
+        let base = DecodeParams::default();
+        assert!(merge_params(&base, "not json").is_err());
     }
 }

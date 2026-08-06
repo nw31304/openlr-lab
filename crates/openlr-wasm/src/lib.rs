@@ -26,7 +26,6 @@
 //! }
 //! ```
 
-use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -40,15 +39,19 @@ extern "C" {
 use openlr_codec::{decode_v3_base64, decode_tpeg_hex, decode_tpeg_base64};
 use openlr_codec::lrp::{LocationReference, Orientation, SideOfRoad};
 use openlr_engine::DecodeResult as EngineDecodeResult;
-use openlr_engine::{decode as engine_decode, decode_forced as engine_decode_forced, DecodeError, DecodeParams, Preset, prefetch_tile_keys, path_to_wkt, path_band_wkt, coverage_range};
+use openlr_engine::{decode as engine_decode, decode_forced as engine_decode_forced, merge_params, DecodeError, DecodeParams, Preset, prefetch_tile_keys, path_to_wkt, path_band_wkt, coverage_range};
 use openlr_engine::{ScoredCandidate, ProjectionResult, CandidateScore};
 use openlr_graph::{SegmentId, NodeId};
 use openlr_graph::{polyline_length_m, haversine_m, Direction};
-use openlr_graph::{Graph, TileKey, PathOutcome, PathResult, shortest_path, project_onto_polyline, NO_PRIOR_SEG};
+use openlr_graph::{TileKey, NO_PRIOR_SEG};
 use openlr_engine::trace::TraversalDir;
 use openlr_provider::TileLoader;
 use openlr_encoder::line::{encode_line as enc_line, LineLocationInput};
 use openlr_encoder::pal::{encode_pal as enc_pal, PalLocationInput};
+use openlr_encoder::waypoint::{
+    nearby_anchors, route_waypoints, snap_point, RouteFailure, RouteOutcome, SnapHint, Waypoint,
+    WAYPOINT_SNAP_RADIUS_M,
+};
 use serde::Serialize;
 
 // ── Module init ───────────────────────────────────────────────────────────────
@@ -56,6 +59,22 @@ use serde::Serialize;
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
+}
+
+/// The built-in named parameter presets, serialized straight from
+/// `DecodeParams::preset()` — the single source of truth for Permissive/
+/// Default/Strict. Called once at app startup so the JS-side `PRESETS`
+/// object is *derived* from this, rather than a hand-copied duplicate that
+/// can silently drift from it (as it did until this was added — the two
+/// happened to still agree, but nothing enforced it).
+/// Returns `{"Permissive": {...}, "Default": {...}, "Strict": {...}}`.
+#[wasm_bindgen]
+pub fn list_presets_json() -> String {
+    serde_json::json!({
+        "Permissive": DecodeParams::preset(Preset::Permissive),
+        "Default":    DecodeParams::preset(Preset::Default),
+        "Strict":     DecodeParams::preset(Preset::Strict),
+    }).to_string()
 }
 
 // ── JS-visible result types ───────────────────────────────────────────────────
@@ -1224,48 +1243,6 @@ impl Decoder {
 // // result: { v3, tpeg } or { needs_tile: [z,x,y] } or { error }
 // ```
 
-const WAYPOINT_SNAP_RADIUS_M: f64 = 50.0;
-
-#[derive(serde::Deserialize)]
-struct WaypointIn {
-    lon: f64,
-    lat: f64,
-    /// Explicit disambiguation choice from `candidates_near_point` — when the
-    /// click was near multiple plausible roads, snap onto exactly this
-    /// segment instead of silently picking the nearest one. Ignored if
-    /// `node_id` is also set (node wins — see `SnapHint`).
-    #[serde(default)]
-    segment_id: Option<u32>,
-    /// Explicit disambiguation choice: snap directly to this intersection
-    /// node instead of to a point along some road, regardless of which
-    /// segment is geometrically nearest.
-    #[serde(default)]
-    node_id: Option<u32>,
-}
-
-/// The three ways a waypoint can resolve to a place on the graph.
-enum SnapHint {
-    /// Snap directly to this node (an explicit "this intersection" choice) —
-    /// offset is always zero, since the user picked the junction itself, not
-    /// a position along a particular road.
-    Node(NodeId),
-    /// Snap onto this specific segment (an explicit "this road" choice),
-    /// still choosing whichever endpoint is nearer and computing a real
-    /// offset — same as the default, just without the nearest-segment search.
-    Segment(SegmentId),
-    /// No explicit choice — pick whichever nearby segment is geometrically
-    /// nearest (today's default, unambiguous-click behavior).
-    Nearest,
-}
-
-impl WaypointIn {
-    fn snap_hint(&self) -> SnapHint {
-        if let Some(id) = self.node_id { SnapHint::Node(NodeId(id)) }
-        else if let Some(id) = self.segment_id { SnapHint::Segment(SegmentId(id)) }
-        else { SnapHint::Nearest }
-    }
-}
-
 #[derive(Serialize)]
 struct TilesResult {
     tiles: Vec<[u32; 3]>,
@@ -1391,408 +1368,6 @@ struct CandidatesResult {
     candidates: Vec<SnapCandidate>,
 }
 
-/// A waypoint snapped onto a road segment.
-struct SnappedWaypoint {
-    seg_id: SegmentId,
-    /// Whichever endpoint of `seg_id` is nearer (in arc-length) to the click.
-    node: NodeId,
-    /// Distance from `node` to the true click point, along the segment.
-    offset_m: f64,
-}
-
-/// A candidate anchor for the *first or last* waypoint of a route — the two
-/// boundary LRPs, which alone carry a POFF/NOFF offset in the Line format.
-///
-/// Unlike an interior waypoint (nearest-endpoint snapping is fine, since no
-/// offset is ever recorded for it), a boundary offset is only reconstructible
-/// by the decoder if it's a *forward* distance from a node the recorded path
-/// genuinely starts (or ends) at, through to the click. When the click lands
-/// mid-segment, that forward-reachable node is not necessarily the nearer
-/// endpoint — it depends on which endpoint the rest of the route actually
-/// continues from, which isn't decidable from proximity alone (see
-/// `resolve_boundary_leg`, which tries both and picks whichever connects).
-struct BoundaryCandidate {
-    seg_id: SegmentId,
-    /// Node the offset is measured from — becomes the location's start/end
-    /// anchor node if this candidate wins.
-    anchor: NodeId,
-    /// The opposite endpoint: where the rest of the route actually connects.
-    /// Equal to `anchor` (offset always 0) when the click snapped exactly
-    /// onto a node, or resolved to an existing node via `SnapHint::Node`.
-    continuation: NodeId,
-    /// Forward distance from `anchor`, through `seg_id`, to the click.
-    offset_m: f64,
-}
-
-impl BoundaryCandidate {
-    /// The segment to bias the onward search against re-entering — `seg_id`
-    /// when this candidate actually walks through it to reach `continuation`,
-    /// or `NO_PRIOR_SEG` when `anchor == continuation` (nothing was walked).
-    fn bias_seg(&self) -> SegmentId {
-        if self.anchor == self.continuation { NO_PRIOR_SEG } else { self.seg_id }
-    }
-}
-
-/// Every way waypoint `w` could anchor a location boundary: a single
-/// zero-offset candidate for an explicit node pick, or two — one per segment
-/// endpoint — for a segment/nearest-road snap, since which endpoint the path
-/// actually continues from can't be decided without knowing where the route
-/// goes next (the caller tries both — see `resolve_boundary_leg`).
-fn boundary_candidates(graph: &Graph, w: &WaypointIn) -> Option<Vec<BoundaryCandidate>> {
-    if let SnapHint::Node(node_id) = w.snap_hint() {
-        if graph.nodes.contains_key(&node_id) {
-            let seg_id = graph.topology_neighbors(node_id).first().map(|(_, s)| *s)?;
-            return Some(vec![BoundaryCandidate { seg_id, anchor: node_id, continuation: node_id, offset_m: 0.0 }]);
-        }
-        // Hinted node no longer loaded — fall through to nearest-segment search.
-    }
-    let seg_id = match w.snap_hint() {
-        SnapHint::Segment(id) if graph.segments.contains_key(&id) => id,
-        _ => {
-            let nearby = graph.segments_near(w.lon, w.lat, WAYPOINT_SNAP_RADIUS_M);
-            nearby.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())?.0
-        }
-    };
-    let seg = graph.segments.get(&seg_id)?;
-    let proj = project_onto_polyline(w.lon, w.lat, &seg.geometry)?;
-    let total = seg.length_m;
-    Some(vec![
-        BoundaryCandidate { seg_id, anchor: seg.start_node, continuation: seg.end_node, offset_m: proj.arc_offset_m },
-        BoundaryCandidate { seg_id, anchor: seg.end_node, continuation: seg.start_node, offset_m: total - proj.arc_offset_m },
-    ])
-}
-
-/// Try every `candidates` entry's continuation against the fixed `target`
-/// node on the other side of this leg — always an interior waypoint's
-/// snapped node, since a route with no interior waypoints resolves both
-/// boundaries jointly instead (see `route_waypoints`). Picks whichever
-/// candidate yields the shortest total distance (its own offset plus the
-/// connecting search). There's no incoming leg to bias against here — this
-/// is always the very first leg of the route.
-fn resolve_boundary_leg(
-    graph: &Graph,
-    candidates: &[BoundaryCandidate],
-    target: NodeId,
-    max_turn_deviation_deg: f64,
-    zoom: u8,
-) -> Result<(usize, PathResult), RouteOutcome> {
-    let mut best: Option<(usize, PathResult, f64)> = None;
-    for (idx, c) in candidates.iter().enumerate() {
-        let (result, extra_len) = if c.continuation == target {
-            (PathResult { segments: vec![], length_m: 0.0 }, 0.0)
-        } else {
-            match shortest_path(graph, c.continuation, c.bias_seg(), target, 7, max_turn_deviation_deg, 0, zoom) {
-                PathOutcome::Found(r) => { let l = r.length_m; (r, l) }
-                PathOutcome::NeedsTile(tk) => return Err(RouteOutcome::NeedsTile(tk)),
-                PathOutcome::NoPath => continue,
-            }
-        };
-        let total = c.offset_m + extra_len;
-        if best.as_ref().map_or(true, |b| total < b.2) {
-            best = Some((idx, result, total));
-        }
-    }
-    best.map(|(idx, r, _)| (idx, r))
-        .ok_or_else(|| RouteOutcome::Error(RouteFailure::plain("no route found for a boundary waypoint")))
-}
-
-/// Mirror of `resolve_boundary_leg` for the *last* boundary: the fixed node
-/// is the source (the previous leg's arrival point) and the search runs
-/// forward from it to each candidate's continuation.
-fn resolve_boundary_leg_from(
-    graph: &Graph,
-    source: NodeId,
-    source_bias_seg: SegmentId,
-    candidates: &[BoundaryCandidate],
-    max_turn_deviation_deg: f64,
-    zoom: u8,
-) -> Result<(usize, PathResult), RouteOutcome> {
-    let mut best: Option<(usize, PathResult, f64)> = None;
-    for (idx, c) in candidates.iter().enumerate() {
-        let (result, extra_len) = if source == c.continuation {
-            (PathResult { segments: vec![], length_m: 0.0 }, 0.0)
-        } else {
-            match shortest_path(graph, source, source_bias_seg, c.continuation, 7, max_turn_deviation_deg, 0, zoom) {
-                PathOutcome::Found(r) => { let l = r.length_m; (r, l) }
-                PathOutcome::NeedsTile(tk) => return Err(RouteOutcome::NeedsTile(tk)),
-                PathOutcome::NoPath => continue,
-            }
-        };
-        let total = c.offset_m + extra_len;
-        if best.as_ref().map_or(true, |b| total < b.2) {
-            best = Some((idx, result, total));
-        }
-    }
-    best.map(|(idx, r, _)| (idx, r))
-        .ok_or_else(|| RouteOutcome::Error(RouteFailure::plain("no route found for a boundary waypoint")))
-}
-
-/// Snap `(lon, lat)` onto the road network per `hint` — see `SnapHint`. Used
-/// for both the live-route preview and the final encode — both need "which
-/// node do I route through, and how far is the true point from it" for
-/// exactly the same reason `LineLocationInput` needs `start_offset_m`/
-/// `end_offset_m`.
-fn snap_point(graph: &Graph, lon: f64, lat: f64, hint: SnapHint) -> Option<SnappedWaypoint> {
-    if let SnapHint::Node(node_id) = hint {
-        if graph.nodes.contains_key(&node_id) {
-            // Must be departable *from* this node in its permitted direction —
-            // PAL reads this segment back out directly as its own line, with
-            // no coverage-sweep/A* step afterward to reject an illegal
-            // direction the way routing would. `topology_neighbors` ignores
-            // `Direction` entirely (right for Rule-4's structural walk, wrong
-            // here): picking an arbitrary touching segment could anchor PAL
-            // on a one-way road in the prohibited direction, producing a
-            // reference no decoder could ever route.
-            let seg_id = graph.outgoing_segments(node_id).first().copied()?;
-            return Some(SnappedWaypoint { seg_id, node: node_id, offset_m: 0.0 });
-        }
-        // Hinted node no longer loaded — fall through to nearest-segment search.
-    }
-
-    let seg_id = match hint {
-        SnapHint::Segment(id) if graph.segments.contains_key(&id) => id,
-        _ => {
-            let nearby = graph.segments_near(lon, lat, WAYPOINT_SNAP_RADIUS_M);
-            nearby.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())?.0
-        }
-    };
-    let seg = graph.segments.get(&seg_id)?;
-    let proj = project_onto_polyline(lon, lat, &seg.geometry)?;
-    let total = seg.length_m;
-    // Nearest-endpoint is only a free choice on a `Both`-direction segment.
-    // A one-way segment can only be *anchored* at the end its direction
-    // permits departing from — PAL reads this straight back out as its own
-    // line with no coverage-sweep/A* step to reject the wrong choice
-    // afterward (same root cause as the node-hint fix above, different
-    // path: picking the geometrically nearer endpoint regardless of
-    // direction could anchor PAL on the end that requires travelling the
-    // prohibited way).
-    match seg.direction {
-        Direction::Forward  => Some(SnappedWaypoint { seg_id, node: seg.start_node, offset_m: proj.arc_offset_m }),
-        Direction::Backward => Some(SnappedWaypoint { seg_id, node: seg.end_node, offset_m: total - proj.arc_offset_m }),
-        Direction::Both => if proj.arc_offset_m <= total - proj.arc_offset_m {
-            Some(SnappedWaypoint { seg_id, node: seg.start_node, offset_m: proj.arc_offset_m })
-        } else {
-            Some(SnappedWaypoint { seg_id, node: seg.end_node, offset_m: total - proj.arc_offset_m })
-        },
-    }
-}
-
-/// Outcome of chaining shortest-path search across an ordered waypoint list.
-enum RouteOutcome {
-    Found {
-        path: Vec<SegmentId>,
-        start_node: NodeId,
-        start_offset_m: f64,
-        end_offset_m: f64,
-        length_m: f64,
-        /// Segment-count boundaries within `path` marking where each
-        /// waypoint-to-waypoint leg ends (see `LineLocationInput::via_split_points`).
-        via_split_points: Vec<usize>,
-        /// The snapped node coordinate for each waypoint, in input order —
-        /// see `RoutePreviewResult::snapped`.
-        snapped_coords: Vec<(f64, f64)>,
-    },
-    NeedsTile(TileKey),
-    Error(RouteFailure),
-}
-
-/// A `route_waypoints` failure, with structured leg context when the failure
-/// is a specific waypoint-to-waypoint connection (as opposed to e.g. "no road
-/// near this waypoint at all", which has no leg to report). When present,
-/// `from_node`/`to_node`/`from_segment_id` can be fed directly into
-/// `Encoder::diagnose_connection` without the caller having to look them up.
-struct RouteFailure {
-    message: String,
-    from_node: Option<u32>,
-    to_node: Option<u32>,
-    from_segment_id: Option<u32>,
-}
-
-impl RouteFailure {
-    fn plain(msg: impl Into<String>) -> Self {
-        RouteFailure { message: msg.into(), from_node: None, to_node: None, from_segment_id: None }
-    }
-    fn leg(msg: impl Into<String>, from_node: NodeId, from_seg: SegmentId, to_node: NodeId) -> Self {
-        RouteFailure {
-            message: msg.into(),
-            from_node: Some(from_node.0),
-            to_node: Some(to_node.0),
-            from_segment_id: if from_seg == NO_PRIOR_SEG { None } else { Some(from_seg.0) },
-        }
-    }
-}
-
-/// Snap every waypoint, then chain `shortest_path` leg-by-leg between
-/// consecutive snaps. Shared by `route_between` (map preview) and
-/// `encode_line`/`encode_pal` (final encode) so both always see the exact
-/// same routing decision — no stale-preview-vs-encode mismatch.
-///
-/// The first and last waypoints get special handling: when one snaps
-/// mid-segment, its POFF/NOFF offset is only reconstructible by the decoder
-/// if it's a forward distance from a node the recorded path genuinely
-/// starts (or ends) at — and that's not necessarily the nearer endpoint of
-/// the snapped segment. If the nearer endpoint happens to be the one the
-/// route continues *away* from (its own segment never appears in the
-/// recorded path at all), the offset is just a number with no path to trim
-/// against, and the decoder reconstructs a bogus start/end point. Interior
-/// waypoints don't have this problem — the Line format has no offset field
-/// on interior LRPs, so nearest-endpoint snapping loses nothing extra.
-///
-/// `max_turn_deviation_deg` is the same cap `encode_line`'s `sweep_coverage`
-/// step will enforce (see its own doc comment). Passing the real value here
-/// — rather than a permissive `180.0` — means any path this preview finds is
-/// already turn-angle-compliant, so `sweep_coverage`'s independent
-/// re-derivation of that same path can't diverge over a turn this search
-/// was allowed to take but that one wasn't: a route the preview shows as
-/// connected is then guaranteed not to fail encoding for that reason.
-fn route_waypoints(graph: &Graph, waypoints: &[WaypointIn], max_turn_deviation_deg: f64, zoom: u8) -> RouteOutcome {
-    if waypoints.len() < 2 {
-        return RouteOutcome::Error(RouteFailure::plain("need at least 2 waypoints"));
-    }
-
-    let first_candidates = match boundary_candidates(graph, &waypoints[0]) {
-        Some(c) => c,
-        None => return RouteOutcome::Error(RouteFailure::plain(format!(
-            "no road found within {WAYPOINT_SNAP_RADIUS_M}m of waypoint 0 — load more tiles or move it closer to a road"
-        ))),
-    };
-    let last_idx = waypoints.len() - 1;
-    let last_candidates = match boundary_candidates(graph, &waypoints[last_idx]) {
-        Some(c) => c,
-        None => return RouteOutcome::Error(RouteFailure::plain(format!(
-            "no road found within {WAYPOINT_SNAP_RADIUS_M}m of waypoint {last_idx} — load more tiles or move it closer to a road"
-        ))),
-    };
-
-    if waypoints.len() == 2 {
-        // The one leg spans both boundaries at once — every (first, last)
-        // candidate pair is a physically distinct route, so try them all
-        // jointly rather than resolving each boundary independently.
-        let mut best: Option<(usize, usize, PathResult, f64)> = None;
-        for (fi, fc) in first_candidates.iter().enumerate() {
-            for (li, lc) in last_candidates.iter().enumerate() {
-                let (result, extra_len) = if fc.continuation == lc.continuation {
-                    (PathResult { segments: vec![], length_m: 0.0 }, 0.0)
-                } else {
-                    match shortest_path(graph, fc.continuation, fc.bias_seg(), lc.continuation, 7, max_turn_deviation_deg, 0, zoom) {
-                        PathOutcome::Found(r) => { let l = r.length_m; (r, l) }
-                        PathOutcome::NeedsTile(tk) => return RouteOutcome::NeedsTile(tk),
-                        PathOutcome::NoPath => continue,
-                    }
-                };
-                let total = fc.offset_m + lc.offset_m + extra_len;
-                if best.as_ref().map_or(true, |b| total < b.3) {
-                    best = Some((fi, li, result, total));
-                }
-            }
-        }
-        let (fi, li, core, total) = match best {
-            Some(b) => b,
-            None => return RouteOutcome::Error(RouteFailure::plain("no route found between waypoint 0 and 1")),
-        };
-        let fc = &first_candidates[fi];
-        let lc = &last_candidates[li];
-
-        let mut full_path = Vec::with_capacity(core.segments.len() + 2);
-        if fc.anchor != fc.continuation { full_path.push(fc.seg_id); }
-        full_path.extend(core.segments);
-        if lc.anchor != lc.continuation { full_path.push(lc.seg_id); }
-
-        let snapped_coords = [fc.anchor, lc.anchor].iter()
-            .filter_map(|n| graph.nodes.get(n).map(|n| (n.lon, n.lat)))
-            .collect();
-
-        return RouteOutcome::Found {
-            path: full_path,
-            start_node: fc.anchor,
-            start_offset_m: fc.offset_m,
-            end_offset_m: lc.offset_m,
-            length_m: total,
-            via_split_points: Vec::new(),
-            snapped_coords,
-        };
-    }
-
-    // Interior waypoints never carry an offset (Line format only supports
-    // POFF/NOFF on the first/last LRP), so plain nearest-endpoint snapping
-    // is fine — direction doesn't matter when there's no offset to
-    // reconstruct.
-    let mut mid_nodes = Vec::with_capacity(waypoints.len() - 2);
-    for (i, w) in waypoints[1..last_idx].iter().enumerate() {
-        match snap_point(graph, w.lon, w.lat, w.snap_hint()) {
-            Some(s) => mid_nodes.push(s.node),
-            None => return RouteOutcome::Error(RouteFailure::plain(format!(
-                "no road found within {WAYPOINT_SNAP_RADIUS_M}m of waypoint {} — load more tiles or move it closer to a road", i + 1
-            ))),
-        }
-    }
-
-    let (fi, first_leg) = match resolve_boundary_leg(graph, &first_candidates, mid_nodes[0], max_turn_deviation_deg, zoom) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let fc = &first_candidates[fi];
-
-    let mut full_path: Vec<SegmentId> = Vec::new();
-    let mut current_seg = fc.bias_seg();
-    let mut length_m = fc.offset_m;
-    let mut via_split_points = Vec::new();
-
-    if fc.anchor != fc.continuation { full_path.push(fc.seg_id); }
-    length_m += first_leg.length_m;
-    if let Some(&last) = first_leg.segments.last() { current_seg = last; }
-    full_path.extend(first_leg.segments);
-    // `mid_nodes[0]` is always an interior waypoint here (this branch only
-    // runs for len >= 3), so this leg always ends at a real via-point.
-    via_split_points.push(full_path.len());
-
-    // Interior-to-interior legs: unaffected by the boundary-offset problem
-    // (no offset to reconstruct), so a plain chained search is fine. Every
-    // one of these ends at another interior waypoint, so each gets a split
-    // point too.
-    for i in 0..mid_nodes.len() - 1 {
-        match shortest_path(graph, mid_nodes[i], current_seg, mid_nodes[i + 1], 7, max_turn_deviation_deg, 0, zoom) {
-            PathOutcome::Found(r) => {
-                length_m += r.length_m;
-                if let Some(&last) = r.segments.last() { current_seg = last; }
-                full_path.extend(r.segments);
-                via_split_points.push(full_path.len());
-            }
-            PathOutcome::NoPath => return RouteOutcome::Error(RouteFailure::leg(
-                format!("no route found between waypoint {} and {}", i + 1, i + 2),
-                mid_nodes[i], current_seg, mid_nodes[i + 1],
-            )),
-            PathOutcome::NeedsTile(tk) => return RouteOutcome::NeedsTile(tk),
-        }
-    }
-
-    let last_mid = *mid_nodes.last().unwrap();
-    let (li, last_leg) = match resolve_boundary_leg_from(graph, last_mid, current_seg, &last_candidates, max_turn_deviation_deg, zoom) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let lc = &last_candidates[li];
-    length_m += last_leg.length_m + lc.offset_m;
-    full_path.extend(last_leg.segments);
-    if lc.anchor != lc.continuation { full_path.push(lc.seg_id); }
-
-    let mut snapped_coords: Vec<(f64, f64)> = Vec::with_capacity(waypoints.len());
-    snapped_coords.extend(graph.nodes.get(&fc.anchor).map(|n| (n.lon, n.lat)));
-    snapped_coords.extend(mid_nodes.iter().filter_map(|n| graph.nodes.get(n).map(|n| (n.lon, n.lat))));
-    snapped_coords.extend(graph.nodes.get(&lc.anchor).map(|n| (n.lon, n.lat)));
-
-    RouteOutcome::Found {
-        path: full_path,
-        start_node: fc.anchor,
-        start_offset_m: fc.offset_m,
-        end_offset_m: lc.offset_m,
-        length_m,
-        via_split_points,
-        snapped_coords,
-    }
-}
-
 /// Stateful encode session. Mirrors `Decoder`'s tile-loading lifecycle exactly
 /// (same `TileLoader`), but for the opposite direction: draw waypoints, get a
 /// live route preview, then encode to both physical formats.
@@ -1847,7 +1422,7 @@ impl Encoder {
     /// on success, `{ "needs_tile": [z,x,y] }` if the search needs an unloaded
     /// tile (load it and retry), or `{ "error": "..." }`.
     pub fn route_between(&self, waypoints_json: &str, max_turn_deviation_deg: f64, zoom: u8) -> String {
-        let waypoints: Vec<WaypointIn> = match serde_json::from_str(waypoints_json) {
+        let waypoints: Vec<Waypoint> = match serde_json::from_str(waypoints_json) {
             Ok(w) => w,
             Err(e) => return serde_json::to_string(&RoutePreviewResult::err(format!("invalid waypoints: {e}"))).unwrap(),
         };
@@ -1891,73 +1466,20 @@ impl Encoder {
     /// distance_m, snapped_lon, snapped_lat, frc, fow, stable_id}, ...] }`,
     /// nearest first.
     pub fn candidates_near_point(&self, lon: f64, lat: f64) -> String {
-        let graph = &self.loader.graph;
-        let nearby_segs = graph.segments_near(lon, lat, WAYPOINT_SNAP_RADIUS_M);
-
-        // Node (intersection/junction) candidates first: every distinct
-        // endpoint of a nearby segment that's itself within snap radius of
-        // the click. These are the "snap to this intersection" choice —
-        // explicit and exact (zero offset), independent of which particular
-        // road happens to be geometrically nearest.
-        let mut seen_nodes: HashSet<NodeId> = HashSet::new();
-        let mut candidates: Vec<SnapCandidate> = Vec::new();
-        for (seg_id, _) in &nearby_segs {
-            let Some(seg) = graph.segments.get(seg_id) else { continue };
-            for node_id in [seg.start_node, seg.end_node] {
-                if !seen_nodes.insert(node_id) { continue; }
-                let Some(dist) = graph.node_dist_m(node_id, lon, lat) else { continue };
-                if dist > WAYPOINT_SNAP_RADIUS_M { continue; }
-                let Some(n) = graph.nodes.get(&node_id) else { continue };
-                candidates.push(SnapCandidate {
-                    kind: "node",
-                    node_id: Some(node_id.0),
-                    segment_id: None,
-                    distance_m: dist,
-                    snapped_lon: n.lon,
-                    snapped_lat: n.lat,
-                    frc: None,
-                    fow: None,
-                    stable_id: None,
-                });
-            }
-        }
-
-        // Segment (interior, along-the-road) candidates: skip any whose
-        // projected point is essentially the same spot as a node candidate
-        // already listed (that's not a distinct choice, it's just that
-        // junction) or as another segment candidate already kept (e.g. two
-        // travel-direction segments of the same road).
-        let close_enough = |a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64| {
-            let dx = (a_lon - b_lon) * a_lat.to_radians().cos();
-            let dy = a_lat - b_lat;
-            (dx * dx + dy * dy).sqrt() * 111_000.0 < 5.0
-        };
-        let mut seg_candidates: Vec<SnapCandidate> = nearby_segs.into_iter()
-            .filter_map(|(seg_id, _dist)| {
-                let seg = graph.segments.get(&seg_id)?;
-                let proj = project_onto_polyline(lon, lat, &seg.geometry)?;
-                Some(SnapCandidate {
-                    kind: "segment",
-                    node_id: None,
-                    segment_id: Some(seg_id.0),
-                    distance_m: proj.distance_m,
-                    snapped_lon: proj.point.0,
-                    snapped_lat: proj.point.1,
-                    frc: Some(seg.frc),
-                    fow: Some(seg.fow),
-                    stable_id: Some(seg.stable_id.clone()),
-                })
+        let candidates: Vec<SnapCandidate> = nearby_anchors(&self.loader.graph, lon, lat)
+            .into_iter()
+            .map(|a| SnapCandidate {
+                kind: a.kind,
+                node_id: a.node_id.map(|n| n.0),
+                segment_id: a.segment_id.map(|s| s.0),
+                distance_m: a.distance_m,
+                snapped_lon: a.point.0,
+                snapped_lat: a.point.1,
+                frc: a.frc,
+                fow: a.fow,
+                stable_id: a.stable_id,
             })
             .collect();
-        seg_candidates.sort_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap());
-        for c in seg_candidates {
-            let is_dup = candidates.iter().any(|d| close_enough(d.snapped_lon, d.snapped_lat, c.snapped_lon, c.snapped_lat));
-            if !is_dup {
-                candidates.push(c);
-            }
-        }
-
-        candidates.sort_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap());
         serde_json::to_string(&CandidatesResult { candidates }).unwrap()
     }
 
@@ -1982,7 +1504,7 @@ impl Encoder {
     /// Returns `{ "v3": "...", "tpeg": "..." }`, `{ "needs_tile": [z,x,y] }`,
     /// or `{ "error": "..." }`.
     pub fn encode_line(&self, waypoints_json: &str, max_turn_deviation_deg: f64, max_leg_m: f64, zoom: u8) -> String {
-        let waypoints: Vec<WaypointIn> = match serde_json::from_str(waypoints_json) {
+        let waypoints: Vec<Waypoint> = match serde_json::from_str(waypoints_json) {
             Ok(w) => w,
             Err(e) => return serde_json::to_string(&EncodeOutResult::err(format!("invalid waypoints: {e}"))).unwrap(),
         };
@@ -2166,17 +1688,6 @@ fn serialize_encoded(loc_ref: &LocationReference) -> String {
 // ── Segment source-key helper ─────────────────────────────────────────────────
 
 // ── Param merge helper ────────────────────────────────────────────────────────
-
-fn merge_params(base: &DecodeParams, override_json: &str) -> Result<DecodeParams, serde_json::Error> {
-    let mut base_val = serde_json::to_value(base)?;
-    let overlay: serde_json::Value = serde_json::from_str(override_json)?;
-    if let (Some(base_obj), Some(overlay_obj)) = (base_val.as_object_mut(), overlay.as_object()) {
-        for (k, v) in overlay_obj {
-            base_obj.insert(k.clone(), v.clone());
-        }
-    }
-    serde_json::from_value(base_val)
-}
 
 // ── Format auto-detection ─────────────────────────────────────────────────────
 

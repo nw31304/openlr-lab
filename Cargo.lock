@@ -113,6 +113,7 @@ dependencies = [
  "openlr-graph",
  "openlr-provider",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

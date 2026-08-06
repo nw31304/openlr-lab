@@ -16,6 +16,7 @@ pub mod diagnose;
 pub mod line;
 pub mod pal;
 pub mod virtual_split;
+pub mod waypoint;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {

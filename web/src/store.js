@@ -158,95 +158,58 @@ export function getNodeId(z, x, y, localIndex) {
   return _decoder.node_id_at(z, x, y, localIndex);
 }
 
-function defaultFrcTable() {
-  const p = [0.00, 0.10, 0.25, 0.45, 0.65, 0.80, 0.90, 1.00];
-  return Array.from({ length: 8 }, (_, i) =>
-    Array.from({ length: 8 }, (_, j) => p[Math.abs(i - j)])
-  );
-}
-
-const DEFAULT_FOW_TABLE = [
-  [0.00, 0.30, 0.30, 0.30, 0.30, 0.30, 0.30, 0.30],
-  [0.30, 0.00, 0.10, 0.40, 0.60, 0.70, 0.20, 0.80],
-  [0.30, 0.10, 0.00, 0.20, 0.40, 0.50, 0.25, 0.70],
-  [0.30, 0.40, 0.20, 0.00, 0.20, 0.25, 0.30, 0.40],
-  [0.30, 0.60, 0.40, 0.20, 0.00, 0.30, 0.40, 0.50],
-  [0.30, 0.70, 0.50, 0.25, 0.30, 0.00, 0.50, 0.40],
-  [0.30, 0.20, 0.25, 0.30, 0.40, 0.50, 0.00, 0.50],
-  [0.30, 0.80, 0.70, 0.40, 0.50, 0.40, 0.50, 0.00],
-];
-
-export const PRESETS = {
-  Permissive: {
-    candidate_search_radius_m:    200.0,
-    snap_to_endpoint_threshold_m:  25.0,
-    distance_weight:                0.5,
-    bearing_weight:                 0.2,
-    bearing_penalty_per_bucket:     0.03,
-    frc_weight:                     0.05,
-    fow_weight:                     0.10,
-    interior_weight:                0.05,
-    wrong_endpoint_weight:          0.10,
-    frc_penalty_table: defaultFrcTable(),
-    fow_penalty_table: DEFAULT_FOW_TABLE,
-    max_bearing_deviation_deg:     90.0,
-    max_candidate_score:            1.5,
-    max_candidates_per_lrp:        10,
-    dnp_tolerance_pct:              0.40,
-    max_path_search_factor:         4.0,
-    max_astar_expansions:       50000,
-    lfrcnp_tolerance:               2,
-    max_interior_turn_deviation_deg: 180.0,
-    max_routing_attempts:           0,
-    trace_level: 'Summary',
-  },
-  Default: {
-    candidate_search_radius_m:     30.0,
-    snap_to_endpoint_threshold_m:  15.0,
-    distance_weight:                0.5,
-    bearing_weight:                 0.3,
-    bearing_penalty_per_bucket:     0.05,
-    frc_weight:                     0.10,
-    fow_weight:                     0.20,
-    interior_weight:                0.10,
-    wrong_endpoint_weight:          5.00,
-    frc_penalty_table: defaultFrcTable(),
-    fow_penalty_table: DEFAULT_FOW_TABLE,
-    max_bearing_deviation_deg:     45.0,
-    max_candidate_score:            1.5,
-    max_candidates_per_lrp:         8,
-    dnp_tolerance_pct:              0.25,
-    max_path_search_factor:         5.0,
-    max_astar_expansions:      100000,
-    lfrcnp_tolerance:               2,
-    max_interior_turn_deviation_deg: 150.0,
-    max_routing_attempts:          10,
-    trace_level: 'Summary',
-  },
-  Strict: {
-    candidate_search_radius_m:     50.0,
-    snap_to_endpoint_threshold_m:  10.0,
-    distance_weight:                0.5,
-    bearing_weight:                 0.4,
-    bearing_penalty_per_bucket:     0.08,
-    frc_weight:                     0.20,
-    fow_weight:                     0.30,
-    interior_weight:                0.20,
-    wrong_endpoint_weight:          0.30,
-    frc_penalty_table: defaultFrcTable(),
-    fow_penalty_table: DEFAULT_FOW_TABLE,
-    max_bearing_deviation_deg:     30.0,
-    max_candidate_score:            1.0,
-    max_candidates_per_lrp:         5,
-    dnp_tolerance_pct:              0.10,
-    max_path_search_factor:         3.0,
-    max_astar_expansions:           0,
-    lfrcnp_tolerance:               0,
-    max_interior_turn_deviation_deg: 120.0,
-    max_routing_attempts:           5,
-    trace_level: 'Summary',
-  },
+// Minimal bootstrap default, used only for the store's synchronous initial
+// state before the wasm module has loaded (App.jsx's setup() effect calls
+// list_presets_json() and overwrites PRESETS -- including this Default entry
+// -- with the authoritative values from openlr_engine::DecodeParams::preset()
+// well before the UI ever renders). This is the *only* hand-copied preset
+// literal left in JS -- Permissive/Strict, and the FRC/FOW penalty tables
+// every preset carries, used to come from separate hardcoded copies here too,
+// with nothing enforcing they matched Rust's own Preset::preset() values.
+// They happened to still agree, but that was luck, not a guarantee.
+const BOOTSTRAP_DEFAULT_PARAMS = {
+  candidate_search_radius_m:     30.0,
+  snap_to_endpoint_threshold_m:  15.0,
+  distance_weight:                0.5,
+  bearing_weight:                 0.3,
+  bearing_penalty_per_bucket:     0.05,
+  frc_weight:                     0.10,
+  fow_weight:                     0.20,
+  interior_weight:                0.10,
+  wrong_endpoint_weight:          5.00,
+  frc_penalty_table: [
+    [0.00, 0.10, 0.25, 0.45, 0.65, 0.80, 0.90, 1.00],
+    [0.10, 0.00, 0.10, 0.25, 0.45, 0.65, 0.80, 0.90],
+    [0.25, 0.10, 0.00, 0.10, 0.25, 0.45, 0.65, 0.80],
+    [0.45, 0.25, 0.10, 0.00, 0.10, 0.25, 0.45, 0.65],
+    [0.65, 0.45, 0.25, 0.10, 0.00, 0.10, 0.25, 0.45],
+    [0.80, 0.65, 0.45, 0.25, 0.10, 0.00, 0.10, 0.25],
+    [0.90, 0.80, 0.65, 0.45, 0.25, 0.10, 0.00, 0.10],
+    [1.00, 0.90, 0.80, 0.65, 0.45, 0.25, 0.10, 0.00],
+  ],
+  fow_penalty_table: [
+    [0.00, 0.30, 0.30, 0.30, 0.30, 0.30, 0.30, 0.30],
+    [0.30, 0.00, 0.10, 0.40, 0.60, 0.70, 0.20, 0.80],
+    [0.30, 0.10, 0.00, 0.20, 0.40, 0.50, 0.25, 0.70],
+    [0.30, 0.40, 0.20, 0.00, 0.20, 0.25, 0.30, 0.40],
+    [0.30, 0.60, 0.40, 0.20, 0.00, 0.30, 0.40, 0.50],
+    [0.30, 0.70, 0.50, 0.25, 0.30, 0.00, 0.50, 0.40],
+    [0.30, 0.20, 0.25, 0.30, 0.40, 0.50, 0.00, 0.50],
+    [0.30, 0.80, 0.70, 0.40, 0.50, 0.40, 0.50, 0.00],
+  ],
+  max_bearing_deviation_deg:     45.0,
+  max_candidate_score:            1.5,
+  max_candidates_per_lrp:         8,
+  dnp_tolerance_pct:              0.25,
+  max_path_search_factor:         5.0,
+  max_astar_expansions:      100000,
+  lfrcnp_tolerance:               2,
+  max_interior_turn_deviation_deg: 150.0,
+  max_routing_attempts:          10,
+  trace_level: 'Summary',
 };
+
+export const PRESETS = { Default: BOOTSTRAP_DEFAULT_PARAMS };
 
 // Produce a human-readable label for a tool call, incorporating key arguments.
 function toolCallLabel(name, args) {
@@ -363,6 +326,22 @@ export const useStore = create(persist(
   resetToDefaults: () => set({ params: { ...PRESETS.Default } }),
 
   loadPreset: (name) => set({ params: { ...PRESETS[name] } }),
+
+  // Called once at startup (App.jsx, after initWasm() resolves) with
+  // Decoder.list_presets_json()'s output -- overwrites PRESETS in place
+  // (mutating the same object every consumer already references, not
+  // rebinding the export) with the authoritative Permissive/Default/Strict
+  // values straight from openlr_engine::DecodeParams::preset(). If the
+  // active params are still exactly the pre-wasm bootstrap default (i.e.
+  // this is a first-ever load with nothing persisted or user-edited yet),
+  // also refreshes them to the real Default -- otherwise a first-time user
+  // would silently keep seeing the JS bootstrap copy until they happened to
+  // click "Reset to defaults" themselves.
+  loadPresetsFromEngine: (presetsJson) => {
+    const wasBootstrap = JSON.stringify(get().params) === JSON.stringify(PRESETS.Default);
+    Object.assign(PRESETS, JSON.parse(presetsJson));
+    if (wasBootstrap) set({ params: { ...PRESETS.Default } });
+  },
 
   saveParamSet: (name, params) => set(state => ({
     savedParamSets: { ...state.savedParamSets, [name]: { ...params } },
