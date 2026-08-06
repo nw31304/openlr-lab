@@ -1,6 +1,6 @@
 # OpenLRLab
 
-A browser-based diagnostic decoder **and encoder** for [OpenLR](https://www.openlr-association.com/) location references. The decode/encode engine (codec, graph, A\* path search, encoder) lives in a separate repo, [openlr-core](https://github.com/nw31304/openlr-core), compiled to WebAssembly here via a thin `openlr-wasm` binding crate. A MapLibre GL JS front end renders the decoded/encoded path and step-by-step diagnostics.
+A browser-based diagnostic decoder **and encoder** for [OpenLR](https://www.openlr-association.com/) location references. This repo contains no Rust code — the decode/encode engine (codec, graph, A\* path search, encoder) *and* the `wasm-bindgen` binding crate that compiles it to WebAssembly both live in a separate repo, [openlr-core](https://github.com/nw31304/openlr-core); this repo builds that crate and copies the resulting wasm module in. A MapLibre GL JS front end renders the decoded/encoded path and step-by-step diagnostics.
 
 Two formats are supported, both for decode and encode:
 
@@ -21,35 +21,40 @@ BUILD TIME  (a few times per year, separate repo: openlr-pmtiles)
 RUNTIME  (browser, no server)
   PMTiles (range reads) ──▶ TileLoader ──▶ OpenLRDataProvider ──▶ in-memory graph   ┐
                                                     │                                │ openlr-core
-  decode:  OpenLR string ──▶ codec (v3 / TPEG) ──▶ unified LRP model                │ (separate repo,
-                                                    │                                │  external dep)
-                             engine: candidate selection + A* + validation          │
+  decode:  OpenLR string ──▶ codec (v3 / TPEG) ──▶ unified LRP model                │ (separate repo —
+                                                    │                                │  engine AND the
+                             engine: candidate selection + A* + validation          │  openlr-wasm
+                                                    │                                │  bindings crate
+  encode:  waypoints (map clicks) ──▶ snap + route ──▶ encoder (Rule-1/Rule-4)      │  both live there)
                                                     │                                │
-  encode:  waypoints (map clicks) ──▶ snap + route ──▶ encoder (Rule-1/Rule-4)      ┘
+                             codec (v3 / TPEG) ──▶ round-trip verify (decode)       │
+                                                    │                                │
+                             openlr-wasm (openlr-core) ────────────────────────────┘
                                                     │
-                             codec (v3 / TPEG) ──▶ round-trip verify (decode)
+                              compiled wasm module, copied into web/src/wasm
                                                     │
-                                openlr-wasm (this repo) + diagnostics + MapLibre UI
+                                        diagnostics + MapLibre UI  (this repo)
 ```
 
 All map I/O stays in JavaScript. WASM receives pre-fetched tile bytes and operates synchronously over an in-memory cache, avoiding async-trait across the FFI boundary.
 
 ### Crates
 
-| Crate | Repo | Role |
-|---|---|---|
-| `openlr-codec` | [openlr-core](https://github.com/nw31304/openlr-core) | v3 / TPEG-OLR binary parsing and serialization ↔ unified `Lrp` model |
-| `openlr-graph` | openlr-core | Tile format, segment/node tables, geometry pool |
-| `openlr-engine` | openlr-core | Decode: candidate selection, A\* (`state = (node, incoming_segment)`), scoring, diagnostics |
-| `openlr-encoder` | openlr-core | Encode: Rule-1/Rule-4 Line and PointAlongLine encoding, boundary expansion, coverage sweep, waypoint snapping |
-| `openlr-provider` | openlr-core | `OpenLRDataProvider` trait + `PmtilesProvider` implementation |
-| `openlr-cli` | openlr-core | Native batch-decode binary against a local `.pmtiles` archive |
-| `openlr-wasm` | this repo | Thin `wasm-bindgen` adapter exposing `Decoder`/`Encoder` to JS — JSON shaping and the tile-injection protocol only, no algorithmic logic |
+Every crate below lives in [openlr-core](https://github.com/nw31304/openlr-core) — this repo has no `Cargo.toml`/`crates/` of its own.
 
-`openlr-wasm/Cargo.toml` depends on `openlr-core`'s crates via `git` references, overridden by a
-`[patch]` section in this repo's root `Cargo.toml` to a local sibling checkout — clone
-`openlr-core` alongside this repo (`../openlr-core` relative to here) before building. See
-`CLAUDE.md` §1 for why this arrangement (rather than a bare path dependency) was chosen.
+| Crate | Role |
+|---|---|
+| `openlr-codec` | v3 / TPEG-OLR binary parsing and serialization ↔ unified `Lrp` model |
+| `openlr-graph` | Tile format, segment/node tables, geometry pool |
+| `openlr-engine` | Decode: candidate selection, A\* (`state = (node, incoming_segment)`), scoring, diagnostics |
+| `openlr-encoder` | Encode: Rule-1/Rule-4 Line and PointAlongLine encoding, boundary expansion, coverage sweep, waypoint snapping |
+| `openlr-provider` | `OpenLRDataProvider` trait + `PmtilesProvider` implementation |
+| `openlr-cli` | Native batch-decode binary against a local `.pmtiles` archive |
+| `openlr-wasm` | Thin `wasm-bindgen` adapter exposing `Decoder`/`Encoder` to JS — JSON shaping and the tile-injection protocol only, no algorithmic logic. This is what this repo builds and copies in (see Build, below). |
+
+Clone `openlr-core` alongside this repo (`../openlr-core` relative to here) before building — see
+`CLAUDE.md` §1 for why building its `openlr-wasm` crate from a sibling checkout, rather than
+vendoring Rust source into this repo, was chosen.
 
 The PMTiles builder (`openlr-pmtiles-build`, ingesting Overture, OSM, generic
 GeoJSONL, or a canonical DuckDB source) lives in a separate repo,
@@ -74,24 +79,28 @@ The UI is a stepped debugger, not just a result renderer:
 
 ## Prerequisites
 
-- Rust toolchain + `wasm-pack`
+- Rust toolchain + `wasm-pack` (needed to build `openlr-core`'s `openlr-wasm` crate; this repo
+  itself has no Rust code)
 - Node.js ≥ 18
 - [openlr-core](https://github.com/nw31304/openlr-core) cloned as a sibling directory of this repo
-  (`../openlr-core`) — the actual decode/encode engine `openlr-wasm` depends on. See `CLAUDE.md` §1.
+  (`../openlr-core`) — owns the decode/encode engine *and* the `openlr-wasm` binding crate this
+  repo builds. See `CLAUDE.md` §1.
 
 ## Build
 
 ### 1. Compile the WASM module
 
 ```sh
-cd crates/openlr-wasm
-wasm-pack build --target web --out-dir ../../web/src/wasm
+cd ../openlr-core/crates/openlr-wasm
+wasm-pack build --target web --out-dir ../../../openlr-lab/web/src/wasm
 ```
 
+(Run from this repo's own root; adjust the relative path if your sibling checkout lives elsewhere.)
+
 **This is not a one-time step.** The Vite dev server does not watch or rebuild the WASM module —
-re-run this command (from `crates/openlr-wasm/`) and reload the browser after *every* change under
-`crates/`, or you'll silently keep testing against a stale binary. The output is gitignored, so
-`npm run deploy` (see Deployment, below) also rebuilds it fresh before every deploy.
+re-run this command and reload the browser after *every* change in the sibling `openlr-core`
+checkout, or you'll silently keep testing against a stale binary. The output (`web/src/wasm/`) is
+gitignored, so `npm run deploy` (see Deployment, below) also rebuilds it fresh before every deploy.
 
 ### 2. Run the web dev server
 

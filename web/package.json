@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "vite --host",
     "build": "vite build",
-    "deploy": "cd ../crates/openlr-wasm && wasm-pack build --target web --out-dir ../../web/src/wasm && cd ../../web && vite build && wrangler pages deploy dist --project-name=openlr-lab"
+    "deploy": "cd ../../openlr-core/crates/openlr-wasm && wasm-pack build --target web --out-dir ../../../openlr-lab/web/src/wasm && cd ../../../openlr-lab/web && vite build && wrangler pages deploy dist --project-name=openlr-lab"
   },
   "dependencies": {
     "@maptoolkit/maplibre-gl-logo": "^0.1.0",

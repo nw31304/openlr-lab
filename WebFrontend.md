@@ -798,7 +798,7 @@ mismatch or failure). Full drill-down uses the **same** `ResultPanel`/`TracePane
 of `decodeResult` while `mode === 'encode'` (see §20.2), so there is no separate
 encode-side trace UI to maintain.
 
-### 20.5 WASM `Encoder` bindings (`crates/openlr-wasm/src/lib.rs`)
+### 20.5 WASM `Encoder` bindings (`openlr-core`'s `crates/openlr-wasm/src/lib.rs`)
 
 A separate class from `Decoder`, mirroring its tile lifecycle (`new`, `load_tile`,
 `reset_tiles`, `tiles_near_point`): `route_between(waypoints_json, max_turn_deviation_deg, zoom)`
@@ -889,6 +889,7 @@ wrangler r2 object put openlr-lab-tiles/manifest.json --file=/path/to/manifest.j
 ```
 cd web && npm run deploy
 ```
-which runs `wasm-pack build` (crates/openlr-wasm → web/src/wasm, gitignored, must be
-fresh locally before every deploy since it's never committed), `vite build`, then
-`wrangler pages deploy dist --project-name=openlr-lab`.
+which runs `wasm-pack build` against `openlr-core`'s `crates/openlr-wasm` (a sibling
+checkout; → `web/src/wasm`, gitignored, must be fresh locally before every deploy
+since it's never committed), `vite build`, then `wrangler pages deploy dist
+--project-name=openlr-lab`.

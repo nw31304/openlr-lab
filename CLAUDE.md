@@ -1,13 +1,13 @@
 # CLAUDE.md — OpenLRLab
 
-Browser-based WebAssembly OpenLR **diagnostic decoder and encoder** with global coverage. This
-repo owns the browser UI (React/MapLibre) and a thin `openlr-wasm` binding crate — the actual
-decode/encode *engine* (codec, graph, A\*, encoder) lives in a separate repo,
-[openlr-core](https://github.com/nw31304/openlr-core), which this repo consumes as an external
-dependency. Map data is preprocessed once per source-data release into a static PMTiles archive
-(R2/CDN); no live server queries at runtime. Two formats, both decode and encode: **OpenLR binary
-v3** (TomTom; 11.25° bearing buckets, ~58.6 m DNP buckets) and **TPEG-OLR / ISO 21219-22** (full
-precision).
+Browser-based WebAssembly OpenLR **diagnostic decoder and encoder** with global coverage. This repo
+owns *only* the browser UI (React/MapLibre) — it contains no Rust code at all. Every bit of OpenLR
+logic, including the `openlr-wasm` `wasm-bindgen` adapter this UI calls into, lives in a separate
+repo, [openlr-core](https://github.com/nw31304/openlr-core), which this repo depends on for its
+compiled wasm module (built there, copied here — see §1). Map data is preprocessed once per
+source-data release into a static PMTiles archive (R2/CDN); no live server queries at runtime. Two
+formats, both decode and encode: **OpenLR binary v3** (TomTom; 11.25° bearing buckets, ~58.6 m DNP
+buckets) and **TPEG-OLR / ISO 21219-22** (full precision).
 
 **Read §2 before writing any code — several invariants fail silently (wrong output, not a crash).**
 **Most of the correctness-critical invariants now live in `openlr-core`'s own `CLAUDE.md`** — this
@@ -17,26 +17,27 @@ repo's list below is only what's genuinely specific to the browser/wasm side.
 
 ## 1. Relationship to openlr-core
 
-`openlr-core` owns `openlr-codec`, `openlr-graph`, `openlr-engine`, `openlr-encoder`, and
-`openlr-provider` — all decode/encode logic, with zero `wasm-bindgen`/browser awareness. This repo
-owns `crates/openlr-wasm` (a thin adapter: JSON-in/JSON-out wasm-bindgen glue, the tile-injection
-protocol, nothing algorithmic) and `web/` (the actual UI). If you find yourself wanting to add real
-encoding/decoding logic here, it almost certainly belongs in `openlr-core` instead — see that
-repo's own `CLAUDE.md` §4 for why (this split happened *because* waypoint-snapping logic once
-leaked into this repo's `openlr-wasm` crate and had to be moved out).
+`openlr-core` owns every line of OpenLR-aware Rust: `openlr-codec`/`openlr-graph`/`openlr-engine`/
+`openlr-encoder`/`openlr-provider` (the engine, zero `wasm-bindgen`/browser awareness) and
+`openlr-wasm` (the thin `wasm-bindgen` adapter — JSON-in/JSON-out glue, the tile-injection protocol,
+nothing algorithmic) — `openlr-wasm` used to live in this repo but moved to `openlr-core` once it
+became clear it carried no client-specific shaping (see that repo's `CLAUDE.md` §1 for the history).
+This repo owns `web/` and nothing else. If you find yourself wanting to add real encoding/decoding
+logic — or even wasm-bindgen JSON-shaping glue — here, it belongs in `openlr-core` instead; there is
+no Rust workspace in this repo to add it to.
 
-**Local dependency setup**: `openlr-wasm/Cargo.toml` declares its five dependencies as `git`
-references to `openlr-core`, but a `[patch]` section in this repo's root `Cargo.toml` overrides
-them to a local path (`../openlr-core`, a sibling checkout) — so day-to-day builds never touch the
-network, edits to `openlr-core` show up immediately on the next `cargo build`, and the manifest
-still states a real, resolvable source for anyone (or CI) without that sibling checkout. Requires
-`openlr-core` cloned as a sibling directory of this repo. If a build suddenly starts fetching from
-GitHub instead of using local edits, check that the sibling checkout still exists at `../openlr-core`
-and that the `[patch]` section hasn't been accidentally removed.
+**Local dependency setup**: this repo has no `Cargo.toml`, no `crates/` directory, no `cargo build`
+step of any kind. The wasm module `web/` actually loads (`web/src/wasm/`, gitignored, never
+committed) is built by running `wasm-pack build` *from `openlr-core`'s own
+`crates/openlr-wasm`*, pointed at this repo's `web/src/wasm` via `--out-dir` — see the README's
+Build section for the exact command, and `openlr-core` cloned as a sibling directory of this repo
+(`../openlr-core`) is a hard prerequisite for it to resolve. If `web/src/wasm` is stale or missing,
+the fix is always to re-run that command in the sibling checkout, never to add Rust code here.
 
 If this repo's docs and `openlr-core`'s ever describe the same invariant differently, that's drift
-to fix — `openlr-core`'s own `CLAUDE.md` is authoritative for engine behavior; this repo's mentions
-of it should be describing the same reality from the consumer's side, not a second opinion.
+to fix — `openlr-core`'s own `CLAUDE.md` is authoritative for engine *and* wasm-binding behavior;
+this repo's mentions of it should be describing the same reality from the consumer's side, not a
+second opinion.
 
 ---
 
@@ -48,24 +49,27 @@ of it should be describing the same reality from the consumer's side, not a seco
    source feeds a given build. See §13.
 
 2. **JS owns all I/O — WASM stays synchronous.** `openlr-core`'s engine is synchronous Rust with no
-   async-trait across FFI; this repo's `openlr-wasm` operates over an in-memory tile cache that JS
-   populates. When the engine needs a tile it yields a tile-key request to JS; JS fetches and
-   resumes with bytes injected via `load_tile()`. This is a browser/wasm-boundary design decision
-   specific to this repo, not an `openlr-core` concern — its `Graph`/`OpenLrDataProvider` API is
-   agnostic to how a caller gets tile bytes into it (`openlr-core`'s own `openlr-cli` reads them
-   straight off local disk, no injection dance needed).
+   async-trait across FFI; `openlr-core`'s `openlr-wasm` crate operates over an in-memory tile cache
+   that JS populates. When the engine needs a tile it yields a tile-key request to JS; JS fetches
+   and resumes with bytes injected via `load_tile()`. This is a browser/wasm-boundary design
+   decision specific to that binding, not a concern of the engine crates themselves — the
+   `Graph`/`OpenLrDataProvider` API is agnostic to how a caller gets tile bytes into it
+   (`openlr-core`'s own `openlr-cli` reads them straight off local disk, no injection dance needed).
+   This repo's role is purely the JS side of that protocol: `web/`'s `TileLoader`/store code fetches
+   tile bytes over HTTP range reads and calls `load_tile()`.
 
 3. **Candidate-search tile-prefetch completeness across a `retry_decode` param change.**
    `prefetch_tile_keys()` sizes its per-leg corridor buffer from `candidate_search_radius_m` *as of
-   the `start()` call*. `Decoder::retry_decode` (`openlr-wasm/src/lib.rs`) lets a caller override
-   `DecodeParams` — including `candidate_search_radius_m` — for a fresh decode against the
-   *already-loaded* graph. `retry_decode` recomputes `prefetch_tile_keys` for the *merged* params
-   first and returns `{ "needs_tiles": [[z,x,y], ...] }` instead of decoding if any aren't loaded
-   yet; the LLM chat's `retry_decode` tool (`web/src/llm/tools.js`) fetches them via
-   `storeActions.fetchAndLoadDecodeTiles` and retries, capped at 5 rounds. The underlying "why does
-   this matter at all" invariant (candidate search has no reactive fallback the way A\* interior
-   routing does) is `openlr-core`'s Invariant 10 — this entry is specifically about the one place
-   in *this* repo's code that has to uphold it across a parameter change mid-session.
+   the `start()` call*. `Decoder::retry_decode` (in `openlr-core`'s `crates/openlr-wasm/src/lib.rs`)
+   lets a caller override `DecodeParams` — including `candidate_search_radius_m` — for a fresh
+   decode against the *already-loaded* graph. `retry_decode` recomputes `prefetch_tile_keys` for
+   the *merged* params first and returns `{ "needs_tiles": [[z,x,y], ...] }` instead of decoding if
+   any aren't loaded yet; this repo's LLM chat's `retry_decode` tool (`web/src/llm/tools.js`)
+   fetches them via `storeActions.fetchAndLoadDecodeTiles` and retries, capped at 5 rounds. The
+   underlying "why does this matter at all" invariant (candidate search has no reactive fallback the
+   way A\* interior routing does) is `openlr-core`'s Invariant 10 — this entry is specifically about
+   the one place in *this* repo's JS code that has to uphold it across a parameter change
+   mid-session.
 
 4. **Decode-time `zoom` must always come from the archive's own manifest, never a hardcoded
    literal.** `web/src/App.jsx` throws (surfaced through the setup-error UI) if a manifest is
@@ -86,19 +90,22 @@ of it should be describing the same reality from the consumer's side, not a seco
   PMTiles ──range reads──▶ [TileLoader] ──▶ [OpenLRDataProvider] ──▶ in-memory graph   ┐
                                                     │                                   │
   OpenLR string ──▶ [Codec: v3/TPEG] ──▶ unified LRP model ([LB,UB] intervals)         │ openlr-core
-                                                    │                                   │ (external repo,
-                                        [Engine: candidates + A* + validation]          │  path-patched
-                                                    │                                   │  dependency)
-                                        [Encoder: Line/PAL, waypoint snapping]         ┘
+                                                    │                                   │ (external repo —
+                                        [Engine: candidates + A* + validation]          │  engine AND the
+                                                    │                                   │  openlr-wasm
+                                        [Encoder: Line/PAL, waypoint snapping]          │  bindings crate
+                                                    │                                   │  both live there)
+                                     openlr-wasm (openlr-core — thin wasm-bindgen glue)  ┘
                                                     │
-                                     openlr-wasm (this repo — thin wasm-bindgen glue)
+                                    compiled wasm module, copied into web/src/wasm
                                                     │
                                         [Diagnostics + MapLibre UI]  (this repo — web/)
 ```
 
-`openlr-wasm` depends on `openlr-core`'s five crates (see §1) and adds nothing algorithmic — JSON
-DTOs shaped for this app's React components, the tile-injection protocol above, and thin per-method
-wrappers. `web/` (Vite + React + MapLibre GL JS) is the actual product.
+`openlr-core`'s `openlr-wasm` crate depends on that repo's own five engine crates and adds nothing
+algorithmic — JSON DTOs, the tile-injection protocol above, and thin per-method wrappers. This
+repo's `web/` (Vite + React + MapLibre GL JS) is the actual product, and the only thing this repo
+contains.
 
 The PMTiles builder lives in a separate repo,
 [openlr-pmtiles](https://github.com/nw31304/openlr-pmtiles) (private) — `openlr-core` (not this
@@ -130,9 +137,10 @@ orientation for debugging this repo's UI:
 
 Custom binary payload (magic `OLRL`, version 3), not MVT — a single fixed zoom level (`z/x/y` is
 purely an addressing convention, not a level-of-detail pyramid), coordinates at 1e-7° precision.
-This repo's `openlr-wasm::TileLoader.load_tile()` receives these bytes over the wire and passes
-them straight to `openlr-core`'s parser, unmodified — see that repo's `CLAUDE.md` §5 for the full
-header/segment/node/restriction-table byte layout.
+`openlr-core`'s `openlr-wasm::TileLoader.load_tile()` receives these bytes over the wire (fetched by
+this repo's `web/` code via HTTP range reads) and passes them straight to `openlr-core`'s parser,
+unmodified — see that repo's `CLAUDE.md` §5 for the full header/segment/node/restriction-table byte
+layout.
 
 ---
 
@@ -213,17 +221,17 @@ inter-waypoint routing) live in `openlr-core`'s `openlr-encoder` crate now — s
 `CLAUDE.md` §2 Invariant 9 and `OpenLREngine.md` for the algorithm detail. This repo's role:
 
 - **Waypoint placement UI** (`Map.jsx`): right-click to append/insert/move a waypoint, the
-  snap-candidate popup, the live route preview — all backed by `openlr-wasm`'s thin `Encoder`
-  methods (`route_between`, `candidates_near_point`, `encode_line`, `encode_pal`), which call
-  straight into `openlr-core`'s `openlr-encoder::waypoint` module and JSON-shape the result.
+  snap-candidate popup, the live route preview — all backed by `openlr-core`'s `openlr-wasm` crate's
+  thin `Encoder` methods (`route_between`, `candidates_near_point`, `encode_line`, `encode_pal`),
+  which call straight into that repo's `openlr-encoder::waypoint` module and JSON-shape the result.
 - **Round-trip verification**: every encode in the UI immediately decodes its own output (both v3
   and TPEG) through the ordinary decoder — this *is* a real decode, so it drives the same
   Segments/Trace/Replay panels the decode side already has, unmodified.
-- **Diagnostics** (`openlr-core`'s `diagnose.rs`/`expansion.rs`, called through `openlr-wasm`):
-  `diagnose_connection` distinguishes genuine disconnection from being blocked specifically by the
-  turn-angle gate; `check_boundary_expansion` replays Rule-4 expansion in isolation. Both are
-  exposed as LLM chat tools (`web/src/llm/tools.js`, `SYSTEM_PROMPT.md`) for the same reason the
-  decode side's trace-drilldown tools are.
+- **Diagnostics** (`openlr-core`'s `diagnose.rs`/`expansion.rs`, called through its own
+  `openlr-wasm` crate): `diagnose_connection` distinguishes genuine disconnection from being blocked
+  specifically by the turn-angle gate; `check_boundary_expansion` replays Rule-4 expansion in
+  isolation. Both are exposed as LLM chat tools (`web/src/llm/tools.js`, `SYSTEM_PROMPT.md`) for the
+  same reason the decode side's trace-drilldown tools are.
 
 ---
 
@@ -241,19 +249,22 @@ share-alike obligations. Document exact attribution text before public release.
 
 Lives entirely in [openlr-core](https://github.com/nw31304/openlr-core) now — its own `openlr-cli`
 crate is a batch decode binary against a local `.pmtiles` archive, with no dependency on anything
-in this repo. This repo has no native/CLI ambitions of its own; it's the browser UI.
+in this repo. This repo has no native/CLI ambitions, and no Rust code, of its own — it's the
+browser UI.
 
 ---
 
 ## 15. Agent conventions
 
-- **Real decode/encode logic belongs in `openlr-core`, not here.** This repo's `openlr-wasm` should
-  stay a thin adapter — JSON shaping and the tile-injection protocol, nothing algorithmic. If a
-  change here starts looking like a new graph algorithm or scoring rule, stop and move it to
-  `openlr-core`'s `openlr-engine`/`openlr-encoder` instead, then depend on it from here.
-- `openlr-wasm`'s dependency on `openlr-core` is a `git` reference patched to a local sibling
-  checkout (see §1) — after editing anything in `../openlr-core`, this repo's next
-  `cargo build`/`wasm-pack build` picks it up automatically, no publish/version-bump step needed.
+- **All decode/encode logic, and the wasm-bindgen adapter itself, belong in `openlr-core`, not
+  here.** This repo has no `crates/` directory and should never gain one — if a change here starts
+  looking like it needs new Rust code (a graph algorithm, a scoring rule, or even a new
+  JSON-shaping wasm-bindgen method), stop and make that change in `openlr-core`'s `openlr-wasm`,
+  `openlr-engine`, or `openlr-encoder` instead, then rebuild the wasm module (see §1) to pick it up
+  here.
+- Rebuilding the wasm module after any `openlr-core` change is the one manual step this repo's own
+  dev loop needs — `wasm-pack build` run from `openlr-core`'s `crates/openlr-wasm` (see §1 and the
+  README's Build section), never a step inside this repo. Vite does not watch or rebuild it.
 - This repo has no pipeline/tile-building code and no `fixtures/` corpus of its own — those live in
   `openlr-pmtiles`. Don't reintroduce `pipeline/`-shaped code or dependencies here; a tile-format
   change belongs there first, propagating to `openlr-core`'s decoder, never to this repo directly.
