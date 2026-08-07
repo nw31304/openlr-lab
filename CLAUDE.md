@@ -17,7 +17,7 @@ repo's list below is only what's genuinely specific to the browser/wasm side.
 
 ## 1. Relationship to openlr-core
 
-`openlr-core` owns every line of OpenLR-aware Rust: `openlr-codec`/`openlr-graph`/`openlr-engine`/
+`openlr-core` owns every line of OpenLR-aware Rust: `openlr-codec`/`openlr-graph`/`openlr-decoder`/
 `openlr-encoder`/`openlr-provider` (the engine, zero `wasm-bindgen`/browser awareness) and
 `openlr-wasm` (the thin `wasm-bindgen` adapter — JSON-in/JSON-out glue, the tile-injection protocol,
 nothing algorithmic) — `openlr-wasm` used to live in this repo but moved to `openlr-core` once it
@@ -173,7 +173,7 @@ render whatever `DecodeTrace` comes back (`web/`'s Trace/Replay panels, the LLM 
 
 ## 9. Decode parameters
 
-`DecodeParams` (`openlr-core`'s `crates/openlr-engine/src/params.rs`) is the source of truth for
+`DecodeParams` (`openlr-core`'s `crates/openlr-decoder/src/params.rs`) is the source of truth for
 the full field list and every field's hard-gate-vs-soft-weight classification — don't re-enumerate
 it here. What *is* this repo's concern: the three named presets (Permissive/Default/Strict) shown
 in the Parameters panel are **not** hand-copied in JS — `web/src/store.js`'s `PRESETS` object is
@@ -260,7 +260,7 @@ browser UI.
   here.** This repo has no `crates/` directory and should never gain one — if a change here starts
   looking like it needs new Rust code (a graph algorithm, a scoring rule, or even a new
   JSON-shaping wasm-bindgen method), stop and make that change in `openlr-core`'s `openlr-wasm`,
-  `openlr-engine`, or `openlr-encoder` instead, then rebuild the wasm module (see §1) to pick it up
+  `openlr-decoder`, or `openlr-encoder` instead, then rebuild the wasm module (see §1) to pick it up
   here.
 - Rebuilding the wasm module after any `openlr-core` change is the one manual step this repo's own
   dev loop needs — `wasm-pack build` run from `openlr-core`'s `crates/openlr-wasm` (see §1 and the

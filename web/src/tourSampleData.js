@@ -24,7 +24,7 @@
 //      (234.375/292.969), and the offsets are fractions of the routed leg
 //      length. Carrying the real, unequal [lb, ub] pairs through the sample
 //      is deliberate: the whole app represents these as bounded intervals
-//      end to end (see coverage_range in openlr-engine/src/wkt.rs), never
+//      end to end (see coverage_range in openlr-decoder/src/wkt.rs), never
 //      collapsed to a bucket midpoint, and the sample data should model
 //      that rather than quietly contradict it with a fake lb == ub.
 export const TOUR_SAMPLE_OPENLR_STRING = 'CwRtXyUYzyORBABB/y4jfTUK';

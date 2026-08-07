@@ -46,7 +46,7 @@ Every crate below lives in [openlr-core](https://github.com/nw31304/openlr-core)
 |---|---|
 | `openlr-codec` | v3 / TPEG-OLR binary parsing and serialization ↔ unified `Lrp` model |
 | `openlr-graph` | Tile format, segment/node tables, geometry pool |
-| `openlr-engine` | Decode: candidate selection, A\* (`state = (node, incoming_segment)`), scoring, diagnostics |
+| `openlr-decoder` | Decode: candidate selection, A\* (`state = (node, incoming_segment)`), scoring, diagnostics |
 | `openlr-encoder` | Encode: Rule-1/Rule-4 Line and PointAlongLine encoding, boundary expansion, coverage sweep, waypoint snapping |
 | `openlr-provider` | `OpenLRDataProvider` trait + `PmtilesProvider` implementation |
 | `openlr-cli` | Native batch-decode binary against a local `.pmtiles` archive |

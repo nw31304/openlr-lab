@@ -161,7 +161,7 @@ export function getNodeId(z, x, y, localIndex) {
 // Minimal bootstrap default, used only for the store's synchronous initial
 // state before the wasm module has loaded (App.jsx's setup() effect calls
 // list_presets_json() and overwrites PRESETS -- including this Default entry
-// -- with the authoritative values from openlr_engine::DecodeParams::preset()
+// -- with the authoritative values from openlr_decoder::DecodeParams::preset()
 // well before the UI ever renders). This is the *only* hand-copied preset
 // literal left in JS -- Permissive/Strict, and the FRC/FOW penalty tables
 // every preset carries, used to come from separate hardcoded copies here too,
@@ -334,7 +334,7 @@ export const useStore = create(persist(
   // Decoder.list_presets_json()'s output -- overwrites PRESETS in place
   // (mutating the same object every consumer already references, not
   // rebinding the export) with the authoritative Permissive/Default/Strict
-  // values straight from openlr_engine::DecodeParams::preset(). If the
+  // values straight from openlr_decoder::DecodeParams::preset(). If the
   // active params are still exactly the pre-wasm bootstrap default (i.e.
   // this is a first-ever load with nothing persisted or user-edited yet),
   // also refreshes them to the real Default -- otherwise a first-time user
