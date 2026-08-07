@@ -1,6 +1,6 @@
 # OpenLRLab User Guide
 
-A browser-based, visual diagnostic tool for decoding and encoding [OpenLR](https://www.openlr-association.com/)
+A browser-based, visual diagnostic tool for decoding and encoding [OpenLR](https://www.openlr.org/)
 location references — both **TomTomV3** (binary) and **TPEG-OLR** (ISO 21219-22) formats. Everything
 runs client-side in WebAssembly; the only network activity is fetching map tiles from whichever
 [PMTiles](https://protomaps.com/) archive is configured.

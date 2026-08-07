@@ -1,6 +1,6 @@
 # OpenLRLab
 
-A browser-based diagnostic decoder **and encoder** for [OpenLR](https://www.openlr-association.com/) location references. This repo contains no Rust code — the decode/encode engine (codec, graph, A\* path search, encoder) *and* the `wasm-bindgen` binding crate that compiles it to WebAssembly both live in a separate repo, [openlr-core](https://github.com/nw31304/openlr-core); this repo builds that crate and copies the resulting wasm module in. A MapLibre GL JS front end renders the decoded/encoded path and step-by-step diagnostics.
+A browser-based diagnostic decoder **and encoder** for [OpenLR](https://www.openlr.org/) location references. This repo contains no Rust code — the decode/encode engine (codec, graph, A\* path search, encoder) *and* the `wasm-bindgen` binding crate that compiles it to WebAssembly both live in a separate repo, [openlr-core](https://github.com/nw31304/openlr-core); this repo builds that crate and copies the resulting wasm module in. A MapLibre GL JS front end renders the decoded/encoded path and step-by-step diagnostics.
 
 Two formats are supported, both for decode and encode:
 
